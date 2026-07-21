@@ -1,0 +1,15 @@
+# qwerty-app: the Windows binary — egui UI, tray, hotkeys, audio thread, and
+# the PlatformActions trait + Windows implementation (ARCHITECTURE.md).
+# GUI / audio / Windows dependencies are added here in the phase that needs
+# them (egui/eframe in Phase 3, cpal in Phase 2, the `windows` crate in
+# Phase 5) — Phase 0 keeps this a minimal binary that just links qwerty-core.
+[package]
+name = "qwerty-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+qwerty-core = { path = "../qwerty-core" }

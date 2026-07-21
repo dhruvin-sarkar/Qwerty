@@ -1,0 +1,23 @@
+# Qwerty workspace manifest.
+# Layout and the qwerty-core / qwerty-app split are defined in ARCHITECTURE.md.
+[workspace]
+resolver = "2"
+members = ["crates/qwerty-core", "crates/qwerty-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["dhruvin-sarkar"]
+repository = "https://github.com/dhruvin-sarkar/Qwerty"
+
+# Shared dependency versions live here so both crates stay in lockstep.
+# Nothing is added speculatively — each entry is introduced by the phase
+# that first needs it (see ROADMAP.md).
+[workspace.dependencies]
+# Phase 1 — data model persistence (DATA_MODEL.md) and DSP.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+rustfft = "6"

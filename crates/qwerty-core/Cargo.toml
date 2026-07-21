@@ -1,0 +1,20 @@
+# qwerty-core: pure DSP / classifier / profile logic.
+# HARD RULE (ARCHITECTURE.md, CLAUDE.md principle #7): no Windows-specific
+# and no GUI dependencies may ever appear here. This crate must build and
+# test with zero real audio hardware.
+[package]
+name = "qwerty-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rustfft = { workspace = true }
+
+[dev-dependencies]

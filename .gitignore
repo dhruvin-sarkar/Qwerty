@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Local soak / evaluation evidence artifacts are produced on demand and are
+# large / machine-specific — never committed (see CLAUDE.md "banned patterns":
+# no example/test WAV files or real calibration data in the repo).
+/artifacts
+*.wav
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+
+# Planning / spec documents — kept local only, never committed to the repo
+# (the repo holds shipped code + LICENSE, not the design docs used to build it).
+/INDEX.md
+/VISION.md
+/CLAUDE.md
+/DESIGN.md
+/ARCHITECTURE.md
+/DATA_MODEL.md
+/PERFORMANCE.md
+/MOTION.md
+/TESTING.md
+/ACCEPTANCE.md
+/ROADMAP.md
+/.remember/
