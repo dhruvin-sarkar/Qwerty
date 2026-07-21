@@ -255,7 +255,18 @@ impl Profile {
 
     /// Parse from JSON with the schema-version policy applied.
     pub fn from_json(s: &str, file: &str) -> Result<Self, PersistenceError> {
-        parse_versioned(s, PROFILE_SCHEMA_VERSION, file)
+        let profile: Profile = parse_versioned(s, PROFILE_SCHEMA_VERSION, file)?;
+        // The classifier blob is only version-checked at the outer schema level;
+        // validate its internal invariants so a stale or hand-edited profile
+        // fails loudly instead of silently truncating and misclassifying.
+        profile
+            .classifier
+            .validate()
+            .map_err(|e| PersistenceError::InvalidData {
+                file: file.to_string(),
+                reason: e.to_string(),
+            })?;
+        Ok(profile)
     }
 
     /// Load from a file path, applying the schema-version policy.
@@ -287,6 +298,10 @@ pub enum PersistenceError {
         found: u32,
         expected: u32,
     },
+    /// The file parsed and its version matched, but its contents fail an
+    /// internal integrity check (e.g. classifier dimensions inconsistent with
+    /// this build). Loaded loudly-refused, never silently accepted.
+    InvalidData { file: String, reason: String },
 }
 
 impl std::fmt::Display for PersistenceError {
@@ -303,6 +318,9 @@ impl std::fmt::Display for PersistenceError {
                 "{file}: schema_version {found} does not match expected {expected} \
                  — this file must be migrated or recalibrated, not loaded as-is",
             ),
+            PersistenceError::InvalidData { file, reason } => {
+                write!(f, "{file}: invalid contents — {reason}")
+            }
         }
     }
 }
@@ -313,6 +331,7 @@ impl std::error::Error for PersistenceError {
             PersistenceError::Io(e) => Some(e),
             PersistenceError::Json(e) => Some(e),
             PersistenceError::SchemaMismatch { .. } => None,
+            PersistenceError::InvalidData { .. } => None,
         }
     }
 }
@@ -471,5 +490,16 @@ mod tests {
         assert!(json.contains("\"type\": \"OpenApp\""));
         assert!(json.contains("\"type\": \"ShowToast\""));
         assert!(json.contains("\"path\":"));
+    }
+
+    #[test]
+    fn profile_with_malformed_classifier_is_refused_on_load() {
+        // A stale/hand-edited profile whose classifier vectors are the wrong
+        // length must fail loudly on load, not silently truncate at classify.
+        let p = sample_profile();
+        let mut v: serde_json::Value = serde_json::from_str(&p.to_json()).unwrap();
+        v["classifier"]["feature_mean"] = serde_json::json!([0.0, 1.0]);
+        let err = Profile::from_json(&v.to_string(), "p.json").unwrap_err();
+        assert!(matches!(err, PersistenceError::InvalidData { .. }));
     }
 }

@@ -8,7 +8,7 @@
 //! ring fills, samples are dropped and counted rather than blocking the
 //! callback.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ pub enum CaptureError {
     UnsupportedFormat(cpal::SampleFormat),
     BuildStream(cpal::BuildStreamError),
     Play(cpal::PlayStreamError),
+    /// The stream reported an asynchronous error after starting (device
+    /// unplugged, permission revoked mid-session, driver fault).
+    StreamFailed,
 }
 
 impl std::fmt::Display for CaptureError {
@@ -45,11 +48,54 @@ impl std::fmt::Display for CaptureError {
             }
             CaptureError::BuildStream(e) => write!(f, "could not build the input stream: {e}"),
             CaptureError::Play(e) => write!(f, "could not start the input stream: {e}"),
+            CaptureError::StreamFailed => write!(
+                f,
+                "the audio input stream failed (see stderr for the device error)"
+            ),
         }
     }
 }
 
 impl std::error::Error for CaptureError {}
+
+/// Errors from the end-to-end live harness: capture failed, or calibration
+/// (classifier training) failed. A real enum so `--live` never reports a
+/// training failure as success (`CLAUDE.md`: fail fast, no silent fallbacks).
+#[derive(Debug)]
+pub enum LiveError {
+    Capture(CaptureError),
+    Training(qwerty_core::classifier::ClassifierError),
+}
+
+impl std::fmt::Display for LiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveError::Capture(e) => write!(f, "{e}"),
+            LiveError::Training(e) => write!(f, "calibration failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LiveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LiveError::Capture(e) => Some(e),
+            LiveError::Training(e) => Some(e),
+        }
+    }
+}
+
+impl From<CaptureError> for LiveError {
+    fn from(e: CaptureError) -> Self {
+        LiveError::Capture(e)
+    }
+}
+
+impl From<qwerty_core::classifier::ClassifierError> for LiveError {
+    fn from(e: qwerty_core::classifier::ClassifierError) -> Self {
+        LiveError::Training(e)
+    }
+}
 
 /// List the names of all available audio input devices.
 pub fn list_input_devices() -> Result<Vec<String>, CaptureError> {
@@ -68,6 +114,7 @@ pub struct AudioCapture {
     _stream: cpal::Stream,
     consumer: Consumer<f32>,
     dropped: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
     pub device_name: String,
     sample_rate: u32,
     channels: u16,
@@ -103,18 +150,19 @@ impl AudioCapture {
         let capacity = (sample_rate as usize).max(FEATURE_WINDOW_SAMPLES * 4);
         let (producer, consumer) = RingBuffer::<f32>::new(capacity);
         let dropped = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
         let ch = channels as usize;
 
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => {
-                build_input_stream::<f32>(&device, &config, producer, ch, dropped.clone())
-            }
-            cpal::SampleFormat::I16 => {
-                build_input_stream::<i16>(&device, &config, producer, ch, dropped.clone())
-            }
-            cpal::SampleFormat::U16 => {
-                build_input_stream::<u16>(&device, &config, producer, ch, dropped.clone())
-            }
+            cpal::SampleFormat::F32 => build_input_stream::<f32>(
+                &device, &config, producer, ch, dropped.clone(), failed.clone(),
+            ),
+            cpal::SampleFormat::I16 => build_input_stream::<i16>(
+                &device, &config, producer, ch, dropped.clone(), failed.clone(),
+            ),
+            cpal::SampleFormat::U16 => build_input_stream::<u16>(
+                &device, &config, producer, ch, dropped.clone(), failed.clone(),
+            ),
             other => return Err(CaptureError::UnsupportedFormat(other)),
         }
         .map_err(CaptureError::BuildStream)?;
@@ -125,6 +173,7 @@ impl AudioCapture {
             _stream: stream,
             consumer,
             dropped,
+            failed,
             device_name,
             sample_rate,
             channels,
@@ -142,6 +191,11 @@ impl AudioCapture {
     pub fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    /// Whether the input stream has reported an asynchronous failure.
+    pub fn stream_failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
 }
 
 /// Build a typed input stream whose callback downmixes to mono and pushes into
@@ -153,6 +207,7 @@ fn build_input_stream<T>(
     mut producer: Producer<f32>,
     channels: usize,
     dropped: Arc<AtomicUsize>,
+    failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample,
@@ -173,7 +228,10 @@ where
                 }
             }
         },
-        move |err| eprintln!("audio stream error: {err}"),
+        move |err| {
+            eprintln!("audio stream error: {err}");
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )
 }
@@ -206,6 +264,9 @@ pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(seconds) {
+        if cap.stream_failed() {
+            return Err(CaptureError::StreamFailed);
+        }
         buf.clear();
         cap.drain(&mut buf);
         if !buf.is_empty() {
@@ -231,6 +292,7 @@ pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
 
 fn wait_for_enter() {
     let mut s = String::new();
+    // Block until the user presses Enter; a closed/piped stdin simply proceeds.
     let _ = std::io::stdin().read_line(&mut s);
 }
 
@@ -240,11 +302,14 @@ fn capture_taps(
     cap: &mut AudioCapture,
     extractor: &mut qwerty_core::features::FeatureExtractor,
     taps_per_zone: usize,
-) -> Vec<qwerty_core::features::FeatureVector> {
+) -> Result<Vec<qwerty_core::features::FeatureVector>, CaptureError> {
     let mut detector = OnsetDetector::new();
     let mut buf = Vec::new();
     let mut out = Vec::new();
     while out.len() < taps_per_zone {
+        if cap.stream_failed() {
+            return Err(CaptureError::StreamFailed);
+        }
         buf.clear();
         cap.drain(&mut buf);
         for ev in detector.process(&buf) {
@@ -258,7 +323,7 @@ fn capture_taps(
         }
         std::thread::sleep(Duration::from_millis(15));
     }
-    out
+    Ok(out)
 }
 
 /// Phase 2 end-to-end CLI: calibrate `zone_count` zones from the mic, train the
@@ -266,7 +331,7 @@ fn capture_taps(
 /// correct zone decisions printed live" (`ROADMAP.md`). This is a terminal-only
 /// preview of the calibration wizard built properly in Phase 4; it does not
 /// persist a profile.
-pub fn run_live(zone_count: usize, taps_per_zone: usize) -> Result<(), CaptureError> {
+pub fn run_live(zone_count: usize, taps_per_zone: usize) -> Result<(), LiveError> {
     use qwerty_core::classifier::ClassifierParams;
     use qwerty_core::features::{FeatureExtractor, FeatureVector};
     use qwerty_core::profile::ZoneId;
@@ -291,24 +356,18 @@ pub fn run_live(zone_count: usize, taps_per_zone: usize) -> Result<(), CaptureEr
             taps_per_zone,
         );
         use std::io::Write;
-        std::io::stdout().flush().ok();
+        let _ = std::io::stdout().flush(); // best-effort flush before the prompt
         wait_for_enter();
-        // Flush any audio buffered before the user was ready.
+        // Discard any audio buffered before the user was ready.
         let mut stale = Vec::new();
         cap.drain(&mut stale);
 
-        for fv in capture_taps(&mut cap, &mut extractor, taps_per_zone) {
+        for fv in capture_taps(&mut cap, &mut extractor, taps_per_zone)? {
             samples.push((zid, fv));
         }
     }
 
-    let classifier = match ClassifierParams::train(&samples, &[]) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("classifier training failed: {e}");
-            return Ok(());
-        }
-    };
+    let classifier = ClassifierParams::train(&samples, &[])?;
     println!(
         "\nTrained on {} taps across {} zones. Tap live now (Ctrl-C to stop)…",
         samples.len(),
@@ -318,6 +377,9 @@ pub fn run_live(zone_count: usize, taps_per_zone: usize) -> Result<(), CaptureEr
     let mut detector = OnsetDetector::new();
     let mut buf = Vec::new();
     loop {
+        if cap.stream_failed() {
+            return Err(CaptureError::StreamFailed.into());
+        }
         buf.clear();
         cap.drain(&mut buf);
         for ev in detector.process(&buf) {

@@ -28,18 +28,28 @@ const NOVELTY_SIGMA: f32 = 4.0;
 /// Softmax temperature for turning centroid distances into a confidence.
 const CONFIDENCE_BETA: f32 = 1.0;
 
-/// Errors that can arise while fitting a classifier.
+/// Errors that can arise while fitting or loading a classifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassifierError {
     /// No labeled samples were provided.
     EmptyTrainingSet,
+    /// Training produced a non-finite parameter (NaN/inf) — refuse it rather
+    /// than persist unusable data.
+    NonFiniteParameters,
+    /// Loaded parameters are internally inconsistent (e.g. a stale profile from
+    /// a build with a different `FEATURE_DIM`). The string names the mismatch.
+    MalformedParameters(String),
 }
 
 impl std::fmt::Display for ClassifierError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClassifierError::EmptyTrainingSet => {
-                write!(f, "classifier training set was empty")
+            ClassifierError::EmptyTrainingSet => write!(f, "classifier training set was empty"),
+            ClassifierError::NonFiniteParameters => {
+                write!(f, "classifier training produced non-finite parameters")
+            }
+            ClassifierError::MalformedParameters(d) => {
+                write!(f, "classifier parameters are malformed: {d}")
             }
         }
     }
@@ -51,7 +61,7 @@ impl std::error::Error for ClassifierError {}
 /// novelty gate. Stored as a plain float vector (not the `FeatureVector`
 /// type) so the persisted `Profile` stays decoupled from the DSP core's
 /// evolving feature layout (`DATA_MODEL.md`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct StdExample {
     zone: usize,
     v: Vec<f32>,
@@ -59,7 +69,7 @@ struct StdExample {
 
 /// Fitted classifier parameters. Persisted inside a `Profile` and treated as
 /// opaque everywhere except this module.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClassifierParams {
     schema_version: u32,
     feature_mean: Vec<f32>,
@@ -181,7 +191,7 @@ impl ClassifierParams {
             .map(|ex| euclidean(&ex.v, &centroids[ex.zone]))
             .collect();
         let (spread_mean, spread_std) = mean_std(&spreads);
-        spreads.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        spreads.sort_by(|a, b| a.total_cmp(b));
         let spread_max = spreads.last().copied().unwrap_or(0.0);
         let mut novelty_threshold = (spread_mean + NOVELTY_SIGMA * spread_std).max(spread_max);
         if novelty_threshold <= 0.0 {
@@ -209,7 +219,7 @@ impl ClassifierParams {
             }
         }
 
-        Ok(Self {
+        let params = Self {
             schema_version: CLASSIFIER_SCHEMA_VERSION,
             feature_mean: mean,
             feature_std: std,
@@ -218,12 +228,72 @@ impl ClassifierParams {
             examples,
             novelty_threshold,
             negative_examples_trained,
-        })
+        };
+        params.validate()?;
+        Ok(params)
+    }
+
+    /// Check that these parameters are internally consistent and finite. Run at
+    /// the end of `train()` and again after a profile is loaded, so a stale or
+    /// hand-edited blob fails loudly instead of silently truncating via `.zip()`
+    /// and misclassifying (`CLAUDE.md`: fail fast, no silent fallbacks).
+    pub fn validate(&self) -> Result<(), ClassifierError> {
+        let dim_ok = |v: &[f32]| v.len() == FEATURE_DIM;
+        if !dim_ok(&self.feature_mean) || !dim_ok(&self.feature_std) {
+            return Err(ClassifierError::MalformedParameters(format!(
+                "standardization vectors must be length {FEATURE_DIM}"
+            )));
+        }
+        if self.centroids.len() != self.zone_ids.len() {
+            return Err(ClassifierError::MalformedParameters(
+                "centroid count does not match zone count".into(),
+            ));
+        }
+        if self.centroids.iter().any(|c| !dim_ok(c)) {
+            return Err(ClassifierError::MalformedParameters(format!(
+                "each centroid must be length {FEATURE_DIM}"
+            )));
+        }
+        if self
+            .examples
+            .iter()
+            .any(|ex| !dim_ok(&ex.v) || ex.zone >= self.zone_ids.len())
+        {
+            return Err(ClassifierError::MalformedParameters(
+                "an example has a bad dimension or zone index".into(),
+            ));
+        }
+        let all_finite = self
+            .feature_mean
+            .iter()
+            .chain(&self.feature_std)
+            .chain(self.centroids.iter().flatten())
+            .chain(self.examples.iter().flat_map(|e| &e.v))
+            .chain(std::iter::once(&self.novelty_threshold))
+            .all(|v| v.is_finite());
+        if !all_finite {
+            return Err(ClassifierError::NonFiniteParameters);
+        }
+        if self.feature_std.iter().any(|s| *s <= 0.0) {
+            return Err(ClassifierError::MalformedParameters(
+                "feature_std must be strictly positive".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Classify one feature vector: assign the nearest-centroid zone, or reject
     /// via the nearest-example novelty gate.
     pub fn classify(&self, fv: &FeatureVector) -> Classification {
+        // Garbage input (NaN/inf from a flaky driver) is rejected rather than
+        // fed into the distance math, where a NaN compare would otherwise panic.
+        if !fv.is_finite() {
+            return Classification {
+                zone_id: None,
+                confidence: 0.0,
+                accepted: false,
+            };
+        }
         let raw = fv.as_array();
         let z: Vec<f32> = raw
             .iter()
@@ -244,7 +314,7 @@ impl ClassifierParams {
         let best = dists
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i);
 
         let (zone_id, confidence) = match best {

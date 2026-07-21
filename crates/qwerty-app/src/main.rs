@@ -23,19 +23,37 @@ fn main() {
             Err(e) => fail(&e),
         },
         Some("--monitor") => {
-            let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+            let seconds = arg_or(&args, 2, 20u64, "seconds");
             if let Err(e) = run_monitor(seconds) {
                 fail(&e);
             }
         }
         Some("--live") => {
-            let zones = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
-            let taps = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let zones = arg_or(&args, 2, 4usize, "zones");
+            let taps = arg_or(&args, 3, 10usize, "taps");
             if let Err(e) = run_live(zones, taps) {
                 fail(&e);
             }
         }
-        _ => print_usage(),
+        None => print_usage(),
+        Some(other) => {
+            eprintln!("error: unknown command: {other}");
+            print_usage();
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Parse a positional CLI arg, defaulting only when it is ABSENT — a present
+/// but malformed value is a loud error, never silently defaulted (mirrors the
+/// soak example's arg handling; `CLAUDE.md`: fail fast).
+fn arg_or<T: std::str::FromStr>(args: &[String], idx: usize, default: T, name: &str) -> T {
+    match args.get(idx) {
+        None => default,
+        Some(s) => s.parse().unwrap_or_else(|_| {
+            eprintln!("error: invalid {name}: {s:?}");
+            std::process::exit(2);
+        }),
     }
 }
 
