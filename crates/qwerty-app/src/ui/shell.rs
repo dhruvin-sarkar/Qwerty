@@ -13,10 +13,22 @@ use std::time::Instant;
 use qwerty_core::profile::Theme;
 
 use crate::app_state::{AppState, ListeningState, Screen};
+use crate::capture_worker::{CaptureEvent, LiveCapture};
 use crate::hotkeys::Hotkeys;
 use crate::tray::{Tray, TrayCommand};
 use crate::ui::motion;
 use crate::ui::theme::{tokens_for, Color, Tokens};
+
+/// Live input status while listening, drained from the capture worker.
+#[derive(Default)]
+struct LiveStatus {
+    device: Option<String>,
+    rms: f32,
+    peak: f32,
+    taps: u32,
+    rejects: u32,
+    error: Option<String>,
+}
 
 /// Launch the GUI. Blocks until the window is closed.
 pub fn run() -> eframe::Result<()> {
@@ -42,6 +54,10 @@ struct QwertyApp {
     /// The global listening-toggle hotkey. `None` if registration failed
     /// (e.g. the combo is already claimed by another app).
     hotkeys: Option<Hotkeys>,
+    /// The live microphone capture, present only while listening.
+    capture: Option<LiveCapture>,
+    /// Live input status drained from the capture worker.
+    live: LiveStatus,
 }
 
 impl QwertyApp {
@@ -80,6 +96,48 @@ impl QwertyApp {
             state,
             tray,
             hotkeys,
+            capture: None,
+            live: LiveStatus::default(),
+        }
+    }
+
+    /// Start/stop the microphone to match the listening state, then drain any
+    /// capture events. Listening opens the device; pausing (or an error) drops
+    /// the worker, which stops the stream via RAII. A capture failure moves the
+    /// app into the `Error` state with a specific message (fail fast).
+    fn reconcile_capture(&mut self, ctx: &egui::Context) {
+        match self.state.listening {
+            ListeningState::Listening if self.capture.is_none() => {
+                self.live = LiveStatus::default();
+                self.capture = Some(LiveCapture::start(None, ctx.clone()));
+            }
+            ListeningState::Paused | ListeningState::Error if self.capture.is_some() => {
+                self.capture = None; // Drop stops the worker + closes the device.
+            }
+            _ => {}
+        }
+
+        let events = self.capture.as_ref().map(LiveCapture::poll).unwrap_or_default();
+        for ev in events {
+            match ev {
+                CaptureEvent::Started { device_name, .. } => self.live.device = Some(device_name),
+                CaptureEvent::Level { rms, peak } => {
+                    self.live.rms = rms;
+                    self.live.peak = peak;
+                }
+                CaptureEvent::Onset { is_transient, .. } => {
+                    if is_transient {
+                        self.live.taps += 1;
+                    } else {
+                        self.live.rejects += 1;
+                    }
+                }
+                CaptureEvent::Failed(msg) => {
+                    self.live.error = Some(msg);
+                    self.state.listening = ListeningState::Error;
+                    self.capture = None;
+                }
+            }
         }
     }
 
@@ -134,6 +192,9 @@ impl eframe::App for QwertyApp {
 
         // Apply tray/hotkey events and the close-to-tray policy before painting.
         self.handle_external_events(ctx);
+
+        // Start/stop the mic to match listening state and absorb capture events.
+        self.reconcile_capture(ctx);
 
         // Resolve this frame's effective tokens, advancing any theme cross-fade.
         let tokens = self.effective_tokens(ctx, now);
@@ -252,6 +313,38 @@ impl QwertyApp {
                     .color(pal.secondary)
                     .small(),
                 );
+            }
+
+            match self.state.listening {
+                ListeningState::Listening => {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    let mic = self.live.device.as_deref().unwrap_or("opening microphone…");
+                    ui.label(egui::RichText::new(format!("Mic: {mic}")).color(pal.secondary).small());
+                    ui.add_space(4.0);
+                    // Peak level, sqrt-shaped so quiet signals are still visible.
+                    let frac = self.live.peak.clamp(0.0, 1.0).sqrt();
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(260.0)
+                            .text(format!("input {:.0}%", frac * 100.0)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "taps {}   ·   rejected {}",
+                            self.live.taps, self.live.rejects
+                        ))
+                        .color(pal.text),
+                    );
+                }
+                ListeningState::Error => {
+                    ui.add_space(10.0);
+                    let msg = self.live.error.as_deref().unwrap_or("audio device error");
+                    ui.label(egui::RichText::new(format!("⚠ {msg}")).color(pal.danger));
+                }
+                ListeningState::Paused => {}
             }
         });
 

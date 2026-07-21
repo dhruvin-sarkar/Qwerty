@@ -9,6 +9,7 @@
 
 mod app_state;
 mod audio_thread;
+mod capture_worker;
 mod hotkeys;
 mod tray;
 mod ui;
