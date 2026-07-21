@@ -9,7 +9,11 @@
 //! Modules are introduced phase by phase per ROADMAP.md; Phase 0 is
 //! scaffolding only.
 
+pub mod classifier;
 pub mod features;
+pub mod onset;
+pub mod profile;
+pub mod soak;
 
 /// Crate version string, surfaced so the app and soak binary can log which
 /// core they were built against.
