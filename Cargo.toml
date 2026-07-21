@@ -24,3 +24,17 @@ rustfft = "6"
 # Phase 2 — real audio capture (qwerty-app only; never in qwerty-core).
 cpal = "0.15"
 rtrb = "0.3"
+# Phase 3 — GUI shell, tray, and global hotkey (qwerty-app only). eframe bundles
+# egui + winit + accesskit (screen-reader support, needed in Phase 7). The glow
+# (OpenGL) renderer is selected explicitly: the wgpu backend pulls in wgpu-hal,
+# which fails to compile against the `windows` crate version that tray-icon /
+# global-hotkey require, and glow is the lighter backend for an always-on
+# background app anyway (PERFORMANCE.md).
+# Pinned to the 0.31 API line: egui 0.32+ landed a large layout/app-model
+# redesign (App::ui with a root Ui, SidePanel removed). Qwerty targets the
+# stable 0.31 surface (App::update, SidePanel, CentralPanel); revisiting the
+# redesign is a deliberate later migration, not a Phase 3 concern.
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.31"
+tray-icon = "0.24"
+global-hotkey = "0.8"

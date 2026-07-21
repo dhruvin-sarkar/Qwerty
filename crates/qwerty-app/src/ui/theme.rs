@@ -29,6 +29,16 @@ impl Color {
     pub fn hex(&self) -> String {
         format!("#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
     }
+
+    /// Linearly interpolate between two colors, `t` clamped to `[0, 1]`.
+    /// Used by the theme cross-fade (`MOTION.md` → Theme switch), which
+    /// precomputes both token sets and interpolates rather than swapping the
+    /// style object mid-frame. Kept here (pure, no egui) so it stays testable.
+    pub fn lerp(a: Color, b: Color, t: f32) -> Color {
+        let t = t.clamp(0.0, 1.0);
+        let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+        Color::rgb(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
+    }
 }
 
 /// One theme's full set of semantic tokens (`DESIGN.md`: background layers,
@@ -48,6 +58,28 @@ pub struct Tokens {
     pub success: Color,
     pub warning: Color,
     pub danger: Color,
+}
+
+impl Tokens {
+    /// Interpolate every token between two theme token sets, for the cross-fade
+    /// in `MOTION.md` (Theme switch). At `t = 0` this is `from`, at `t = 1` it
+    /// is `to`; the shell maps the result to egui `Visuals` each frame while the
+    /// switch animation is in flight, then stops repainting.
+    pub fn lerp(from: &Tokens, to: &Tokens, t: f32) -> Tokens {
+        let c = |a: Color, b: Color| Color::lerp(a, b, t);
+        Tokens {
+            bg_base: c(from.bg_base, to.bg_base),
+            bg_surface: c(from.bg_surface, to.bg_surface),
+            bg_elevated: c(from.bg_elevated, to.bg_elevated),
+            text_primary: c(from.text_primary, to.text_primary),
+            text_secondary: c(from.text_secondary, to.text_secondary),
+            border: c(from.border, to.border),
+            accent: c(from.accent, to.accent),
+            success: c(from.success, to.success),
+            warning: c(from.warning, to.warning),
+            danger: c(from.danger, to.danger),
+        }
+    }
 }
 
 /// Resolve a [`Theme`] to its concrete [`Tokens`]. `system_prefers_dark` is the
@@ -226,6 +258,32 @@ mod tests {
             let c = contrast_ratio(t.text_secondary, t.bg_base);
             assert!(c >= 3.0, "{theme:?} secondary text contrast {c:.2} < 3.0");
         }
+    }
+
+    #[test]
+    fn color_lerp_hits_both_endpoints() {
+        let a = Color::rgb(0, 0, 0);
+        let b = Color::rgb(255, 100, 50);
+        assert_eq!(Color::lerp(a, b, 0.0), a);
+        assert_eq!(Color::lerp(a, b, 1.0), b);
+        // Midpoint rounds to nearest.
+        assert_eq!(Color::lerp(a, b, 0.5), Color::rgb(128, 50, 25));
+    }
+
+    #[test]
+    fn color_lerp_clamps_out_of_range_t() {
+        let a = Color::rgb(10, 20, 30);
+        let b = Color::rgb(200, 200, 200);
+        assert_eq!(Color::lerp(a, b, -1.0), a);
+        assert_eq!(Color::lerp(a, b, 2.0), b);
+    }
+
+    #[test]
+    fn tokens_lerp_endpoints_are_exact_themes() {
+        let from = tokens_for(Theme::Daylight, false);
+        let to = tokens_for(Theme::Midnight, false);
+        assert_eq!(Tokens::lerp(&from, &to, 0.0).bg_base, from.bg_base);
+        assert_eq!(Tokens::lerp(&from, &to, 1.0).accent, to.accent);
     }
 
     #[test]

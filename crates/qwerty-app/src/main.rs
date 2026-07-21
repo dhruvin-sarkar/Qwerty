@@ -1,11 +1,13 @@
 //! qwerty-app — the Qwerty desktop binary.
 //!
-//! Phase 2: a CLI validation harness (no GUI yet). It exercises the real audio
-//! path — device enumeration and a live onset monitor against the mic — so the
-//! DSP core proven synthetically in Phase 1 can be validated on real hardware
-//! before any GUI is built (`ROADMAP.md`). The egui shell, tray, hotkeys, and
-//! platform action dispatch arrive in later phases.
+//! Launched with no arguments it opens the GUI (Phase 3 onward). The Phase 2
+//! CLI validation harnesses remain available as explicit subcommands — they
+//! exercise the real audio path (device enumeration, live onset monitor, a
+//! terminal calibrate-then-classify preview) so the DSP core can still be
+//! validated on real hardware without the GUI. Tray, hotkeys, and platform
+//! action dispatch arrive in later phases.
 
+mod app_state;
 mod audio_thread;
 mod ui;
 
@@ -39,7 +41,12 @@ fn main() {
             }
         }
         Some("--themes") => ui::theme::print_report(),
-        None => print_usage(),
+        None => {
+            if let Err(e) = ui::shell::run() {
+                eprintln!("error: could not start the GUI: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(other) => {
             eprintln!("error: unknown command: {other}");
             print_usage();
@@ -67,9 +74,10 @@ fn print_usage() {
         env!("CARGO_PKG_VERSION"),
         qwerty_core::CORE_VERSION,
     );
-    println!("Phase 2 CLI validation harness (no GUI yet).");
+    println!("Run with no arguments to open the GUI. Debug subcommands:");
     println!();
     println!("Usage:");
+    println!("  qwerty-app                                open the GUI (default)");
     println!("  qwerty-app --list-devices                 list audio input devices");
     println!("  qwerty-app --monitor [secs] [device]      live onset monitor + level meter (default 20s, default mic)");
     println!("  qwerty-app --live [zones] [taps] [device] calibrate then classify taps live (default 4 zones, 10 taps)");

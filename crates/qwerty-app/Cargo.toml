@@ -15,3 +15,8 @@ repository.workspace = true
 qwerty-core = { path = "../qwerty-core" }
 cpal = { workspace = true }
 rtrb = { workspace = true }
+# Phase 3 — GUI shell, tray icon, global hotkey (ROADMAP.md).
+eframe = { workspace = true }
+egui = { workspace = true }
+tray-icon = { workspace = true }
+global-hotkey = { workspace = true }
