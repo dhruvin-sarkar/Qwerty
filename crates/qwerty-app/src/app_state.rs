@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwerty_core::profile::{Config, Theme};
+use qwerty_core::profile::{Config, Profile, Theme};
 
 /// The main-navigation destinations (`DESIGN.md` → Layout: a persistent
 /// left-hand rail, every area one click away). The calibration wizard is
@@ -155,6 +155,26 @@ impl AppState {
         if let Err(e) = self.config.save(path) {
             eprintln!("warning: could not save {}: {e}", path.display());
         }
+    }
+
+    /// Persist a freshly calibrated profile to `%APPDATA%\Qwerty\Profiles\
+    /// <id>.json` and make it the active profile. Returns a human-readable
+    /// error string for the wizard to surface. No-op-safe when there is no
+    /// config path (returns an error rather than silently dropping the profile).
+    pub fn save_profile(&mut self, profile: &Profile) -> Result<(), String> {
+        let Some(cfg_path) = &self.config_path else {
+            return Err("no %APPDATA% location is available to save the profile".into());
+        };
+        let dir = cfg_path
+            .parent()
+            .map(|p| p.join("Profiles"))
+            .ok_or("invalid config path")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{}.json", profile.id));
+        profile.save(&path).map_err(|e| e.to_string())?;
+        self.config.active_profile_id = Some(profile.id);
+        self.save_config();
+        Ok(())
     }
 
     /// Toggle between Listening and Paused. Does nothing in the `Error` state —

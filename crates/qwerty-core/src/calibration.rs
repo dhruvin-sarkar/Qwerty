@@ -408,6 +408,17 @@ impl CalibrationSession {
         self.per_zone_samples[self.current_zone].clear();
     }
 
+    /// Jump back to a specific zone and clear it for recapture — used when the
+    /// consistency check flags a zone and the user chooses to redo it
+    /// (`DESIGN.md`: "names that zone specifically and offers to redo it").
+    /// Out-of-range indices are ignored.
+    pub fn restart_zone(&mut self, zone: usize) {
+        if zone < self.zone_ids.len() {
+            self.current_zone = zone;
+            self.per_zone_samples[zone].clear();
+        }
+    }
+
     /// Advance to the next zone; returns `false` if already at the last zone.
     pub fn advance_zone(&mut self) -> bool {
         if self.current_zone + 1 < self.zone_ids.len() {

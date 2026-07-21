@@ -15,6 +15,8 @@ repository.workspace = true
 qwerty-core = { path = "../qwerty-core" }
 cpal = { workspace = true }
 rtrb = { workspace = true }
+# Phase 4 — timestamps for profiles created by the calibration wizard.
+chrono = { workspace = true }
 # Phase 3 — GUI shell, tray icon, global hotkey (ROADMAP.md).
 eframe = { workspace = true }
 egui = { workspace = true }

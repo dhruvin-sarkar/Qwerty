@@ -18,6 +18,7 @@ use crate::hotkeys::Hotkeys;
 use crate::tray::{Tray, TrayCommand};
 use crate::ui::motion;
 use crate::ui::theme::{tokens_for, Color, Tokens};
+use crate::ui::wizard::{Wizard, WizardOutcome};
 
 /// Live input status while listening, drained from the capture worker.
 #[derive(Default)]
@@ -58,6 +59,11 @@ struct QwertyApp {
     capture: Option<LiveCapture>,
     /// Live input status drained from the capture worker.
     live: LiveStatus,
+    /// The calibration wizard, present only while it is taking over the window.
+    wizard: Option<Wizard>,
+    /// Set by a "Calibrate" button; the wizard is launched at end of frame so
+    /// the launch doesn't fight the in-progress render borrow.
+    launch_wizard: bool,
 }
 
 impl QwertyApp {
@@ -98,6 +104,8 @@ impl QwertyApp {
             hotkeys,
             capture: None,
             live: LiveStatus::default(),
+            wizard: None,
+            launch_wizard: false,
         }
     }
 
@@ -193,6 +201,37 @@ impl eframe::App for QwertyApp {
         // Apply tray/hotkey events and the close-to-tray policy before painting.
         self.handle_external_events(ctx);
 
+        // The calibration wizard takes over the entire window when active.
+        if self.wizard.is_some() {
+            self.capture = None; // the wizard owns its own mic
+            if self.state.listening == ListeningState::Listening {
+                self.state.listening = ListeningState::Paused;
+            }
+            let tokens = self.effective_tokens(ctx, now);
+            ctx.set_visuals(visuals_for(&tokens));
+            let pal = Palette::from_tokens(&tokens);
+            let mut outcome = None;
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::default()
+                        .fill(pal.base)
+                        .inner_margin(egui::Margin::same(28)),
+                )
+                .show(ctx, |ui| {
+                    outcome = self.wizard.as_mut().and_then(|w| w.ui(ui, &pal));
+                });
+            if let Some(o) = outcome {
+                if let WizardOutcome::Saved(profile) = o {
+                    if let Err(e) = self.state.save_profile(&profile) {
+                        eprintln!("warning: could not save profile: {e}");
+                    }
+                    self.state.screen = Screen::Home;
+                }
+                self.wizard = None;
+            }
+            return;
+        }
+
         // Start/stop the mic to match listening state and absorb capture events.
         self.reconcile_capture(ctx);
 
@@ -216,6 +255,16 @@ impl eframe::App for QwertyApp {
                 Screen::Evaluation => placeholder(ui, &pal, "Evaluation", "Phase 6"),
                 Screen::Settings => self.settings(ui, &pal, now),
             });
+
+        // Launch the wizard at end of frame (set by a Calibrate button), after
+        // the render borrow of `self` is released.
+        if self.launch_wizard {
+            self.launch_wizard = false;
+            self.state.listening = ListeningState::Paused;
+            self.capture = None;
+            self.wizard = Some(Wizard::new(ctx));
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -283,9 +332,13 @@ impl QwertyApp {
         ui.heading(egui::RichText::new("Home").color(pal.text).size(26.0));
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("No profile yet — calibration arrives in Phase 4.")
+            egui::RichText::new("Calibrate a profile to map taps on your desk to actions.")
                 .color(pal.secondary),
         );
+        ui.add_space(12.0);
+        if ui.button("Calibrate a new profile").clicked() {
+            self.launch_wizard = true;
+        }
         ui.add_space(20.0);
 
         // Status card.
@@ -480,21 +533,22 @@ fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// egui `Color32` versions of the semantic tokens, for painting this frame.
-struct Palette {
-    base: egui::Color32,
-    surface: egui::Color32,
-    elevated: egui::Color32,
-    text: egui::Color32,
-    secondary: egui::Color32,
-    border: egui::Color32,
-    accent: egui::Color32,
-    success: egui::Color32,
-    warning: egui::Color32,
-    danger: egui::Color32,
+/// `pub(crate)` so the calibration wizard can paint with the same palette.
+pub(crate) struct Palette {
+    pub(crate) base: egui::Color32,
+    pub(crate) surface: egui::Color32,
+    pub(crate) elevated: egui::Color32,
+    pub(crate) text: egui::Color32,
+    pub(crate) secondary: egui::Color32,
+    pub(crate) border: egui::Color32,
+    pub(crate) accent: egui::Color32,
+    pub(crate) success: egui::Color32,
+    pub(crate) warning: egui::Color32,
+    pub(crate) danger: egui::Color32,
 }
 
 impl Palette {
-    fn from_tokens(t: &Tokens) -> Self {
+    pub(crate) fn from_tokens(t: &Tokens) -> Self {
         Self {
             base: c32(t.bg_base),
             surface: c32(t.bg_surface),
@@ -510,7 +564,7 @@ impl Palette {
     }
 }
 
-fn c32(c: Color) -> egui::Color32 {
+pub(crate) fn c32(c: Color) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 

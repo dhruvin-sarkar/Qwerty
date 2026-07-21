@@ -7,3 +7,4 @@
 pub mod motion;
 pub mod shell;
 pub mod theme;
+pub mod wizard;
