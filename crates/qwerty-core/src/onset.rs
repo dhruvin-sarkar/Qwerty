@@ -49,8 +49,17 @@ pub struct OnsetEvent {
     pub is_transient: bool,
 }
 
-/// Streaming adaptive onset detector.
+/// Streaming adaptive onset detector. Feed it successive sample chunks with
+/// [`OnsetDetector::process`]; it buffers internally so a tap's window may span
+/// many chunks, and drops consumed samples so memory stays bounded.
 pub struct OnsetDetector {
+    /// Samples received but not yet fully scanned (front is compacted away as
+    /// hops are consumed, so this never grows unbounded).
+    buf: Vec<f32>,
+    /// Absolute sample index of `buf[0]`, so emitted `start`s are stream-global.
+    base_index: usize,
+    /// Hops within `buf` already scanned.
+    processed_hops: usize,
     noise_floor: f32,
     prev_hop_rms: f32,
     /// Hops remaining before another onset may fire (refractory period).
@@ -67,6 +76,9 @@ impl Default for OnsetDetector {
 impl OnsetDetector {
     pub fn new() -> Self {
         Self {
+            buf: Vec::new(),
+            base_index: 0,
+            processed_hops: 0,
             noise_floor: ABS_FLOOR,
             prev_hop_rms: 0.0,
             cooldown_hops: 0,
@@ -74,17 +86,21 @@ impl OnsetDetector {
         }
     }
 
-    /// Process a chunk of samples, returning any onsets whose full
-    /// [`FEATURE_WINDOW_SAMPLES`] window fits within this chunk. Rejected
-    /// (sustained) onsets are still returned, flagged `is_transient = false`,
-    /// so callers/soak can account for them.
+    /// Append a chunk of samples and return any onsets whose full
+    /// [`FEATURE_WINDOW_SAMPLES`] window has now arrived. Rejected (sustained)
+    /// onsets are still returned, flagged `is_transient = false`, so
+    /// callers/soak can account for them. Passing an entire clip in one call
+    /// yields exactly the onsets contained in it (the Phase 1 behavior).
     pub fn process(&mut self, samples: &[f32]) -> Vec<OnsetEvent> {
+        self.buf.extend_from_slice(samples);
         let mut events = Vec::new();
-        let hops = samples.len() / HOP;
 
-        for h in 0..hops {
-            let start = h * HOP;
-            let rms = hop_rms(&samples[start..start + HOP]);
+        // Only scan hops that also have a full window of trailing samples, so a
+        // detected onset can be emitted immediately.
+        let max_hop = self.buf.len().saturating_sub(FEATURE_WINDOW_SAMPLES) / HOP;
+        while self.processed_hops < max_hop {
+            let start = self.processed_hops * HOP;
+            let rms = hop_rms(&self.buf[start..start + HOP]);
 
             let elevated = rms > (self.noise_floor * ONSET_RATIO).max(ABS_FLOOR);
             let sharp = rms > self.prev_hop_rms * ATTACK_RATIO;
@@ -92,18 +108,15 @@ impl OnsetDetector {
             if self.cooldown_hops > 0 {
                 self.cooldown_hops -= 1;
             } else if self.initialized && elevated && sharp {
-                // Candidate onset. Capture the window if it fits.
-                if start + FEATURE_WINDOW_SAMPLES <= samples.len() {
-                    let window = samples[start..start + FEATURE_WINDOW_SAMPLES].to_vec();
-                    let is_transient = passes_sustain_gate(&window);
-                    events.push(OnsetEvent {
-                        start,
-                        window,
-                        is_transient,
-                    });
-                    // Refractory: don't re-trigger within one window.
-                    self.cooldown_hops = FEATURE_WINDOW_SAMPLES / HOP;
-                }
+                let window = self.buf[start..start + FEATURE_WINDOW_SAMPLES].to_vec();
+                let is_transient = passes_sustain_gate(&window);
+                events.push(OnsetEvent {
+                    start: self.base_index + start,
+                    window,
+                    is_transient,
+                });
+                // Refractory: don't re-trigger within one window.
+                self.cooldown_hops = FEATURE_WINDOW_SAMPLES / HOP;
             } else {
                 // Quiet hop: let the noise floor track the background.
                 self.noise_floor =
@@ -112,6 +125,16 @@ impl OnsetDetector {
 
             self.prev_hop_rms = rms;
             self.initialized = true;
+            self.processed_hops += 1;
+        }
+
+        // Compact: drop fully-scanned samples from the front (already copied
+        // into any emitted window) so the buffer stays bounded.
+        let drop = self.processed_hops * HOP;
+        if drop > 0 {
+            self.buf.drain(0..drop);
+            self.base_index += drop;
+            self.processed_hops = 0;
         }
         events
     }

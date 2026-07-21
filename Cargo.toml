@@ -21,3 +21,6 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 rustfft = "6"
+# Phase 2 — real audio capture (qwerty-app only; never in qwerty-core).
+cpal = "0.15"
+rtrb = "0.3"

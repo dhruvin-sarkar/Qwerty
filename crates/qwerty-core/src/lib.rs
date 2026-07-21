@@ -9,6 +9,7 @@
 //! Modules are introduced phase by phase per ROADMAP.md; Phase 0 is
 //! scaffolding only.
 
+pub mod capture;
 pub mod classifier;
 pub mod features;
 pub mod onset;

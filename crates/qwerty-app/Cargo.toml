@@ -13,3 +13,5 @@ repository.workspace = true
 
 [dependencies]
 qwerty-core = { path = "../qwerty-core" }
+cpal = { workspace = true }
+rtrb = { workspace = true }
