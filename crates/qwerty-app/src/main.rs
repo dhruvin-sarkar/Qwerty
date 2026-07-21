@@ -8,7 +8,7 @@
 
 mod audio_thread;
 
-use audio_thread::{list_input_devices, run_monitor};
+use audio_thread::{list_input_devices, run_live, run_monitor};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -28,6 +28,13 @@ fn main() {
                 fail(&e);
             }
         }
+        Some("--live") => {
+            let zones = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let taps = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+            if let Err(e) = run_live(zones, taps) {
+                fail(&e);
+            }
+        }
         _ => print_usage(),
     }
 }
@@ -41,8 +48,9 @@ fn print_usage() {
     println!("Phase 2 CLI validation harness (no GUI yet).");
     println!();
     println!("Usage:");
-    println!("  qwerty-app --list-devices        list audio input devices");
-    println!("  qwerty-app --monitor [seconds]   live onset monitor (default 20s) — tap the desk");
+    println!("  qwerty-app --list-devices          list audio input devices");
+    println!("  qwerty-app --monitor [seconds]     live onset monitor (default 20s) — tap the desk");
+    println!("  qwerty-app --live [zones] [taps]   calibrate then classify taps live (default 4 zones, 10 taps)");
 }
 
 fn fail(e: &dyn std::error::Error) -> ! {

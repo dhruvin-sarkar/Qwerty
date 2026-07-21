@@ -228,3 +228,111 @@ pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
     );
     Ok(())
 }
+
+fn wait_for_enter() {
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+}
+
+/// Collect `taps_per_zone` accepted taps from the mic, extracting a feature
+/// vector for each. Blocks until enough transients are captured.
+fn capture_taps(
+    cap: &mut AudioCapture,
+    extractor: &mut qwerty_core::features::FeatureExtractor,
+    taps_per_zone: usize,
+) -> Vec<qwerty_core::features::FeatureVector> {
+    let mut detector = OnsetDetector::new();
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    while out.len() < taps_per_zone {
+        buf.clear();
+        cap.drain(&mut buf);
+        for ev in detector.process(&buf) {
+            if ev.is_transient {
+                out.push(extractor.extract(&ev.window));
+                println!("  captured {}/{taps_per_zone}", out.len());
+                if out.len() >= taps_per_zone {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    out
+}
+
+/// Phase 2 end-to-end CLI: calibrate `zone_count` zones from the mic, train the
+/// Phase 1 classifier, then classify taps live — "tap a real desk and see
+/// correct zone decisions printed live" (`ROADMAP.md`). This is a terminal-only
+/// preview of the calibration wizard built properly in Phase 4; it does not
+/// persist a profile.
+pub fn run_live(zone_count: usize, taps_per_zone: usize) -> Result<(), CaptureError> {
+    use qwerty_core::classifier::ClassifierParams;
+    use qwerty_core::features::{FeatureExtractor, FeatureVector};
+    use qwerty_core::profile::ZoneId;
+
+    let mut cap = AudioCapture::open_default()?;
+    println!(
+        "Live harness on \"{}\" @ {} Hz — {} zones, {} taps each.",
+        cap.device_name,
+        cap.sample_rate(),
+        zone_count,
+        taps_per_zone,
+    );
+
+    let mut extractor = FeatureExtractor::new();
+    let zone_ids: Vec<ZoneId> = (0..zone_count).map(|_| ZoneId::new()).collect();
+    let mut samples: Vec<(ZoneId, FeatureVector)> = Vec::new();
+
+    for (i, &zid) in zone_ids.iter().enumerate() {
+        print!(
+            "\nZone {} — press Enter, then tap that spot {} times… ",
+            i + 1,
+            taps_per_zone,
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        wait_for_enter();
+        // Flush any audio buffered before the user was ready.
+        let mut stale = Vec::new();
+        cap.drain(&mut stale);
+
+        for fv in capture_taps(&mut cap, &mut extractor, taps_per_zone) {
+            samples.push((zid, fv));
+        }
+    }
+
+    let classifier = match ClassifierParams::train(&samples, &[]) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("classifier training failed: {e}");
+            return Ok(());
+        }
+    };
+    println!(
+        "\nTrained on {} taps across {} zones. Tap live now (Ctrl-C to stop)…",
+        samples.len(),
+        zone_count,
+    );
+
+    let mut detector = OnsetDetector::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        cap.drain(&mut buf);
+        for ev in detector.process(&buf) {
+            if ev.is_transient {
+                let fv = extractor.extract(&ev.window);
+                let decision = classifier.classify(&fv);
+                match decision.zone_id {
+                    Some(z) => {
+                        let idx = zone_ids.iter().position(|x| *x == z).unwrap() + 1;
+                        println!("  ZONE {idx}   (confidence {:.2})", decision.confidence);
+                    }
+                    None => println!("  rejected (unknown tap)"),
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}

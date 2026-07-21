@@ -95,11 +95,14 @@ impl OnsetDetector {
         self.buf.extend_from_slice(samples);
         let mut events = Vec::new();
 
-        // Only scan hops that also have a full window of trailing samples, so a
-        // detected onset can be emitted immediately.
-        let max_hop = self.buf.len().saturating_sub(FEATURE_WINDOW_SAMPLES) / HOP;
-        while self.processed_hops < max_hop {
+        // Scan every hop that now has a full window of trailing samples, so a
+        // detected onset can be emitted immediately — and the boundary hop is
+        // not skipped. The guard also makes the window slice below panic-safe.
+        loop {
             let start = self.processed_hops * HOP;
+            if start + FEATURE_WINDOW_SAMPLES > self.buf.len() {
+                break;
+            }
             let rms = hop_rms(&self.buf[start..start + HOP]);
 
             let elevated = rms > (self.noise_floor * ONSET_RATIO).max(ABS_FLOOR);
@@ -234,6 +237,32 @@ mod tests {
                 "tap at amp {amp} should be accepted",
             );
         }
+    }
+
+    #[test]
+    fn streaming_in_small_chunks_matches_single_call() {
+        // A tap fed in sub-hop chunks (as real cpal callbacks deliver it) must
+        // be detected identically to passing the whole clip at once.
+        let clip = clip_with(tap(FEATURE_WINDOW_SAMPLES, 0.8));
+
+        let mut streamed = OnsetDetector::new();
+        let mut events = Vec::new();
+        for chunk in clip.chunks(100) {
+            events.extend(streamed.process(chunk));
+        }
+
+        let mut single = OnsetDetector::new();
+        let one_shot = single.process(&clip);
+
+        assert!(
+            events.iter().any(|e| e.is_transient),
+            "streaming across chunk boundaries should still detect the tap",
+        );
+        assert_eq!(
+            events.len(),
+            one_shot.len(),
+            "chunked and single-call must agree on onset count",
+        );
     }
 
     use proptest::prelude::*;
