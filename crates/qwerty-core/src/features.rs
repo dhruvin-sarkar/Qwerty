@@ -357,4 +357,28 @@ mod tests {
             assert!((a - b).abs() < 1e-3, "cepstral shifted with loudness");
         }
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Invariant (TESTING.md): for any bounded tone, features are finite and
+        /// the spectral bands form a non-negative distribution summing to ~1.
+        #[test]
+        fn features_are_finite_and_bands_form_a_distribution(
+            freq in 100.0f32..8000.0,
+            amp in 0.01f32..1.0,
+        ) {
+            let mut ex = FeatureExtractor::new();
+            let win: Vec<f32> = (0..FEATURE_WINDOW_SAMPLES)
+                .map(|i| {
+                    amp * (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE_HZ as f32).sin()
+                })
+                .collect();
+            let fv = ex.extract(&win);
+            prop_assert!(fv.is_finite());
+            prop_assert!(fv.spectral_bands.iter().all(|b| *b >= 0.0));
+            let sum: f32 = fv.spectral_bands.iter().sum();
+            prop_assert!((sum - 1.0).abs() < 1e-2, "bands sum {sum} not ~1");
+        }
+    }
 }

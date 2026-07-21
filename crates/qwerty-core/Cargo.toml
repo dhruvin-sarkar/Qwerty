@@ -18,3 +18,4 @@ chrono = { workspace = true }
 rustfft = { workspace = true }
 
 [dev-dependencies]
+proptest = "1"

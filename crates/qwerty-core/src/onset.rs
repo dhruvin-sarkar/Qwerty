@@ -212,4 +212,46 @@ mod tests {
             );
         }
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Invariant (ACCEPTANCE.md): no steady tone, at any frequency or
+        /// amplitude, is ever accepted as a tap — the zero-false-accepts claim
+        /// generalized over the input space. A steady tone's energy does not
+        /// decay, so the head-vs-tail gate must always reject it.
+        #[test]
+        fn steady_tones_are_never_accepted_as_taps(
+            freq in 150.0f32..3000.0,
+            amp in 0.05f32..1.0,
+        ) {
+            let mut d = OnsetDetector::new();
+            let n = FEATURE_WINDOW_SAMPLES * 2;
+            let signal: Vec<f32> = (0..n)
+                .map(|i| amp * (2.0 * PI * freq * i as f32 / SAMPLE_RATE_HZ as f32).sin())
+                .collect();
+            let events = d.process(&clip_with(signal));
+            prop_assert!(events.iter().all(|e| !e.is_transient));
+        }
+
+        /// Invariant: a sharp, fast-decaying impulse is accepted as a tap across
+        /// the plausible range of decay rates, carrier frequencies, and levels.
+        #[test]
+        fn fast_decay_impulses_are_accepted(
+            decay in 90.0f32..240.0,
+            freq in 500.0f32..6000.0,
+            amp in 0.2f32..1.0,
+        ) {
+            let mut d = OnsetDetector::new();
+            let n = FEATURE_WINDOW_SAMPLES;
+            let signal: Vec<f32> = (0..n)
+                .map(|i| {
+                    let t = i as f32 / SAMPLE_RATE_HZ as f32;
+                    amp * (-t * decay).exp() * (2.0 * PI * freq * i as f32 / SAMPLE_RATE_HZ as f32).sin()
+                })
+                .collect();
+            let events = d.process(&clip_with(signal));
+            prop_assert!(events.iter().any(|e| e.is_transient));
+        }
+    }
 }
