@@ -261,6 +261,25 @@ mod tests {
     }
 
     #[test]
+    fn primary_text_is_legible_on_every_background_layer() {
+        // The shell paints primary text on all three background layers (central
+        // panel = bg_base, nav rail = bg_surface, cards/menus = bg_elevated).
+        // Each pairing must clear WCAG AA for normal text (ACCEPTANCE.md → UI:
+        // "no illegible text in any theme" — the automated half of that row).
+        for theme in CONCRETE_THEMES {
+            let t = tokens_for(theme, false);
+            for (name, bg) in [
+                ("bg_base", t.bg_base),
+                ("bg_surface", t.bg_surface),
+                ("bg_elevated", t.bg_elevated),
+            ] {
+                let c = contrast_ratio(t.text_primary, bg);
+                assert!(c >= 4.5, "{theme:?} primary text on {name} contrast {c:.2} < 4.5 (AA)");
+            }
+        }
+    }
+
+    #[test]
     fn color_lerp_hits_both_endpoints() {
         let a = Color::rgb(0, 0, 0);
         let b = Color::rgb(255, 100, 50);
