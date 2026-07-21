@@ -24,14 +24,16 @@ fn main() {
         },
         Some("--monitor") => {
             let seconds = arg_or(&args, 2, 20u64, "seconds");
-            if let Err(e) = run_monitor(seconds) {
+            let device = args.get(3).map(String::as_str);
+            if let Err(e) = run_monitor(seconds, device) {
                 fail(&e);
             }
         }
         Some("--live") => {
             let zones = arg_or(&args, 2, 4usize, "zones");
             let taps = arg_or(&args, 3, 10usize, "taps");
-            if let Err(e) = run_live(zones, taps) {
+            let device = args.get(4).map(String::as_str);
+            if let Err(e) = run_live(zones, taps, device) {
                 fail(&e);
             }
         }
@@ -66,9 +68,11 @@ fn print_usage() {
     println!("Phase 2 CLI validation harness (no GUI yet).");
     println!();
     println!("Usage:");
-    println!("  qwerty-app --list-devices          list audio input devices");
-    println!("  qwerty-app --monitor [seconds]     live onset monitor (default 20s) — tap the desk");
-    println!("  qwerty-app --live [zones] [taps]   calibrate then classify taps live (default 4 zones, 10 taps)");
+    println!("  qwerty-app --list-devices                 list audio input devices");
+    println!("  qwerty-app --monitor [secs] [device]      live onset monitor + level meter (default 20s, default mic)");
+    println!("  qwerty-app --live [zones] [taps] [device] calibrate then classify taps live (default 4 zones, 10 taps)");
+    println!();
+    println!("  [device] = a list index (see --list-devices) or a name substring, e.g. \"Realtek\".");
 }
 
 fn fail(e: &dyn std::error::Error) -> ! {

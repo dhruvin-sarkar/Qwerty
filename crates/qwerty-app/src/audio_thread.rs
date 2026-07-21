@@ -25,6 +25,8 @@ use qwerty_core::onset::OnsetDetector;
 #[derive(Debug)]
 pub enum CaptureError {
     NoInputDevice,
+    /// A device selector (index or name substring) matched nothing.
+    DeviceNotFound(String),
     Enumerate(cpal::DevicesError),
     DeviceName(cpal::DeviceNameError),
     DefaultConfig(cpal::DefaultStreamConfigError),
@@ -40,6 +42,7 @@ impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureError::NoInputDevice => write!(f, "no audio input device is available"),
+            CaptureError::DeviceNotFound(s) => write!(f, "no input device matched \"{s}\""),
             CaptureError::Enumerate(e) => write!(f, "could not enumerate input devices: {e}"),
             CaptureError::DeviceName(e) => write!(f, "could not read a device name: {e}"),
             CaptureError::DefaultConfig(e) => write!(f, "no default input config: {e}"),
@@ -108,6 +111,34 @@ pub fn list_input_devices() -> Result<Vec<String>, CaptureError> {
     Ok(names)
 }
 
+/// Resolve an input device by list index or case-insensitive name substring;
+/// `None` selects the system default.
+fn resolve_device(selector: Option<&str>) -> Result<cpal::Device, CaptureError> {
+    let host = cpal::default_host();
+    let Some(sel) = selector else {
+        return host
+            .default_input_device()
+            .ok_or(CaptureError::NoInputDevice);
+    };
+    let devices: Vec<cpal::Device> = host
+        .input_devices()
+        .map_err(CaptureError::Enumerate)?
+        .collect();
+    if let Ok(idx) = sel.parse::<usize>() {
+        return devices
+            .into_iter()
+            .nth(idx)
+            .ok_or_else(|| CaptureError::DeviceNotFound(sel.to_string()));
+    }
+    let needle = sel.to_lowercase();
+    for d in devices {
+        if d.name().is_ok_and(|n| n.to_lowercase().contains(&needle)) {
+            return Ok(d);
+        }
+    }
+    Err(CaptureError::DeviceNotFound(sel.to_string()))
+}
+
 /// An open capture stream on the default input device. Holds the live `cpal`
 /// stream and the consumer end of the sample ring.
 pub struct AudioCapture {
@@ -130,12 +161,10 @@ impl AudioSource for AudioCapture {
 }
 
 impl AudioCapture {
-    /// Open the system default input device and start streaming.
-    pub fn open_default() -> Result<Self, CaptureError> {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or(CaptureError::NoInputDevice)?;
+    /// Open a chosen input device (by list index or case-insensitive name
+    /// substring; `None` = system default) and start streaming.
+    pub fn open(selector: Option<&str>) -> Result<Self, CaptureError> {
+        let device = resolve_device(selector)?;
         let device_name = device.name().map_err(CaptureError::DeviceName)?;
         let supported = device
             .default_input_config()
@@ -240,8 +269,8 @@ where
 /// as the user taps the desk. Runs for `seconds`, then prints a summary. This
 /// is the "tap a real desk and see decisions printed live" harness from
 /// `ROADMAP.md` (zone classification arrives with calibration in Phase 4).
-pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
-    let mut cap = AudioCapture::open_default()?;
+pub fn run_monitor(seconds: u64, device: Option<&str>) -> Result<(), CaptureError> {
+    let mut cap = AudioCapture::open(device)?;
     println!(
         "Listening on \"{}\" @ {} Hz, {} ch for {}s. Tap the desk near the mic…",
         cap.device_name,
@@ -252,17 +281,24 @@ pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
     if cap.sample_rate() != SAMPLE_RATE_HZ {
         println!(
             "(note: device runs at {} Hz vs the {} Hz the DSP core is tuned for; onset \
-             detection still works — the classification path resamples at calibration time.)",
+             detection still works.)",
             cap.sample_rate(),
             SAMPLE_RATE_HZ,
         );
     }
+    println!(
+        "A per-second level meter prints below. If it reads 'silent' while you tap, the mic \
+         is not hearing the desk — pick another device, e.g. `--monitor {seconds} \"Realtek\"`.",
+    );
 
     let mut detector = OnsetDetector::new();
     let mut buf: Vec<f32> = Vec::with_capacity(cap.sample_rate() as usize);
     let (mut taps, mut rejects) = (0u32, 0u32);
+    // Per-second signal accounting for the level meter (evidence, not a guess).
+    let (mut sec_sumsq, mut sec_count, mut sec_peak) = (0.0f64, 0usize, 0.0f32);
 
     let start = Instant::now();
+    let mut last_tick = start;
     while start.elapsed() < Duration::from_secs(seconds) {
         if cap.stream_failed() {
             return Err(CaptureError::StreamFailed);
@@ -270,6 +306,11 @@ pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
         buf.clear();
         cap.drain(&mut buf);
         if !buf.is_empty() {
+            for &s in &buf {
+                sec_sumsq += (s as f64) * (s as f64);
+                sec_peak = sec_peak.max(s.abs());
+            }
+            sec_count += buf.len();
             for ev in detector.process(&buf) {
                 if ev.is_transient {
                     taps += 1;
@@ -280,6 +321,22 @@ pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
                 }
             }
         }
+        if last_tick.elapsed() >= Duration::from_secs(1) {
+            let rms = if sec_count > 0 {
+                (sec_sumsq / sec_count as f64).sqrt() as f32
+            } else {
+                0.0
+            };
+            println!(
+                "  level  {sec_count:>6} samp/s  rms {:<8}  peak {:<8}  taps={taps} rejects={rejects}",
+                fmt_dbfs(rms),
+                fmt_dbfs(sec_peak),
+            );
+            sec_sumsq = 0.0;
+            sec_count = 0;
+            sec_peak = 0.0;
+            last_tick = Instant::now();
+        }
         std::thread::sleep(Duration::from_millis(15));
     }
 
@@ -288,6 +345,15 @@ pub fn run_monitor(seconds: u64) -> Result<(), CaptureError> {
         cap.dropped(),
     );
     Ok(())
+}
+
+/// Format a linear amplitude (0..1) as dBFS, or "silent" for ~zero.
+fn fmt_dbfs(amp: f32) -> String {
+    if amp <= 1e-9 {
+        "silent".to_string()
+    } else {
+        format!("{:>5.1}dB", 20.0 * amp.log10())
+    }
 }
 
 fn wait_for_enter() {
@@ -331,12 +397,16 @@ fn capture_taps(
 /// correct zone decisions printed live" (`ROADMAP.md`). This is a terminal-only
 /// preview of the calibration wizard built properly in Phase 4; it does not
 /// persist a profile.
-pub fn run_live(zone_count: usize, taps_per_zone: usize) -> Result<(), LiveError> {
+pub fn run_live(
+    zone_count: usize,
+    taps_per_zone: usize,
+    device: Option<&str>,
+) -> Result<(), LiveError> {
     use qwerty_core::classifier::ClassifierParams;
     use qwerty_core::features::{FeatureExtractor, FeatureVector};
     use qwerty_core::profile::ZoneId;
 
-    let mut cap = AudioCapture::open_default()?;
+    let mut cap = AudioCapture::open(device)?;
     println!(
         "Live harness on \"{}\" @ {} Hz — {} zones, {} taps each.",
         cap.device_name,
