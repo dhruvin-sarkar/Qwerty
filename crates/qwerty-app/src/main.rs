@@ -7,6 +7,7 @@
 //! platform action dispatch arrive in later phases.
 
 mod audio_thread;
+mod ui;
 
 use audio_thread::{list_input_devices, run_live, run_monitor};
 
@@ -37,6 +38,7 @@ fn main() {
                 fail(&e);
             }
         }
+        Some("--themes") => ui::theme::print_report(),
         None => print_usage(),
         Some(other) => {
             eprintln!("error: unknown command: {other}");
@@ -71,6 +73,7 @@ fn print_usage() {
     println!("  qwerty-app --list-devices                 list audio input devices");
     println!("  qwerty-app --monitor [secs] [device]      live onset monitor + level meter (default 20s, default mic)");
     println!("  qwerty-app --live [zones] [taps] [device] calibrate then classify taps live (default 4 zones, 10 taps)");
+    println!("  qwerty-app --themes                       show the 5 theme palettes + WCAG contrast check");
     println!();
     println!("  [device] = a list index (see --list-devices) or a name substring, e.g. \"Realtek\".");
 }
