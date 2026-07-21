@@ -9,6 +9,8 @@
 
 mod app_state;
 mod audio_thread;
+mod hotkeys;
+mod tray;
 mod ui;
 
 use audio_thread::{list_input_devices, run_live, run_monitor};

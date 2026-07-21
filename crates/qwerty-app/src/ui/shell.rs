@@ -13,6 +13,8 @@ use std::time::Instant;
 use qwerty_core::profile::Theme;
 
 use crate::app_state::{AppState, ListeningState, Screen};
+use crate::hotkeys::Hotkeys;
+use crate::tray::{Tray, TrayCommand};
 use crate::ui::motion;
 use crate::ui::theme::{tokens_for, Color, Tokens};
 
@@ -34,6 +36,12 @@ pub fn run() -> eframe::Result<()> {
 
 struct QwertyApp {
     state: AppState,
+    /// The tray icon + menu. `None` if the tray failed to initialize — the GUI
+    /// still runs (the tray is an affordance, not a precondition).
+    tray: Option<Tray>,
+    /// The global listening-toggle hotkey. `None` if registration failed
+    /// (e.g. the combo is already claimed by another app).
+    hotkeys: Option<Hotkeys>,
 }
 
 impl QwertyApp {
@@ -44,7 +52,75 @@ impl QwertyApp {
         // egui default palette (`PERFORMANCE.md`: no flash of unstyled content).
         let tokens = tokens_for(state.config.theme, system_dark);
         cc.egui_ctx.set_visuals(visuals_for(&tokens));
-        Self { state }
+
+        // Wake the UI when a tray/menu/hotkey event arrives. Each thread blocks
+        // on its process-global receiver and requests a repaint — so idle costs
+        // nothing (the thread parks) yet the UI reacts the instant an event
+        // lands, even with the window hidden to the tray (`PERFORMANCE.md`).
+        spawn_wake_thread(cc.egui_ctx.clone());
+
+        // The tray must be created on this (the main / event-loop) thread on
+        // Windows, which is where the eframe creator runs.
+        let tray = match Tray::new(state.listening) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("warning: tray icon unavailable: {e}");
+                None
+            }
+        };
+        let hotkeys = match Hotkeys::new() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("warning: global hotkey unavailable: {e}");
+                None
+            }
+        };
+
+        Self {
+            state,
+            tray,
+            hotkeys,
+        }
+    }
+
+    /// Apply tray/hotkey events and the close-to-tray policy. Returns after
+    /// mutating `self.state` and issuing any viewport commands.
+    fn handle_external_events(&mut self, ctx: &egui::Context) {
+        if let Some(hk) = &self.hotkeys {
+            if hk.poll_toggle() {
+                self.state.toggle_listening();
+            }
+        }
+        if let Some(tray) = &mut self.tray {
+            for cmd in tray.poll() {
+                match cmd {
+                    TrayCommand::ToggleListening => {
+                        self.state.toggle_listening();
+                    }
+                    TrayCommand::OpenWindow => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    TrayCommand::Quit => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+            // Keep the tray icon in sync however the state changed (hotkey,
+            // tray menu, or an in-window button).
+            tray.set_state(self.state.listening);
+        }
+
+        // Close-to-tray: intercept the window-close request and hide instead,
+        // when configured and a tray exists to restore from. Otherwise let the
+        // close proceed and the app exits.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.state.config.minimize_to_tray_on_close
+            && self.tray.is_some()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
     }
 }
 
@@ -55,6 +131,9 @@ impl eframe::App for QwertyApp {
         // Keep the OS dark/light preference current so `Theme::System` tracks it
         // live. A change while on System simply recomputes effective tokens.
         self.state.system_dark = read_system_dark(ctx);
+
+        // Apply tray/hotkey events and the close-to-tray policy before painting.
+        self.handle_external_events(ctx);
 
         // Resolve this frame's effective tokens, advancing any theme cross-fade.
         let tokens = self.effective_tokens(ctx, now);
@@ -163,6 +242,17 @@ impl QwertyApp {
                     self.state.toggle_listening();
                 }
             });
+            if self.hotkeys.is_some() {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Toggle listening from anywhere with {}.",
+                        Hotkeys::DEFAULT_LABEL
+                    ))
+                    .color(pal.secondary)
+                    .small(),
+                );
+            }
         });
 
         ui.add_space(16.0);
@@ -329,6 +419,26 @@ impl Palette {
 
 fn c32(c: Color) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
+}
+
+/// Spawn one background thread per external event source (tray, menu, hotkey).
+/// Each blocks on its process-global receiver and requests a repaint when an
+/// event arrives — parking (zero CPU) while idle. The receivers are `'static`
+/// and never disconnect, so `recv()` only returns on a real event.
+fn spawn_wake_thread(ctx: egui::Context) {
+    let sources: [fn() -> bool; 3] = [
+        || tray_icon::TrayIconEvent::receiver().recv().is_ok(),
+        || tray_icon::menu::MenuEvent::receiver().recv().is_ok(),
+        || global_hotkey::GlobalHotKeyEvent::receiver().recv().is_ok(),
+    ];
+    for wait_for_event in sources {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            while wait_for_event() {
+                ctx.request_repaint();
+            }
+        });
+    }
 }
 
 /// Read the OS dark-mode preference; default to dark when unknown (Midnight is
