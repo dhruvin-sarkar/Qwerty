@@ -10,12 +10,14 @@
 
 use std::time::Instant;
 
-use qwerty_core::profile::Theme;
+use qwerty_core::profile::{Theme, ZoneId};
 
 use crate::app_state::{AppState, ListeningState, Screen};
 use crate::capture_worker::{CaptureEvent, LiveCapture};
 use crate::hotkeys::Hotkeys;
+use crate::platform::{platform_for_this_os, PlatformActions};
 use crate::tray::{Tray, TrayCommand};
+use crate::ui::action_editor::ActionEditor;
 use crate::ui::motion;
 use crate::ui::theme::{tokens_for, Color, Tokens};
 use crate::ui::wizard::{Wizard, WizardOutcome};
@@ -64,6 +66,13 @@ struct QwertyApp {
     /// Set by a "Calibrate" button; the wizard is launched at end of frame so
     /// the launch doesn't fight the in-progress render borrow.
     launch_wizard: bool,
+    /// The OS action backend (constructed once, on the UI thread). Boxed trait
+    /// object so the DSP/UI never names a Windows type directly.
+    platform: Box<dyn PlatformActions>,
+    /// Transient state for the Zones action editor.
+    action_editor: ActionEditor,
+    /// Which zone is selected in the Zones editor.
+    selected_zone: Option<ZoneId>,
 }
 
 impl QwertyApp {
@@ -106,6 +115,9 @@ impl QwertyApp {
             live: LiveStatus::default(),
             wizard: None,
             launch_wizard: false,
+            platform: platform_for_this_os(),
+            action_editor: ActionEditor::default(),
+            selected_zone: None,
         }
     }
 
@@ -250,7 +262,7 @@ impl eframe::App for QwertyApp {
             )
             .show(ctx, |ui| match self.state.screen {
                 Screen::Home => self.home(ui, &pal),
-                Screen::Zones => placeholder(ui, &pal, "Zones & profiles", "Phase 4–5"),
+                Screen::Zones => self.zones(ui, &pal),
                 Screen::Diagnostics => placeholder(ui, &pal, "Diagnostics", "Phase 6"),
                 Screen::Evaluation => placeholder(ui, &pal, "Evaluation", "Phase 6"),
                 Screen::Settings => self.settings(ui, &pal, now),
@@ -430,6 +442,85 @@ impl QwertyApp {
         );
     }
 
+    fn zones(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.heading(
+            egui::RichText::new("Zones & profiles")
+                .color(pal.text)
+                .size(26.0),
+        );
+        ui.add_space(8.0);
+
+        // Disjoint field borrows so the editor can hold the profile + platform
+        // at once.
+        let Self {
+            state,
+            action_editor,
+            platform,
+            selected_zone,
+            launch_wizard,
+            ..
+        } = self;
+
+        let Some(profile) = state.active_profile.as_mut() else {
+            ui.label(
+                egui::RichText::new(
+                    "No profile yet. Calibrate one to define zones and bind actions.",
+                )
+                .color(pal.secondary),
+            );
+            ui.add_space(10.0);
+            if ui.button("Calibrate a new profile").clicked() {
+                *launch_wizard = true;
+            }
+            return;
+        };
+
+        // Default/repair the selection.
+        if selected_zone.is_none() || !profile.zones.iter().any(|z| Some(z.id) == *selected_zone) {
+            *selected_zone = profile.zones.first().map(|z| z.id);
+        }
+
+        let mut changed = false;
+        ui.columns(2, |cols| {
+            cols[0].label(egui::RichText::new(&profile.name).color(pal.text).strong());
+            cols[0].add_space(6.0);
+            for z in &profile.zones {
+                let sel = Some(z.id) == *selected_zone;
+                let text =
+                    egui::RichText::new(&z.label).color(if sel { pal.accent } else { pal.text });
+                if cols[0].selectable_label(sel, text).clicked() {
+                    *selected_zone = Some(z.id);
+                }
+            }
+
+            let right = &mut cols[1];
+            match selected_zone.and_then(|sel| profile.zones.iter_mut().find(|z| z.id == sel)) {
+                Some(zone) => {
+                    right.label(
+                        egui::RichText::new(format!("Actions for “{}”", zone.label))
+                            .color(pal.text)
+                            .strong(),
+                    );
+                    right.add_space(6.0);
+                    egui::ScrollArea::vertical().show(right, |ui| {
+                        changed = action_editor.ui(ui, pal, &mut zone.actions, platform.as_ref());
+                    });
+                }
+                None => {
+                    right.label(
+                        egui::RichText::new("This profile has no zones.").color(pal.secondary),
+                    );
+                }
+            }
+        });
+
+        if changed {
+            if let Err(e) = state.save_active_profile() {
+                eprintln!("warning: could not save profile: {e}");
+            }
+        }
+    }
+
     fn settings(&mut self, ui: &mut egui::Ui, pal: &Palette, now: Instant) {
         ui.heading(egui::RichText::new("Settings").color(pal.text).size(26.0));
         ui.add_space(16.0);
@@ -539,8 +630,8 @@ fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
     ui.add_space(6.0);
 }
 
-/// A simple elevated card frame.
-fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
+/// A simple elevated card frame. `pub(crate)` so the action editor reuses it.
+pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::default()
         .fill(pal.elevated)
         .stroke(egui::Stroke::new(1.0_f32, pal.border))

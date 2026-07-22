@@ -4,6 +4,7 @@
 //! then the motion tokens, then the eframe window/navigation rail/screens that
 //! read from both. The tray/hotkey wiring is layered on next.
 
+pub mod action_editor;
 pub mod motion;
 pub mod shell;
 pub mod theme;

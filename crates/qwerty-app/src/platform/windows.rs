@@ -1,0 +1,304 @@
+//! Windows implementation of [`PlatformActions`] (Phase 5).
+//!
+//! Every Win32 signature here was verified against the installed
+//! `windows-0.62.2` source. This is the only OS-touching module; `qwerty-core`
+//! stays platform-free. Construction is infallible (it degrades with a warning
+//! like the tray/hotkey setup) and everything runs on the UI thread, so the
+//! `!Send` `Tts` engine in a `RefCell` is fine.
+
+use std::os::windows::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
+
+use arboard::{Clipboard, ImageData};
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY,
+};
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY,
+};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, MB_ICONASTERISK, MB_ICONEXCLAMATION, MB_ICONHAND, MB_OK, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNORMAL,
+};
+use qwerty_core::profile::{KeyCombo, Modifier, ScreenshotMode, SystemSound};
+
+use super::{ActionError, PlatformActions, ToastSpec};
+
+/// Run a launched command without flashing a console window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The Windows action backend. A unit struct today: `speak` (tts crate) and
+/// `notify` (winrt-toast crate) are pending — those crates aren't in the
+/// offline cache — so this holds no state yet.
+pub struct WindowsPlatform;
+
+impl Default for WindowsPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WindowsPlatform {
+    pub fn new() -> Self {
+        WindowsPlatform
+    }
+
+    /// Open a file/folder/app/URL with the shell's default "open" verb.
+    fn shell_open(target: &str) -> Result<(), ActionError> {
+        let wide = HSTRING::from(target);
+        let r = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW returns an HINSTANCE whose value is > 32 on success and a
+        // SE_ERR_* code otherwise (Win32 contract).
+        let code = r.0 as isize;
+        if code > 32 {
+            return Ok(());
+        }
+        match code {
+            2 | 3 => Err(ActionError::TargetNotFound(target.to_string())),
+            other => Err(ActionError::LaunchFailed {
+                target: target.to_string(),
+                reason: format!("shell refused to open target (SE_ERR {other})"),
+            }),
+        }
+    }
+}
+
+/// Map a platform-neutral key name to a Windows virtual-key code + whether it is
+/// an "extended" key (arrows need `KEYEVENTF_EXTENDEDKEY`).
+fn vk_of(name: &str) -> Result<(VIRTUAL_KEY, bool), ActionError> {
+    let n = name.trim();
+    if n.len() == 1 {
+        let c = n.as_bytes()[0].to_ascii_uppercase();
+        if c.is_ascii_uppercase() || c.is_ascii_digit() {
+            return Ok((VIRTUAL_KEY(c as u16), false));
+        }
+    }
+    if let Some(num) = n.strip_prefix(['F', 'f']).and_then(|d| d.parse::<u16>().ok()) {
+        if (1..=12).contains(&num) {
+            return Ok((VIRTUAL_KEY(0x70 + num - 1), false)); // VK_F1 = 0x70
+        }
+    }
+    let (vk, ext): (u16, bool) = match n.to_ascii_lowercase().as_str() {
+        "space" | "spacebar" => (0x20, false),
+        "enter" | "return" => (0x0D, false),
+        "tab" => (0x09, false),
+        "esc" | "escape" => (0x1B, false),
+        "left" => (0x25, true),
+        "up" => (0x26, true),
+        "right" => (0x27, true),
+        "down" => (0x28, true),
+        other => return Err(ActionError::Keystroke(format!("unrecognized key \"{other}\""))),
+    };
+    Ok((VIRTUAL_KEY(vk), ext))
+}
+
+fn modifier_vk(m: &Modifier) -> VIRTUAL_KEY {
+    VIRTUAL_KEY(match m {
+        Modifier::Ctrl => 0x11,
+        Modifier::Shift => 0x10,
+        Modifier::Alt => 0x12,
+        Modifier::Win => 0x5B,
+    })
+}
+
+fn key_event(vk: VIRTUAL_KEY, ext: bool, press: bool) -> INPUT {
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if ext {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if !press {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+impl PlatformActions for WindowsPlatform {
+    fn open_uri(&self, uri: &str) -> Result<(), ActionError> {
+        Self::shell_open(uri)
+    }
+
+    fn open_path(&self, path: &Path) -> Result<(), ActionError> {
+        let target = path
+            .to_str()
+            .ok_or_else(|| ActionError::TargetNotFound(path.display().to_string()))?;
+        Self::shell_open(target)
+    }
+
+    fn run_command(&self, cmd: &str, args: &[String]) -> Result<(), ActionError> {
+        match Command::new(cmd)
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(_child) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ActionError::TargetNotFound(cmd.to_string()))
+            }
+            Err(e) => Err(ActionError::LaunchFailed {
+                target: cmd.to_string(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    fn copy_to_clipboard(&self, text: &str) -> Result<(), ActionError> {
+        let mut cb = Clipboard::new().map_err(|e| ActionError::Clipboard(e.to_string()))?;
+        cb.set_text(text)
+            .map_err(|e| ActionError::Clipboard(e.to_string()))
+    }
+
+    fn play_sound(&self, sound: SystemSound) -> Result<(), ActionError> {
+        let flag = match sound {
+            SystemSound::Default => MB_OK,
+            SystemSound::Success => MB_ICONASTERISK,
+            SystemSound::Error => MB_ICONHAND,
+            SystemSound::Notification => MB_ICONEXCLAMATION,
+        };
+        unsafe { MessageBeep(flag) }.map_err(|e| ActionError::Sound(e.to_string()))
+    }
+
+    fn send_keystroke(&self, combo: &KeyCombo) -> Result<(), ActionError> {
+        let (key, ext) = vk_of(&combo.key)?; // resolve before touching the OS
+        let mut inputs = Vec::with_capacity((combo.modifiers.len() + 1) * 2);
+        for m in &combo.modifiers {
+            inputs.push(key_event(modifier_vk(m), false, true));
+        }
+        inputs.push(key_event(key, ext, true));
+        inputs.push(key_event(key, ext, false));
+        for m in combo.modifiers.iter().rev() {
+            inputs.push(key_event(modifier_vk(m), false, false));
+        }
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            let e = unsafe { GetLastError() };
+            return Err(ActionError::Keystroke(format!(
+                "SendInput injected {sent}/{} (GetLastError {:#x})",
+                inputs.len(),
+                e.0
+            )));
+        }
+        Ok(())
+    }
+
+    fn screenshot_to_clipboard(&self, mode: ScreenshotMode) -> Result<(), ActionError> {
+        match mode {
+            ScreenshotMode::RegionSelect => {
+                return Err(ActionError::Unsupported("region-select screenshot"))
+            }
+            ScreenshotMode::FullScreen => {}
+        }
+        unsafe {
+            let (x, y) = (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+            );
+            let (w, h) = (
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            );
+            if w <= 0 || h <= 0 {
+                return Err(ActionError::Screenshot("virtual screen size is 0".into()));
+            }
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return Err(ActionError::Screenshot("GetDC(NULL) returned null".into()));
+            }
+
+            let grab = || -> Result<(usize, usize, Vec<u8>), ActionError> {
+                let mem = CreateCompatibleDC(Some(screen));
+                let bmp = CreateCompatibleBitmap(screen, w, h);
+                let old = SelectObject(mem, bmp.into());
+                let blt = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY);
+                let mut bi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h, // negative => top-down rows
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: 0, // BI_RGB
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut buf = vec![0u8; (w as usize) * (h as usize) * 4]; // BGRX
+                let ok = blt.is_ok()
+                    && GetDIBits(
+                        mem,
+                        bmp,
+                        0,
+                        h as u32,
+                        Some(buf.as_mut_ptr().cast()),
+                        &mut bi,
+                        DIB_RGB_COLORS,
+                    ) != 0;
+                SelectObject(mem, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(mem);
+                if !ok {
+                    return Err(ActionError::Screenshot("BitBlt/GetDIBits failed".into()));
+                }
+                // BGRX -> RGBA (arboard wants meaningful RGBA; force opaque alpha).
+                for px in buf.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                    px[3] = 255;
+                }
+                Ok((w as usize, h as usize, buf))
+            };
+            let result = grab();
+            let _ = ReleaseDC(None, screen);
+            let (wi, hi, rgba) = result?;
+            let mut cb = Clipboard::new().map_err(|e| ActionError::Screenshot(e.to_string()))?;
+            cb.set_image(ImageData {
+                width: wi,
+                height: hi,
+                bytes: rgba.into(),
+            })
+            .map_err(|e| ActionError::Screenshot(e.to_string()))
+        }
+    }
+
+    fn speak(&self, _text: &str) -> Result<(), ActionError> {
+        // Pending: the `tts` crate isn't in the offline cache. Grounded impl
+        // (long-lived Tts in a RefCell, interrupt=true) is ready to drop in
+        // once the registry is reachable.
+        Err(ActionError::Unsupported(
+            "text-to-speech (tts crate not yet fetched)",
+        ))
+    }
+
+    fn notify(&self, _toast: &ToastSpec) -> Result<(), ActionError> {
+        // Pending: the `winrt-toast` crate isn't in the offline cache. Grounded
+        // impl (AUMID register + ToastManager) is ready once fetchable.
+        Err(ActionError::Unsupported(
+            "toast notifications (winrt-toast crate not yet fetched)",
+        ))
+    }
+}

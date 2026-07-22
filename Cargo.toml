@@ -38,3 +38,20 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "defa
 egui = "0.31"
 tray-icon = "0.24"
 global-hotkey = "0.8"
+# Phase 5 — platform action dispatch (qwerty-app only; qwerty-core stays OS-free).
+# The `windows` feature set was verified against the installed windows-0.62.2
+# source (0.62 is already in the lockfile via tray-icon/global-hotkey). NOTE:
+# MessageBeep lives in Win32_System_Diagnostics_Debug, not WindowsAndMessaging.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Diagnostics_Debug",
+] }
+arboard = "3"
+# NOTE: tts (TTS) and winrt-toast (toasts) are intentionally NOT added yet —
+# they are not in the offline cache and the registry is currently unreachable.
+# WindowsPlatform::speak / notify return a clear Unsupported until they can be
+# fetched; every other action is implemented with windows + arboard (cached).

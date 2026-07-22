@@ -209,6 +209,17 @@ impl AppState {
         Ok(())
     }
 
+    /// Persist edits made in place to the active profile (e.g. action bindings),
+    /// stamping `updated_at`. No-op error if there is no active profile.
+    pub fn save_active_profile(&mut self) -> Result<(), String> {
+        let mut p = self
+            .active_profile
+            .clone()
+            .ok_or("no active profile to save")?;
+        p.updated_at = chrono::Utc::now();
+        self.save_profile(&p)
+    }
+
     /// Toggle between Listening and Paused. Does nothing in the `Error` state —
     /// a device error must be resolved, not toggled past (`ARCHITECTURE.md` →
     /// fail fast). Returns the new state.
