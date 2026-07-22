@@ -28,8 +28,18 @@ pub const MIN_SAMPLES_PER_ZONE: usize = 2;
 
 /// A tap is clipped if its peak reaches this fraction of full scale.
 const CLIP_PEAK: f32 = 0.98;
-/// Absolute RMS below which a tap is too weak to be usable.
-const WEAK_RMS: f32 = 0.01;
+/// Onset-region RMS below which a window is treated as *digital silence*, not a
+/// tap. This is only a silence guard, mirroring `onset.rs` ABS_FLOOR — the
+/// meaningful "too quiet to use" decision is the SNR check below (onset energy
+/// vs the room's noise floor). It was -40 dBFS (`0.01`), ~200-300x hotter than
+/// a real low-gain USB mic delivers: the reference Razer headset's accepted
+/// taps have an onset-region RMS near -87 dBFS (~4.5e-5), so every tap the
+/// onset detector accepts (after the ABS_FLOOR fix) was still labelled TooWeak
+/// here and calibration was impossible. Lowered to ~-120 dB so it clears only
+/// true silence; NOTE this is not a remedy for a tap that sits under the noise
+/// floor in a genuinely noisy room — uniform gain scales signal and noise
+/// alike, so the ceiling there is the mic's SNR, and the SNR check handles it.
+const WEAK_RMS: f32 = 1e-6;
 /// A tap must exceed the measured noise floor by this factor, else it is
 /// masked by ambient noise (mirrors the onset detector's `ONSET_RATIO`).
 const MASK_RATIO: f32 = 3.0;
@@ -546,11 +556,30 @@ mod tests {
         // Clipped: reaches full scale.
         let clipped = vec![1.0f32; n];
         assert_eq!(assess_tap(&clipped, 0.001), TapFeedback::Clipped);
-        // Too weak: essentially silent.
-        let weak = vec![0.001f32; n];
+        // Too weak: essentially digital silence (below the silence guard).
+        let weak = vec![1e-7f32; n];
         assert_eq!(assess_tap(&weak, 0.0), TapFeedback::TooWeak);
         // Masked: a real-ish level but the room floor is nearly as loud.
         assert_eq!(assess_tap(&good, 0.2), TapFeedback::MaskedByNoise);
+    }
+
+    #[test]
+    fn low_gain_mic_tap_is_accepted_over_a_quiet_room() {
+        // Reference hardware: a Razer USB headset whose accepted desk taps have
+        // an onset-region RMS near -87 dBFS (~4.5e-5) over a near-silent room
+        // (~-140 dBFS). This tap MUST be Accepted — the old WEAK_RMS=0.01 made
+        // it TooWeak and calibration impossible on the real device.
+        let n = FEATURE_WINDOW_SAMPLES;
+        let edge = 600.min(n);
+        let mut w = vec![0.0f32; n];
+        for s in w.iter_mut().take(edge) {
+            *s = 4.5e-5;
+        }
+        assert_eq!(assess_tap(&w, 1e-7), TapFeedback::Accepted);
+        // Genuine digital silence is still rejected.
+        assert_eq!(assess_tap(&vec![0.0f32; n], 0.0), TapFeedback::TooWeak);
+        // And a tap only marginally above a loud room floor is still masked.
+        assert_eq!(assess_tap(&w, 4.5e-5), TapFeedback::MaskedByNoise);
     }
 
     #[test]
