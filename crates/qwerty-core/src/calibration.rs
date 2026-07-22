@@ -14,7 +14,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::classifier::{ClassifierError, ClassifierParams};
-use crate::features::{FeatureExtractor, FeatureVector, FEATURE_WINDOW_SAMPLES};
+use crate::features::{FeatureExtractor, FeatureVector, FEATURE_WINDOW_SAMPLES, SAMPLE_RATE_HZ};
 use crate::profile::{
     DeviceFingerprint, Profile, SensingMode, Zone, ZoneId, ZoneLayout, PROFILE_SCHEMA_VERSION,
 };
@@ -159,31 +159,51 @@ pub fn assess_environment(noise_rms: f32) -> EnvironmentQuality {
 
 /// Judge one captured window for calibration quality, given the room's measured
 /// noise floor (0.0 if unknown, which disables the masking check).
+///
+/// Loudness is measured over the **onset region** (the first ~15 ms of the
+/// window, where the tap's transient actually is), not the whole 90 ms window.
+/// A tap is a brief transient; averaging over the long silent decay tail
+/// systematically under-reads its level, so whole-window RMS would reject
+/// genuine taps — the very taps the onset detector already accepted, which
+/// gates on the transient's per-hop energy — as `TooWeak` or `MaskedByNoise`.
+/// Clipping is still checked against the peak anywhere in the window.
 pub fn assess_tap(window: &[f32], noise_floor: f32) -> TapFeedback {
+    if window.is_empty() {
+        return TapFeedback::TooWeak;
+    }
     let mut peak = 0.0f32;
-    let mut sum_sq = 0.0f64;
     for &s in window {
         if !s.is_finite() {
             return TapFeedback::TooWeak;
         }
         peak = peak.max(s.abs());
-        sum_sq += (s as f64) * (s as f64);
     }
-    let rms = if window.is_empty() {
-        0.0
-    } else {
-        (sum_sq / window.len() as f64).sqrt() as f32
-    };
+    let edge = onset_edge(window.len());
+    let onset_rms = rms(&window[..edge]);
 
     if peak >= CLIP_PEAK {
         TapFeedback::Clipped
-    } else if rms < WEAK_RMS {
+    } else if onset_rms < WEAK_RMS {
         TapFeedback::TooWeak
-    } else if noise_floor > 0.0 && rms < noise_floor * MASK_RATIO {
+    } else if noise_floor > 0.0 && onset_rms < noise_floor * MASK_RATIO {
         TapFeedback::MaskedByNoise
     } else {
         TapFeedback::Accepted
     }
+}
+
+/// RMS of a slice.
+fn rms(x: &[f32]) -> f32 {
+    if x.is_empty() {
+        return 0.0;
+    }
+    (x.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / x.len() as f64).sqrt() as f32
+}
+
+/// The onset-region span: the first ~15 ms of the window (matching the onset
+/// detector's edge span), clamped to the window length.
+fn onset_edge(n: usize) -> usize {
+    ((SAMPLE_RATE_HZ as usize * 15) / 1000).clamp(1, n)
 }
 
 /// Leave-one-out cross-validation across the captured zones: for each sample,
@@ -531,6 +551,28 @@ mod tests {
         assert_eq!(assess_tap(&weak, 0.0), TapFeedback::TooWeak);
         // Masked: a real-ish level but the room floor is nearly as loud.
         assert_eq!(assess_tap(&good, 0.2), TapFeedback::MaskedByNoise);
+    }
+
+    #[test]
+    fn brief_transient_tap_is_accepted_not_weak_or_masked() {
+        // A real tap: a short, clearly-audible onset followed by a long silent
+        // decay tail. Its whole-90ms-window RMS is small, but its onset-region
+        // energy is strong. The old whole-window measure rejected such taps as
+        // MaskedByNoise (and, when softer, TooWeak); measuring the onset region
+        // accepts them — matching what the onset detector already accepted.
+        let n = FEATURE_WINDOW_SAMPLES;
+        let onset = 200.min(n);
+        let mut w = vec![0.0f32; n];
+        for s in w.iter_mut().take(onset) {
+            *s = 0.1;
+        }
+        let whole_rms =
+            (w.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / n as f64).sqrt() as f32;
+        // The whole-window RMS is under the old masking threshold at this floor,
+        // which is exactly what used to (wrongly) reject the tap.
+        assert!(whole_rms < 0.01 * MASK_RATIO, "whole_rms {whole_rms}");
+        assert_eq!(assess_tap(&w, 0.0), TapFeedback::Accepted);
+        assert_eq!(assess_tap(&w, 0.01), TapFeedback::Accepted);
     }
 
     #[test]
