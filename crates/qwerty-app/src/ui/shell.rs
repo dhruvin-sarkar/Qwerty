@@ -331,12 +331,29 @@ impl QwertyApp {
     fn home(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.heading(egui::RichText::new("Home").color(pal.text).size(26.0));
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("Calibrate a profile to map taps on your desk to actions.")
-                .color(pal.secondary),
-        );
+        if let Some(profile) = &self.state.active_profile {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Active profile: {}  ·  {} zone{}",
+                    profile.name,
+                    profile.zones.len(),
+                    if profile.zones.len() == 1 { "" } else { "s" },
+                ))
+                .color(pal.text),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("Calibrate a profile to map taps on your desk to actions.")
+                    .color(pal.secondary),
+            );
+        }
         ui.add_space(12.0);
-        if ui.button("Calibrate a new profile").clicked() {
+        let calibrate_label = if self.state.active_profile.is_some() {
+            "Recalibrate / new profile"
+        } else {
+            "Calibrate a new profile"
+        };
+        if ui.button(calibrate_label).clicked() {
             self.launch_wizard = true;
         }
         ui.add_space(20.0);

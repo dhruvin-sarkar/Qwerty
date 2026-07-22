@@ -105,6 +105,9 @@ pub struct AppState {
     pub theme_transition: Option<ThemeTransition>,
     /// Last-known OS dark-mode preference, consulted for [`Theme::System`].
     pub system_dark: bool,
+    /// The currently-active profile, loaded from disk (`None` until one is
+    /// calibrated/selected, or if its file is missing/corrupt).
+    pub active_profile: Option<Profile>,
 }
 
 impl AppState {
@@ -126,7 +129,37 @@ impl AppState {
             },
             _ => Config::default(),
         };
-        Self::with_config(config, config_path, system_dark)
+        let mut state = Self::with_config(config, config_path, system_dark);
+        state.reload_active_profile();
+        state
+    }
+
+    /// The `Profiles/` directory beside `config.json`, or `None` without a path.
+    fn profiles_dir(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("Profiles"))
+    }
+
+    /// (Re)load the active profile named by `config.active_profile_id` from
+    /// disk into [`active_profile`](Self::active_profile). A missing or corrupt
+    /// profile is logged and leaves it `None` — the app still runs and the user
+    /// can recalibrate, rather than failing to start (fail loud, not fatal).
+    pub fn reload_active_profile(&mut self) {
+        self.active_profile = None;
+        let (Some(id), Some(dir)) = (self.config.active_profile_id, self.profiles_dir()) else {
+            return;
+        };
+        let path = dir.join(format!("{id}.json"));
+        if !path.exists() {
+            eprintln!("warning: active profile {id} not found at {}", path.display());
+            return;
+        }
+        match Profile::load(&path) {
+            Ok(p) => self.active_profile = Some(p),
+            Err(e) => eprintln!("warning: could not load active profile: {e}"),
+        }
     }
 
     /// Core constructor from an already-resolved config and (optional) path.
@@ -139,6 +172,7 @@ impl AppState {
             listening: ListeningState::Paused,
             theme_transition: None,
             system_dark,
+            active_profile: None,
         }
     }
 
@@ -162,18 +196,16 @@ impl AppState {
     /// error string for the wizard to surface. No-op-safe when there is no
     /// config path (returns an error rather than silently dropping the profile).
     pub fn save_profile(&mut self, profile: &Profile) -> Result<(), String> {
-        let Some(cfg_path) = &self.config_path else {
-            return Err("no %APPDATA% location is available to save the profile".into());
-        };
-        let dir = cfg_path
-            .parent()
-            .map(|p| p.join("Profiles"))
-            .ok_or("invalid config path")?;
+        let dir = self
+            .profiles_dir()
+            .ok_or("no %APPDATA% location is available to save the profile")?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{}.json", profile.id));
         profile.save(&path).map_err(|e| e.to_string())?;
         self.config.active_profile_id = Some(profile.id);
         self.save_config();
+        // Reflect the newly-saved profile in memory immediately.
+        self.active_profile = Some(profile.clone());
         Ok(())
     }
 
