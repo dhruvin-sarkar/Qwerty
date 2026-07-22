@@ -200,7 +200,7 @@ impl Config {
 
     /// Write to a file path as pretty JSON.
     pub fn save(&self, path: &std::path::Path) -> Result<(), PersistenceError> {
-        std::fs::write(path, self.to_json()).map_err(PersistenceError::Io)
+        write_atomic(path, &self.to_json()).map_err(PersistenceError::Io)
     }
 }
 
@@ -277,7 +277,7 @@ impl Profile {
 
     /// Write to a file path as pretty JSON.
     pub fn save(&self, path: &std::path::Path) -> Result<(), PersistenceError> {
-        std::fs::write(path, self.to_json()).map_err(PersistenceError::Io)
+        write_atomic(path, &self.to_json()).map_err(PersistenceError::Io)
     }
 }
 
@@ -334,6 +334,19 @@ impl std::error::Error for PersistenceError {
             PersistenceError::InvalidData { .. } => None,
         }
     }
+}
+
+/// Write `contents` to `path` atomically: serialize to a sibling `*.tmp` file,
+/// then rename it over the target. A crash or full disk mid-write leaves the
+/// previously-good file untouched instead of truncating it — losing a profile
+/// (with its trained classifier) to a torn write would force a full
+/// recalibration (`DATA_MODEL.md` → durability of the primary mechanism).
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents)?;
+    // `rename` replaces an existing destination on Windows and is atomic within
+    // a volume; tmp is a sibling so it is always the same volume.
+    std::fs::rename(&tmp, path)
 }
 
 /// Parse `s` into `T`, but only after confirming its `schema_version` matches

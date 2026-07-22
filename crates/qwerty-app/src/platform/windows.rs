@@ -198,6 +198,15 @@ impl PlatformActions for WindowsPlatform {
         let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent as usize != inputs.len() {
             let e = unsafe { GetLastError() };
+            // A partial injection (blocked by UIPI or a low-level hook) may have
+            // pressed modifiers down without their matching key-up ever landing,
+            // which would leave Ctrl/Shift/Alt/Win stuck down system-wide. Emit a
+            // best-effort key-up for the key and every modifier before failing.
+            let mut release = vec![key_event(key, ext, false)];
+            for m in &combo.modifiers {
+                release.push(key_event(modifier_vk(m), false, false));
+            }
+            unsafe { SendInput(&release, std::mem::size_of::<INPUT>() as i32) };
             return Err(ActionError::Keystroke(format!(
                 "SendInput injected {sent}/{} (GetLastError {:#x})",
                 inputs.len(),
@@ -249,16 +258,19 @@ impl PlatformActions for WindowsPlatform {
                     ..Default::default()
                 };
                 let mut buf = vec![0u8; (w as usize) * (h as usize) * 4]; // BGRX
-                let ok = blt.is_ok()
-                    && GetDIBits(
-                        mem,
-                        bmp,
-                        0,
-                        h as u32,
-                        Some(buf.as_mut_ptr().cast()),
-                        &mut bi,
-                        DIB_RGB_COLORS,
-                    ) != 0;
+                // With a buffer supplied, GetDIBits returns the number of scan
+                // lines copied; require the FULL height, not merely nonzero, so
+                // a short copy is a loud error rather than a truncated image.
+                let lines = GetDIBits(
+                    mem,
+                    bmp,
+                    0,
+                    h as u32,
+                    Some(buf.as_mut_ptr().cast()),
+                    &mut bi,
+                    DIB_RGB_COLORS,
+                );
+                let ok = blt.is_ok() && lines == h;
                 SelectObject(mem, old);
                 let _ = DeleteObject(bmp.into());
                 let _ = DeleteDC(mem);

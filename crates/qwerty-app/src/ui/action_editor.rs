@@ -8,15 +8,16 @@
 
 use egui::{Button, ComboBox, RichText};
 
-use qwerty_core::profile::{ActionSpec, Modifier, ScreenshotMode, SystemSound};
+use qwerty_core::profile::{ActionSpec, Modifier, ScreenshotMode, SystemSound, ZoneId};
 
 use crate::platform::{dispatch, PlatformActions};
 use crate::ui::shell::{card, Palette};
 
-/// Transient editor state (the last Test result to show inline).
+/// Transient editor state: the last Test result, scoped to the zone + row it
+/// was run on so it never bleeds onto a different zone's row.
 #[derive(Default)]
 pub struct ActionEditor {
-    last_test: Option<(usize, Result<(), String>)>,
+    last_test: Option<(ZoneId, usize, Result<(), String>)>,
 }
 
 /// The action variants as a pickable list — an exhaustive mirror of
@@ -131,6 +132,7 @@ impl ActionEditor {
         &mut self,
         ui: &mut egui::Ui,
         pal: &Palette,
+        zone_id: ZoneId,
         actions: &mut Vec<ActionSpec>,
         platform: &dyn PlatformActions,
     ) -> bool {
@@ -151,7 +153,7 @@ impl ActionEditor {
             let row_status = self
                 .last_test
                 .as_ref()
-                .and_then(|(ti, r)| (*ti == i).then_some(r));
+                .and_then(|(zid, ti, r)| (*zid == zone_id && *ti == i).then_some(r));
             ui.push_id(i, |ui| {
                 card(ui, pal, |ui| {
                     ui.horizontal(|ui| {
@@ -213,12 +215,17 @@ impl ActionEditor {
                 Op::MoveUp(i) => actions.swap(i, i - 1),
                 Op::MoveDown(i) => actions.swap(i, i + 1),
             }
-            self.last_test = None;
             changed = true;
-        } else if let Some(i) = test_req {
+        }
+        // Any committed edit (type switch, field edit, add, reorder, remove)
+        // invalidates a stale Test badge — its row/content has moved.
+        if changed {
+            self.last_test = None;
+        }
+        if let Some(i) = test_req {
             if let Some(spec) = actions.get(i) {
                 let res = dispatch(spec, platform).map_err(|e| e.to_string());
-                self.last_test = Some((i, res));
+                self.last_test = Some((zone_id, i, res));
             }
         }
 

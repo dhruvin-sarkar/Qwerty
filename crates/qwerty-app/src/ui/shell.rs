@@ -502,8 +502,9 @@ impl QwertyApp {
                             .strong(),
                     );
                     right.add_space(6.0);
+                    let zid = zone.id;
                     egui::ScrollArea::vertical().show(right, |ui| {
-                        changed = action_editor.ui(ui, pal, &mut zone.actions, platform.as_ref());
+                        changed = action_editor.ui(ui, pal, zid, &mut zone.actions, platform.as_ref());
                     });
                 }
                 None => {
