@@ -312,12 +312,29 @@ pub fn run_monitor(seconds: u64, device: Option<&str>) -> Result<(), CaptureErro
             }
             sec_count += buf.len();
             for ev in detector.process(&buf) {
+                // Per-onset diagnostics: the numbers that discriminate why a
+                // real tap does or doesn't register (see the theory in the
+                // commit that added this). `assess_tap` is the exact gate the
+                // calibration wizard applies to an accepted transient; running
+                // it here (noise_floor = 0, isolating the weak/clip test) shows
+                // whether the wizard would then reject a tap the detector took.
+                let (peak, wrms, decay) = window_stats(&ev.window);
                 if ev.is_transient {
                     taps += 1;
-                    println!("  TAP  #{taps:<4} transient accepted");
+                    let verdict = qwerty_core::calibration::assess_tap(&ev.window, 0.0);
+                    println!(
+                        "  TAP  #{taps:<4} peak {}  win-rms {}  decay {decay:.2}  →  wizard: {verdict:?} ({})",
+                        fmt_dbfs(peak),
+                        fmt_dbfs(wrms),
+                        verdict.reason(),
+                    );
                 } else {
                     rejects += 1;
-                    println!("  ---  rejected (sustained / noise)");
+                    println!(
+                        "  ---  rejected as sustained: peak {}  win-rms {}  decay {decay:.2}  (tap gate needs decay < 0.50)",
+                        fmt_dbfs(peak),
+                        fmt_dbfs(wrms),
+                    );
                 }
             }
         }
@@ -345,6 +362,37 @@ pub fn run_monitor(seconds: u64, device: Option<&str>) -> Result<(), CaptureErro
         cap.dropped(),
     );
     Ok(())
+}
+
+/// Diagnostic stats for one captured window: peak amplitude, whole-window RMS,
+/// and the head→tail energy decay ratio (the exact quantity the onset
+/// detector's sustained-sound gate thresholds at 0.50). Computed here from the
+/// event's window so no change to `qwerty-core` is needed just to observe it.
+fn window_stats(w: &[f32]) -> (f32, f32, f32) {
+    let n = w.len();
+    if n == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut peak = 0.0f32;
+    let mut sumsq = 0.0f64;
+    for &s in w {
+        peak = peak.max(s.abs());
+        sumsq += (s as f64) * (s as f64);
+    }
+    let rms = (sumsq / n as f64).sqrt() as f32;
+    // Same ~15 ms edges the sustain gate uses (onset.rs EDGE_SAMPLES).
+    let edge = ((SAMPLE_RATE_HZ as usize * 15) / 1000).min(n / 4).max(1);
+    let mean_sq = |sl: &[f32]| -> f64 {
+        if sl.is_empty() {
+            0.0
+        } else {
+            sl.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / sl.len() as f64
+        }
+    };
+    let head = mean_sq(&w[..edge]);
+    let tail = mean_sq(&w[n - edge..]);
+    let decay = (tail / (head + 1e-12)) as f32;
+    (peak, rms, decay)
 }
 
 /// Format a linear amplitude (0..1) as dBFS, or "silent" for ~zero.
