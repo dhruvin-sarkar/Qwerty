@@ -22,8 +22,17 @@ const ONSET_RATIO: f32 = 3.0;
 /// …and rise at least this sharply versus the previous hop (fast attack).
 const ATTACK_RATIO: f32 = 2.0;
 
-/// Absolute RMS floor below which nothing triggers (keeps silence quiet).
-const ABS_FLOOR: f32 = 1e-3;
+/// Absolute RMS floor below which nothing triggers (keeps *digital* silence
+/// quiet). Detection is otherwise SNR-relative (`noise_floor * ONSET_RATIO`),
+/// so this is only a guard against triggering on true silence — not a minimum
+/// tap loudness. It was originally -60 dB (`1e-3`), which turned out to be far
+/// hotter than real low-gain USB mics deliver: a captured desk tap on a Razer
+/// USB headset peaked at ~-81 dB with a per-hop RMS near -90 dB (evidence from
+/// the `--monitor` diagnostic), i.e. entirely below the old floor, so no onset
+/// could ever fire despite a clean ~60 dB tap-to-silence SNR. Lowered to
+/// ~-120 dB so the relative gate does the real work and quiet-but-clean mics
+/// are heard; measured room silence sat near -147 dB, well below this.
+const ABS_FLOOR: f32 = 1e-6;
 
 /// Noise-floor EMA rate (only updated on quiet hops so taps don't raise it).
 const NOISE_EMA_ALPHA: f32 = 0.05;
