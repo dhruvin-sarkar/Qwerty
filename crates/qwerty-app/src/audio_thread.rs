@@ -265,6 +265,88 @@ where
     )
 }
 
+/// Adaptive input-gain normalization for the capture path.
+///
+/// Low-gain mics (e.g. a USB headset) deliver taps 20-40 dB below what the
+/// DSP's absolute gates were tuned for. This brings any mic into one level
+/// domain by tracking a slow peak envelope and applying a gain toward a target
+/// peak. It lives in `qwerty-app` (not `qwerty-core`), so the soak path — which
+/// drives the core directly — is provably unaffected.
+///
+/// Safety (the reason this can ship without live tuning): the gain changes by
+/// at most [`GAIN_STEP`] *per block*, so it can never produce the ≥2×-in-one-hop
+/// rise the onset detector needs to see a "sharp" attack — a gain ramp cannot
+/// masquerade as a tap. It also never attenuates and never chases *silence*
+/// upward. Both properties are covered by unit tests below.
+pub struct InputNormalizer {
+    peak_env: f32,
+    gain: f32,
+}
+
+/// Target peak the normalizer aims the loudest recent sample at (~-15 dBFS).
+const TARGET_PEAK: f32 = 0.18;
+/// Gain ceiling (+36 dB) and floor (never attenuate).
+const MAX_GAIN: f32 = 64.0;
+const MIN_GAIN: f32 = 1.0;
+/// Envelope attack/release per block (fast up, slow down → multi-second release).
+const ENV_ATTACK: f32 = 0.5;
+const ENV_RELEASE: f32 = 0.02;
+/// Max fractional gain change per block — the anti-false-trigger guarantee.
+const GAIN_STEP: f32 = 0.01;
+/// Block peaks below this are treated as silence: hold gain, don't ramp up.
+const SILENCE_PEAK: f32 = 1e-5;
+
+impl Default for InputNormalizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputNormalizer {
+    pub fn new() -> Self {
+        Self {
+            peak_env: TARGET_PEAK,
+            gain: MIN_GAIN,
+        }
+    }
+
+    /// The gain currently being applied (for a low-signal UI indicator).
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Normalize a drained mono block in place.
+    pub fn process(&mut self, buf: &mut [f32]) {
+        let block_peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        // Peak envelope: fast attack, slow release.
+        let rate = if block_peak > self.peak_env {
+            ENV_ATTACK
+        } else {
+            ENV_RELEASE
+        };
+        self.peak_env += (block_peak - self.peak_env) * rate;
+
+        // Desired gain — but only chase when THIS block has real signal; hold
+        // through silence (gated on the block peak, not the slowly-releasing
+        // envelope) so a quiet stretch never ramps the floor up into a false
+        // trigger.
+        let desired = if block_peak > SILENCE_PEAK {
+            (TARGET_PEAK / self.peak_env).clamp(MIN_GAIN, MAX_GAIN)
+        } else {
+            self.gain
+        };
+
+        // Move gain toward `desired` by at most GAIN_STEP (fractional) per block.
+        let max_delta = GAIN_STEP * self.gain;
+        let delta = (desired - self.gain).clamp(-max_delta, max_delta);
+        self.gain = (self.gain + delta).clamp(MIN_GAIN, MAX_GAIN);
+
+        for s in buf.iter_mut() {
+            *s *= self.gain;
+        }
+    }
+}
+
 /// Phase 2 CLI validation: open the default mic and print live onset decisions
 /// as the user taps the desk. Runs for `seconds`, then prints a summary. This
 /// is the "tap a real desk and see decisions printed live" harness from
@@ -292,9 +374,11 @@ pub fn run_monitor(seconds: u64, device: Option<&str>) -> Result<(), CaptureErro
     );
 
     let mut detector = OnsetDetector::new();
+    let mut normalizer = InputNormalizer::new();
     let mut buf: Vec<f32> = Vec::with_capacity(cap.sample_rate() as usize);
     let (mut taps, mut rejects) = (0u32, 0u32);
     // Per-second signal accounting for the level meter (evidence, not a guess).
+    // Measured on the RAW signal so the meter still reveals the true mic level.
     let (mut sec_sumsq, mut sec_count, mut sec_peak) = (0.0f64, 0usize, 0.0f32);
 
     let start = Instant::now();
@@ -311,6 +395,9 @@ pub fn run_monitor(seconds: u64, device: Option<&str>) -> Result<(), CaptureErro
                 sec_peak = sec_peak.max(s.abs());
             }
             sec_count += buf.len();
+            // Normalize for detection (mic-independent level); the meter above
+            // already captured the raw level.
+            normalizer.process(&mut buf);
             for ev in detector.process(&buf) {
                 // Per-onset diagnostics: the numbers that discriminate why a
                 // real tap does or doesn't register (see the theory in the
@@ -345,9 +432,10 @@ pub fn run_monitor(seconds: u64, device: Option<&str>) -> Result<(), CaptureErro
                 0.0
             };
             println!(
-                "  level  {sec_count:>6} samp/s  rms {:<8}  peak {:<8}  taps={taps} rejects={rejects}",
+                "  level  {sec_count:>6} samp/s  rms {:<8}  peak {:<8}  gain x{:<4.0}  taps={taps} rejects={rejects}",
                 fmt_dbfs(rms),
                 fmt_dbfs(sec_peak),
+                normalizer.gain(),
             );
             sec_sumsq = 0.0;
             sec_count = 0;
@@ -514,5 +602,74 @@ pub fn run_live(
             }
         }
         std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+#[cfg(test)]
+mod normalizer_tests {
+    use super::*;
+
+    /// A block with the given peak (two opposite-sign spikes; rest silent).
+    fn block(peak: f32, n: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; n];
+        if n >= 2 {
+            v[0] = peak;
+            v[n / 2] = -peak;
+        }
+        v
+    }
+
+    #[test]
+    fn never_attenuates_and_stays_capped() {
+        let mut nz = InputNormalizer::new();
+        for _ in 0..2000 {
+            let mut b = block(0.3, 512);
+            nz.process(&mut b);
+            assert!(nz.gain() >= MIN_GAIN - 1e-6 && nz.gain() <= MAX_GAIN + 1e-6);
+        }
+    }
+
+    #[test]
+    fn gain_step_per_block_cannot_fake_an_attack() {
+        // The safety guarantee: gain changes by at most GAIN_STEP per block, so
+        // it can never rise >=2x within a hop and read as a sharp onset.
+        let mut nz = InputNormalizer::new();
+        let mut prev = nz.gain();
+        for i in 0..1000 {
+            let mut b = block(if i % 2 == 0 { 1e-3 } else { 0.5 }, 512);
+            nz.process(&mut b);
+            let ratio = nz.gain() / prev;
+            assert!(
+                (ratio - 1.0).abs() <= GAIN_STEP + 1e-4,
+                "gain jumped {prev} -> {} (ratio {ratio})",
+                nz.gain(),
+            );
+            prev = nz.gain();
+        }
+    }
+
+    #[test]
+    fn boosts_a_quiet_but_clean_signal() {
+        let mut nz = InputNormalizer::new();
+        for _ in 0..3000 {
+            let mut b = block(5e-4, 512); // ~-66 dBFS, like a low-gain mic tap
+            nz.process(&mut b);
+        }
+        assert!(nz.gain() > 10.0, "gain only reached {}", nz.gain());
+        assert!(5e-4 * nz.gain() > 0.02, "signal not meaningfully lifted");
+    }
+
+    #[test]
+    fn does_not_amplify_silence() {
+        let mut nz = InputNormalizer::new();
+        for _ in 0..2000 {
+            let mut b = vec![0.0f32; 512];
+            nz.process(&mut b);
+        }
+        assert!(
+            (nz.gain() - MIN_GAIN).abs() < 1e-6,
+            "silence pushed gain to {}",
+            nz.gain(),
+        );
     }
 }

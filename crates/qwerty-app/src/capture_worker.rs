@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use qwerty_core::onset::OnsetDetector;
 
-use crate::audio_thread::AudioCapture;
+use crate::audio_thread::{AudioCapture, InputNormalizer};
 
 /// How often the worker emits an input-level sample (bounded-rate meter).
 const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
@@ -121,6 +121,7 @@ fn run_worker(
     ctx.request_repaint();
 
     let mut detector = OnsetDetector::new();
+    let mut normalizer = InputNormalizer::new();
     let mut buf: Vec<f32> = Vec::new();
     let (mut sum_sq, mut count, mut peak) = (0.0f64, 0usize, 0.0f32);
     let mut last_level = Instant::now();
@@ -137,6 +138,9 @@ fn run_worker(
         buf.clear();
         cap.drain(&mut buf);
         if !buf.is_empty() {
+            // Normalize to a mic-independent level before both the meter and
+            // onset detection, so the wizard's level-based gates work on any mic.
+            normalizer.process(&mut buf);
             for &s in &buf {
                 sum_sq += (s as f64) * (s as f64);
                 peak = peak.max(s.abs());
