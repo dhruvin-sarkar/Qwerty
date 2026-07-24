@@ -341,7 +341,11 @@ impl std::error::Error for PersistenceError {
 /// previously-good file untouched instead of truncating it — losing a profile
 /// (with its trained classifier) to a torn write would force a full
 /// recalibration (`DATA_MODEL.md` → durability of the primary mechanism).
-fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+///
+/// `pub(crate)` so [`crate::evaluation`] persists reports through the *same* one
+/// atomic-write path rather than a second, subtly-different copy (`CLAUDE.md`:
+/// one way to do things).
+pub(crate) fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, contents)?;
     // `rename` replaces an existing destination on Windows and is atomic within
@@ -352,7 +356,10 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
 /// Parse `s` into `T`, but only after confirming its `schema_version` matches
 /// `expected`. A missing version is treated as `0` (a mismatch). Corrupt JSON
 /// surfaces as [`PersistenceError::Json`] — never a panic or partial load.
-fn parse_versioned<T: DeserializeOwned>(
+///
+/// `pub(crate)` so [`crate::evaluation`] loads reports under the identical
+/// schema-version policy as `Profile`/`Config` (one versioned-load path).
+pub(crate) fn parse_versioned<T: DeserializeOwned>(
     s: &str,
     expected: u32,
     file: &str,

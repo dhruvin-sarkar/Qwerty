@@ -12,7 +12,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwerty_core::profile::{Config, Profile, Theme};
+use qwerty_core::evaluation::EvaluationReport;
+use qwerty_core::profile::{Config, Profile, ProfileId, Theme};
 
 /// The main-navigation destinations (`DESIGN.md` → Layout: a persistent
 /// left-hand rail, every area one click away). The calibration wizard is
@@ -142,6 +143,22 @@ impl AppState {
             .map(|p| p.join("Profiles"))
     }
 
+    /// The `Evaluations/` directory beside `config.json` (sibling of `Profiles/`,
+    /// per `ARCHITECTURE.md` → Persistence), or `None` without a path.
+    fn evaluations_dir(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("Evaluations"))
+    }
+
+    /// A profile's evaluation-report directory: `Evaluations/<profile-id>/`
+    /// (`DATA_MODEL.md`). Reports are kept per-profile so the Evaluation screen
+    /// can show one profile's accuracy trend over time.
+    fn profile_eval_dir(&self, profile_id: ProfileId) -> Option<PathBuf> {
+        self.evaluations_dir().map(|d| d.join(profile_id.to_string()))
+    }
+
     /// (Re)load the active profile named by `config.active_profile_id` from
     /// disk into [`active_profile`](Self::active_profile). A missing or corrupt
     /// profile is logged and leaves it `None` — the app still runs and the user
@@ -218,6 +235,54 @@ impl AppState {
             .ok_or("no active profile to save")?;
         p.updated_at = chrono::Utc::now();
         self.save_profile(&p)
+    }
+
+    /// Persist a finished evaluation report to
+    /// `Evaluations/<profile-id>/<timestamp>.json` and return the path written.
+    /// The filename uses a filesystem-safe compact timestamp (`:` is illegal in
+    /// Windows paths, so RFC 3339 can't be the filename); the RFC-3339 `run_at`
+    /// inside the JSON is unchanged. Returns an error string (never silently
+    /// drops the report) when there is no `%APPDATA%` location.
+    pub fn save_evaluation_report(&self, report: &EvaluationReport) -> Result<PathBuf, String> {
+        let dir = self
+            .profile_eval_dir(report.profile_id)
+            .ok_or("no %APPDATA% location is available to save the report")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let stamp = report.run_at.format("%Y%m%dT%H%M%S%3fZ").to_string();
+        let path = dir.join(format!("{stamp}.json"));
+        report.save(&path).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// Load a profile's saved evaluation reports, oldest first (by `run_at`), for
+    /// the history/trend view. A report that fails to load (corrupt or a schema
+    /// mismatch from an older build) is logged and skipped rather than aborting
+    /// the whole list — the history view is read-only presentation, not the
+    /// primary persistence path, so one bad historical file must not hide the
+    /// rest. Returns empty without an `%APPDATA%` location or profile directory.
+    pub fn list_evaluation_reports(&self, profile_id: ProfileId) -> Vec<EvaluationReport> {
+        let Some(dir) = self.profile_eval_dir(profile_id) else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut reports = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match EvaluationReport::load(&path) {
+                Ok(r) => reports.push(r),
+                Err(e) => eprintln!(
+                    "warning: skipping unreadable evaluation report {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+        reports.sort_by_key(|r| r.run_at);
+        reports
     }
 
     /// Toggle between Listening and Paused. Does nothing in the `Error` state —

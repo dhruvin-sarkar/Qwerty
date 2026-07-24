@@ -18,6 +18,7 @@ use crate::hotkeys::Hotkeys;
 use crate::platform::{platform_for_this_os, PlatformActions};
 use crate::tray::{Tray, TrayCommand};
 use crate::ui::action_editor::ActionEditor;
+use crate::ui::evaluation::EvaluationScreen;
 use crate::ui::motion;
 use crate::ui::theme::{tokens_for, Color, Tokens};
 use crate::ui::wizard::{Wizard, WizardOutcome};
@@ -73,6 +74,9 @@ struct QwertyApp {
     action_editor: ActionEditor,
     /// Which zone is selected in the Zones editor.
     selected_zone: Option<ZoneId>,
+    /// The Evaluation screen (guided held-out test + report history). Owns its
+    /// own mic while a run is active; the shell yields the Home mic to it.
+    evaluation: EvaluationScreen,
 }
 
 impl QwertyApp {
@@ -118,6 +122,7 @@ impl QwertyApp {
             platform: platform_for_this_os(),
             action_editor: ActionEditor::default(),
             selected_zone: None,
+            evaluation: EvaluationScreen::default(),
         }
     }
 
@@ -244,8 +249,23 @@ impl eframe::App for QwertyApp {
             return;
         }
 
-        // Start/stop the mic to match listening state and absorb capture events.
-        self.reconcile_capture(ctx);
+        // An evaluation run owns the mic while it is active, and only on its own
+        // screen: navigating away ends it, so the mic and the live repaint both
+        // stop (PERFORMANCE.md — the Diagnostics/live views must not keep running
+        // in the background). The same rule keeps a second capture stream from
+        // fighting Home listening for the device.
+        if self.state.screen != Screen::Evaluation {
+            self.evaluation.stop_run();
+        }
+        if self.evaluation.is_running() {
+            if self.state.listening == ListeningState::Listening {
+                self.state.listening = ListeningState::Paused;
+            }
+            self.capture = None; // Drop stops the Home worker + closes the device.
+        } else {
+            // Start/stop the mic to match listening state and absorb capture events.
+            self.reconcile_capture(ctx);
+        }
 
         // Resolve this frame's effective tokens, advancing any theme cross-fade.
         let tokens = self.effective_tokens(ctx, now);
@@ -264,7 +284,7 @@ impl eframe::App for QwertyApp {
                 Screen::Home => self.home(ui, &pal),
                 Screen::Zones => self.zones(ui, &pal),
                 Screen::Diagnostics => placeholder(ui, &pal, "Diagnostics", "Phase 6"),
-                Screen::Evaluation => placeholder(ui, &pal, "Evaluation", "Phase 6"),
+                Screen::Evaluation => self.evaluation.ui(ui, &pal, &self.state),
                 Screen::Settings => self.settings(ui, &pal, now),
             });
 

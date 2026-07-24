@@ -12,6 +12,7 @@
 pub mod calibration;
 pub mod capture;
 pub mod classifier;
+pub mod evaluation;
 pub mod features;
 pub mod onset;
 pub mod profile;

@@ -44,10 +44,16 @@ pub enum CaptureEvent {
     /// tap from a rejected sustained sound; `window` is fed to
     /// `CalibrationSession::record_tap` by the wizard (Phase 4b.2). Home
     /// listening reads only `is_transient` for its tap/reject counters.
+    ///
+    /// `detected_at` is stamped when the worker finishes assembling the window
+    /// (i.e. once the full 90 ms window after the transient has been captured).
+    /// The Evaluation screen (Phase 6) uses it to measure host-side processing
+    /// latency; added to the fixed ~92.9 ms window-fill it forms the end-to-end
+    /// latency the report records (`ACCEPTANCE.md`).
     Onset {
-        #[allow(dead_code)]
         window: Vec<f32>,
         is_transient: bool,
+        detected_at: Instant,
     },
     /// The device failed to open, or the stream faulted mid-session (unplugged,
     /// permission revoked). Terminal — the worker exits after sending this.
@@ -150,6 +156,9 @@ fn run_worker(
                 let _ = tx.send(CaptureEvent::Onset {
                     window: ev.window,
                     is_transient: ev.is_transient,
+                    // Stamp when the window finished assembling; the UI turns this
+                    // into host-side processing latency at classify time.
+                    detected_at: Instant::now(),
                 });
             }
         }

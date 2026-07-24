@@ -5,6 +5,7 @@
 //! read from both. The tray/hotkey wiring is layered on next.
 
 pub mod action_editor;
+pub mod evaluation;
 pub mod motion;
 pub mod shell;
 pub mod theme;

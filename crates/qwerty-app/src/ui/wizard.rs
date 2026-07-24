@@ -189,7 +189,7 @@ impl Wizard {
                         self.env_rms_count += 1;
                     }
                 }
-                CaptureEvent::Onset { window, is_transient } => match self.step {
+                CaptureEvent::Onset { window, is_transient, .. } => match self.step {
                     Step::Capture if self.armed && is_transient => {
                         if let Some(s) = &mut self.session {
                             self.last_feedback = Some(s.record_tap(&window));
