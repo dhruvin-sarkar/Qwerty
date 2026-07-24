@@ -93,6 +93,38 @@ pub struct Classification {
     pub accepted: bool,
 }
 
+/// One zone's standardized-space distance from a query point, tagged by its
+/// [`ZoneId`] (not by position) so a consumer can reorder into the profile's
+/// `zones` order without ever seeing the classifier's private zone ordering —
+/// the same encapsulation boundary the confusion matrix respects
+/// (`DATA_MODEL.md`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoneDistance {
+    pub zone_id: ZoneId,
+    /// Euclidean distance from the (standardized) query to this zone's centroid.
+    /// Smaller = closer = more likely; the winning zone has the minimum.
+    pub centroid_distance: f32,
+}
+
+/// A debuggable projection of one feature vector against the calibrated model,
+/// for the Diagnostics feature-space view (`DESIGN.md`: "see *why* a tap was
+/// misclassified instead of guessing"). It exposes computed distances only —
+/// never the opaque fitted parameters — so it does not breach the
+/// `ClassifierParams` encapsulation boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureSpaceView {
+    /// Per-zone centroid distances (why one zone wins over another).
+    pub zones: Vec<ZoneDistance>,
+    /// Distance to the nearest calibrated example — what the novelty gate tests.
+    pub nearest_example_distance: f32,
+    /// The novelty gate's accept boundary: a query is accepted iff
+    /// `nearest_example_distance <= novelty_threshold`.
+    pub novelty_threshold: f32,
+    /// Whether this query passes the novelty gate (equals the [`Classification`]
+    /// `accepted` for the same input).
+    pub accepted: bool,
+}
+
 impl ClassifierParams {
     /// Whether this profile was trained with negative (rejection) examples.
     pub fn negative_examples_trained(&self) -> bool {
@@ -338,6 +370,62 @@ impl ClassifierParams {
             accepted,
         }
     }
+
+    /// Project one feature vector onto the calibrated model for the Diagnostics
+    /// feature-space view: the standardized distance to every zone's centroid
+    /// (tagged by `ZoneId`), the distance to the nearest calibrated example, and
+    /// the novelty threshold that gate tests against. Pure and read-only — it
+    /// computes the same standardization and distances `classify` uses, exposing
+    /// only the resulting numbers, so the fitted parameters stay opaque.
+    ///
+    /// A non-finite input yields infinite distances and `accepted = false`, the
+    /// same defensive handling as [`classify`](Self::classify).
+    pub fn feature_space(&self, fv: &FeatureVector) -> FeatureSpaceView {
+        if !fv.is_finite() {
+            return FeatureSpaceView {
+                zones: self
+                    .zone_ids
+                    .iter()
+                    .map(|&zone_id| ZoneDistance {
+                        zone_id,
+                        centroid_distance: f32::INFINITY,
+                    })
+                    .collect(),
+                nearest_example_distance: f32::INFINITY,
+                novelty_threshold: self.novelty_threshold,
+                accepted: false,
+            };
+        }
+        let raw = fv.as_array();
+        let z: Vec<f32> = raw
+            .iter()
+            .zip(self.feature_mean.iter().zip(&self.feature_std))
+            .map(|(&x, (&m, &sd))| (x - m) / sd)
+            .collect();
+
+        let zones = self
+            .zone_ids
+            .iter()
+            .zip(&self.centroids)
+            .map(|(&zone_id, c)| ZoneDistance {
+                zone_id,
+                centroid_distance: euclidean(&z, c),
+            })
+            .collect();
+
+        let nearest_example_distance = self
+            .examples
+            .iter()
+            .map(|ex| euclidean(&z, &ex.v))
+            .fold(f32::INFINITY, f32::min);
+
+        FeatureSpaceView {
+            zones,
+            nearest_example_distance,
+            novelty_threshold: self.novelty_threshold,
+            accepted: nearest_example_distance <= self.novelty_threshold,
+        }
+    }
 }
 
 fn euclidean(a: &[f32], b: &[f32]) -> f32 {
@@ -435,6 +523,43 @@ mod tests {
         let out = clf.classify(&fv_from(1000.0, 0.0));
         assert!(!out.accepted);
         assert_eq!(out.zone_id, None);
+    }
+
+    #[test]
+    fn feature_space_reports_distances_and_gate() {
+        let (za, zb, zc) = (zone(1), zone(2), zone(3));
+        let mut samples = Vec::new();
+        for j in 0..10 {
+            let jit = j as f32 * 1e-4;
+            samples.push((za, fv_from(0.0, jit)));
+            samples.push((zb, fv_from(5.0, jit)));
+            samples.push((zc, fv_from(10.0, jit)));
+        }
+        let clf = ClassifierParams::train(&samples, &[]).unwrap();
+
+        // A query near zone A: A is the closest centroid, and it is accepted.
+        let near_a = clf.feature_space(&fv_from(0.0, 1e-3));
+        assert_eq!(near_a.zones.len(), 3);
+        let closest = near_a
+            .zones
+            .iter()
+            .min_by(|x, y| x.centroid_distance.total_cmp(&y.centroid_distance))
+            .unwrap();
+        assert_eq!(closest.zone_id, za, "nearest centroid should be zone A");
+        assert!(near_a.accepted);
+        assert!(near_a.nearest_example_distance <= near_a.novelty_threshold);
+
+        // A far-out query is rejected by the novelty gate, and its distances are
+        // all large — the debuggable signature of a rejection.
+        let far = clf.feature_space(&fv_from(1000.0, 0.0));
+        assert!(!far.accepted);
+        assert!(far.nearest_example_distance > far.novelty_threshold);
+
+        // The reported ids are exactly the profile's zones (tagged, not ordered).
+        let ids: Vec<ZoneId> = near_a.zones.iter().map(|z| z.zone_id).collect();
+        for z in [za, zb, zc] {
+            assert!(ids.contains(&z));
+        }
     }
 
     #[test]
