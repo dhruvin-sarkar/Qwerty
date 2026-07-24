@@ -297,6 +297,23 @@ impl eframe::App for QwertyApp {
             self.wizard = Some(Wizard::new(ctx));
             ctx.request_repaint();
         }
+
+        // Start a requested evaluation run here, at end of frame, for the same
+        // reason the wizard launches here: the Home microphone must be closed
+        // *before* the run opens its own, or the device would briefly be held by
+        // two capture streams (harmless on most drivers, a spurious device-busy
+        // failure on some). Deciding this at the top of the frame would be too
+        // early — the button that requests it is only rendered further down.
+        if let Some(taps) = self.evaluation.take_pending_start() {
+            if self.state.listening == ListeningState::Listening {
+                self.state.listening = ListeningState::Paused;
+            }
+            self.capture = None; // Drop stops the Home worker + closes the device.
+            if let Some(profile) = self.state.active_profile.as_ref() {
+                self.evaluation.begin_run(ctx, profile, taps);
+            }
+            ctx.request_repaint();
+        }
     }
 }
 

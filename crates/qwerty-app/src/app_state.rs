@@ -264,8 +264,21 @@ impl AppState {
         let Some(dir) = self.profile_eval_dir(profile_id) else {
             return Vec::new();
         };
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
+        // A missing directory is the ordinary "never evaluated yet" case and is
+        // silent; any *other* read failure (permissions, a lock, the path being
+        // a file) is a real problem and is logged, matching how an unreadable
+        // individual report below is reported. Collapsing both into an empty
+        // list would disguise an I/O fault as "no history".
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read evaluations directory {}: {e}",
+                    dir.display()
+                );
+                return Vec::new();
+            }
         };
         let mut reports = Vec::new();
         for entry in entries.flatten() {

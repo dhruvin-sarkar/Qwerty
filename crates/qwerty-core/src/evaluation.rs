@@ -156,9 +156,44 @@ impl EvaluationReport {
         serde_json::to_string_pretty(self).expect("EvaluationReport serializes")
     }
 
-    /// Parse from JSON with the shared schema-version policy applied.
+    /// Parse from JSON with the shared schema-version policy applied, then check
+    /// structural integrity. A file whose version matches but whose contents are
+    /// internally inconsistent — a ragged (non-square) confusion matrix, or a
+    /// per-zone map that disagrees with the matrix size — is *refused* with
+    /// [`PersistenceError::InvalidData`] rather than loaded and silently
+    /// mis-rendered, the same loudly-refuse policy `Profile::from_json` applies
+    /// to its classifier blob.
     pub fn from_json(s: &str, file: &str) -> Result<Self, PersistenceError> {
-        parse_versioned(s, EVALUATION_SCHEMA_VERSION, file)
+        let report: Self = parse_versioned(s, EVALUATION_SCHEMA_VERSION, file)?;
+        report
+            .validate()
+            .map_err(|reason| PersistenceError::InvalidData {
+                file: file.to_string(),
+                reason,
+            })?;
+        Ok(report)
+    }
+
+    /// Structural invariants of a report: the confusion matrix is square, and
+    /// `per_zone_accuracy` carries exactly one entry per matrix row/column.
+    fn validate(&self) -> Result<(), String> {
+        let n = self.confusion_matrix.len();
+        for (i, row) in self.confusion_matrix.iter().enumerate() {
+            if row.len() != n {
+                return Err(format!(
+                    "confusion_matrix row {i} has {} cells, expected {n} \
+                     (the matrix must be square)",
+                    row.len()
+                ));
+            }
+        }
+        if self.per_zone_accuracy.len() != n {
+            return Err(format!(
+                "per_zone_accuracy has {} entries but the confusion matrix is {n}x{n}",
+                self.per_zone_accuracy.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Load from a file path, applying the schema-version policy.
@@ -228,10 +263,18 @@ impl EvaluationAccumulator {
     /// `confidence` (ignored when `predicted` is `None`), and the end-to-end
     /// `latency_ms`.
     ///
-    /// An `actual` not in this run's zone set is a caller bug (the guided test
-    /// only ever asks for profile zones); such a tap is ignored rather than
-    /// panicking mid-run, and `debug_assert` flags it in debug builds. A
-    /// `predicted` zone not in the set (impossible for a classifier trained on
+    /// # Panics
+    /// Panics if `actual` is not one of this run's zones. That is a caller bug,
+    /// not a runtime condition (the guided test only ever asks for zones from
+    /// the profile the accumulator was built from), so it fails fast in *every*
+    /// build — the same policy as [`crate::features::FeatureExtractor::extract`]
+    /// on a wrong-length window. It deliberately does **not** use
+    /// `debug_assert!`, which would compile away in release and let the tap be
+    /// dropped silently, undercounting the report (`CLAUDE.md`: a precondition
+    /// that isn't met must surface immediately and loudly, never be quietly
+    /// worked around).
+    ///
+    /// A `predicted` zone not in the set (impossible for a classifier trained on
     /// this profile) is treated as a rejection so it can never index out of
     /// bounds.
     pub fn record(
@@ -241,10 +284,10 @@ impl EvaluationAccumulator {
         confidence: f32,
         latency_ms: f32,
     ) {
-        let Some(&ai) = self.index.get(&actual) else {
-            debug_assert!(false, "evaluation tap for a zone not in this run");
-            return;
-        };
+        let ai = *self
+            .index
+            .get(&actual)
+            .expect("evaluation tap recorded for a zone that is not in this run");
         self.latencies_ms.push(latency_ms);
         match predicted.and_then(|p| self.index.get(&p).copied()) {
             Some(pi) => {
@@ -281,6 +324,16 @@ impl EvaluationAccumulator {
     /// caller stamps it) so this stays free of the wall clock and remains a pure
     /// function of what was recorded — matching how the rest of `qwerty-core`
     /// keeps timestamps at the boundary.
+    ///
+    /// Convention for `per_zone_accuracy`: a zone with zero presented taps is
+    /// reported as `0.0`, the same value as a zone that was tested and missed
+    /// every tap. The persisted schema is `HashMap<ZoneId, f32>`
+    /// (`DATA_MODEL.md`), so the two cases are not distinguishable in the report
+    /// — this is sound only because a real run always presents every zone: the
+    /// guided test's "Finish" action is gated on every zone having reached
+    /// `taps_per_zone`. Call `finish` only on a complete run; a partial run's
+    /// report would understate the unpresented zones rather than mark them
+    /// as unmeasured.
     pub fn finish(&self, profile_id: ProfileId, run_at: DateTime<Utc>) -> EvaluationReport {
         let n = self.zone_ids.len();
 
@@ -431,6 +484,38 @@ mod tests {
         v["schema_version"] = serde_json::json!(999);
         let err = EvaluationReport::from_json(&v.to_string(), "eval.json").unwrap_err();
         assert!(matches!(err, PersistenceError::SchemaMismatch { .. }));
+    }
+
+    #[test]
+    #[should_panic(expected = "not in this run")]
+    fn recording_a_zone_outside_the_run_fails_fast() {
+        // A precondition violation must surface loudly in EVERY build, not be
+        // dropped silently in release (which `debug_assert!` would have done).
+        let (za, zb) = (zone(1), zone(2));
+        let mut acc = EvaluationAccumulator::new(vec![za], 5);
+        acc.record(zb, Some(za), 0.9, 40.0);
+    }
+
+    #[test]
+    fn structurally_inconsistent_report_is_refused_on_load() {
+        let (za, zb) = (zone(1), zone(2));
+        let mut acc = EvaluationAccumulator::new(vec![za, zb], 1);
+        acc.record(za, Some(za), 0.8, 40.0);
+        acc.record(zb, Some(zb), 0.8, 40.0);
+        let r = acc.finish(ProfileId::from_uuid(Uuid::from_u128(7)), Utc::now());
+
+        // A ragged (non-square) confusion matrix is a named refusal, not a
+        // silently-loaded report that would later mis-render.
+        let mut v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        v["confusion_matrix"] = serde_json::json!([[1, 0], [0]]);
+        let err = EvaluationReport::from_json(&v.to_string(), "eval.json").unwrap_err();
+        assert!(matches!(err, PersistenceError::InvalidData { .. }), "got {err:?}");
+
+        // So is a per-zone map that disagrees with the matrix size.
+        let mut v2: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        v2["per_zone_accuracy"] = serde_json::json!({ za.to_string(): 1.0 });
+        let err2 = EvaluationReport::from_json(&v2.to_string(), "eval.json").unwrap_err();
+        assert!(matches!(err2, PersistenceError::InvalidData { .. }), "got {err2:?}");
     }
 
     #[test]

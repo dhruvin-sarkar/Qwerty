@@ -152,7 +152,9 @@ fn run_worker(
                 peak = peak.max(s.abs());
             }
             count += buf.len();
-            for ev in detector.process(&buf) {
+            let onsets = detector.process(&buf);
+            let had_onset = !onsets.is_empty();
+            for ev in onsets {
                 let _ = tx.send(CaptureEvent::Onset {
                     window: ev.window,
                     is_transient: ev.is_transient,
@@ -160,6 +162,13 @@ fn run_worker(
                     // into host-side processing latency at classify time.
                     detected_at: Instant::now(),
                 });
+            }
+            // Wake the UI immediately on a real onset (like Started/Level/Failed
+            // do). Without this, an onset waits for the next bounded-rate frame
+            // (~33 ms), and that scheduling delay would be folded into the
+            // Evaluation screen's measured per-tap latency, inflating the report.
+            if had_onset {
+                ctx.request_repaint();
             }
         }
 

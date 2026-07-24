@@ -242,6 +242,11 @@ pub struct EvaluationScreen {
     result: Option<FinishedRun>,
     history: Vec<EvaluationReport>,
     history_for: Option<ProfileId>,
+    /// Set when the user asks to start a run; the *shell* acts on it at end of
+    /// frame. The run is deliberately not created here: the shell must close the
+    /// Home microphone first, so the device is never held by two capture streams
+    /// at once. Same deferred-launch pattern as the calibration wizard.
+    pending_start: Option<u32>,
 }
 
 impl EvaluationScreen {
@@ -249,6 +254,20 @@ impl EvaluationScreen {
     /// suppress Home listening and to stop the run when navigating away).
     pub fn is_running(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// Take a pending "start a run" request, if the user made one this frame.
+    /// The shell calls this at end of frame, closes the Home mic, then calls
+    /// [`begin_run`](Self::begin_run).
+    pub fn take_pending_start(&mut self) -> Option<u32> {
+        self.pending_start.take()
+    }
+
+    /// Actually start the guided run (opens this screen's own microphone). Only
+    /// the shell calls this, and only after it has dropped the Home capture.
+    pub fn begin_run(&mut self, ctx: &egui::Context, profile: &Profile, taps_per_zone: u32) {
+        self.result = None;
+        self.run = Some(EvalRun::new(ctx, profile, taps_per_zone));
     }
 
     /// Stop and discard any in-progress run (drops the mic). Called by the shell
@@ -320,10 +339,9 @@ impl EvaluationScreen {
         ui.add_space(14.0);
 
         if ui.button("Run evaluation").clicked() {
-            let taps = self.taps_per_zone.max(1);
-            self.run = Some(EvalRun::new(ui.ctx(), profile, taps));
-            // Paint the running view next frame without waiting for mouse input
-            // (the capture worker will also wake us, but this makes it immediate).
+            // Request only — the shell starts the run at end of frame, after it
+            // has closed the Home microphone (see `pending_start`).
+            self.pending_start = Some(self.taps_per_zone.max(1));
             ui.ctx().request_repaint();
         }
 
@@ -530,17 +548,40 @@ impl EvaluationScreen {
         });
         ui.add_space(6.0);
 
+        // A failed save must not cost the user the whole run: the computed
+        // report is still in memory, so offer a retry rather than forcing a
+        // repeat of the entire guided test.
+        let mut retry_save = false;
         match &res.saved {
-            Some(Ok(path)) => ui.label(
-                egui::RichText::new(format!("Saved report: {}", path.display()))
-                    .color(pal.secondary)
-                    .small(),
-            ),
-            Some(Err(e)) => ui.label(
-                egui::RichText::new(format!("⚠ Could not save report: {e}")).color(pal.danger),
-            ),
-            None => ui.label(egui::RichText::new("Saving…").color(pal.secondary).small()),
-        };
+            Some(Ok(path)) => {
+                ui.label(
+                    egui::RichText::new(format!("Saved report: {}", path.display()))
+                        .color(pal.secondary)
+                        .small(),
+                );
+            }
+            Some(Err(e)) => {
+                ui.label(
+                    egui::RichText::new(format!("⚠ Could not save report: {e}")).color(pal.danger),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Retry save").clicked() {
+                        retry_save = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "The results below are still in memory — retrying will not \
+                             require redoing the test.",
+                        )
+                        .color(pal.secondary)
+                        .small(),
+                    );
+                });
+            }
+            None => {
+                ui.label(egui::RichText::new("Saving…").color(pal.secondary).small());
+            }
+        }
         ui.add_space(14.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -606,7 +647,15 @@ impl EvaluationScreen {
         });
 
         ui.add_space(14.0);
-        if ui.button("Run another evaluation").clicked() {
+        let run_again = ui.button("Run another evaluation").clicked();
+
+        // Apply the transitions after every read of `res` is done.
+        if retry_save {
+            if let Some(r) = &mut self.result {
+                r.saved = None; // re-attempts the save on the next frame
+            }
+            ui.ctx().request_repaint();
+        } else if run_again {
             self.result = None;
             ui.ctx().request_repaint();
         }
