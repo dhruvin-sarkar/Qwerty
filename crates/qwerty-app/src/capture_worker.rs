@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use qwerty_core::features::{FeatureExtractor, FEATURE_WINDOW_SAMPLES, SAMPLE_RATE_HZ};
 use qwerty_core::onset::OnsetDetector;
 
 use crate::audio_thread::{AudioCapture, InputNormalizer};
@@ -26,6 +27,26 @@ use crate::audio_thread::{AudioCapture, InputNormalizer};
 const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
 /// Worker poll cadence when draining the capture ring.
 const POLL_INTERVAL: Duration = Duration::from_millis(15);
+/// Diagnostics frame cadence — 30 fps, the fixed rate `MOTION.md` prescribes for
+/// the live waveform/spectrogram ("30fps is sufficient for legibility, not 60+").
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// How much recent audio the Diagnostics views keep (0.25 s). Bounded, and
+/// comfortably larger than one feature window so the spectrum always has input.
+const RECENT_SPAN: usize = SAMPLE_RATE_HZ as usize / 4;
+/// Display points in one waveform frame (an envelope, not raw samples).
+const WAVEFORM_POINTS: usize = 256;
+
+/// How much the worker computes per frame. The extra Diagnostics work (an FFT
+/// every 33 ms plus a waveform envelope) is opt-in so Home listening and the
+/// wizard stay at the idle-CPU budget in `PERFORMANCE.md` — there is one worker
+/// implementation, not two, just a bounded amount of extra output when asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureDetail {
+    /// Level meter + onsets only (Home, wizard, evaluation).
+    Standard,
+    /// Adds waveform + spectrum frames for the Diagnostics screen.
+    Diagnostics,
+}
 
 /// An event from the capture worker to the UI thread.
 #[derive(Debug, Clone)]
@@ -55,6 +76,16 @@ pub enum CaptureEvent {
         is_transient: bool,
         detected_at: Instant,
     },
+    /// A Diagnostics display frame, emitted at a fixed 30 fps and only when the
+    /// worker was started with [`CaptureDetail::Diagnostics`].
+    ///
+    /// `waveform` is a max-abs envelope of the recent input decimated to
+    /// [`WAVEFORM_POINTS`] points (not raw samples — the UI never needs 11k
+    /// points to draw a 300 px trace). `bands` is the classifier's own
+    /// normalized spectral-band vector for the most recent feature window, so
+    /// the spectrogram shows exactly what the model sees rather than a prettier
+    /// but unrelated STFT.
+    Frame { waveform: Vec<f32>, bands: Vec<f32> },
     /// The device failed to open, or the stream faulted mid-session (unplugged,
     /// permission revoked). Terminal — the worker exits after sending this.
     Failed(String),
@@ -72,12 +103,13 @@ impl LiveCapture {
     /// Start capturing from `device` (list index or name substring; `None` =
     /// system default). Returns immediately; watch for `Started`/`Failed` on
     /// [`poll`](Self::poll). `ctx` is pinged so the UI wakes on each event.
-    pub fn start(device: Option<String>, ctx: egui::Context) -> Self {
+    /// `detail` selects whether Diagnostics display frames are computed.
+    pub fn start(device: Option<String>, ctx: egui::Context, detail: CaptureDetail) -> Self {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_worker = stop.clone();
         let handle = std::thread::spawn(move || {
-            run_worker(device, tx, ctx, stop_worker);
+            run_worker(device, tx, ctx, stop_worker, detail);
         });
         Self {
             rx,
@@ -108,6 +140,7 @@ fn run_worker(
     tx: mpsc::Sender<CaptureEvent>,
     ctx: egui::Context,
     stop: Arc<AtomicBool>,
+    detail: CaptureDetail,
 ) {
     let mut cap = match AudioCapture::open(device.as_deref()) {
         Ok(c) => c,
@@ -132,6 +165,15 @@ fn run_worker(
     let (mut sum_sq, mut count, mut peak) = (0.0f64, 0usize, 0.0f32);
     let mut last_level = Instant::now();
 
+    // Diagnostics-only state: a bounded rolling tail of recent audio plus the
+    // extractor that turns its newest feature window into a spectrum column.
+    // Both are absent entirely in `Standard` detail, so the ordinary listening
+    // path pays neither the memory nor the per-frame FFT.
+    let diagnostics = detail == CaptureDetail::Diagnostics;
+    let mut recent: Vec<f32> = Vec::new();
+    let mut extractor = diagnostics.then(FeatureExtractor::new);
+    let mut last_frame = Instant::now();
+
     while !stop.load(Ordering::Relaxed) {
         if cap.stream_failed() {
             let _ = tx.send(CaptureEvent::Failed(
@@ -152,6 +194,14 @@ fn run_worker(
                 peak = peak.max(s.abs());
             }
             count += buf.len();
+            if diagnostics {
+                // Keep only the most recent RECENT_SPAN samples, so memory is
+                // bounded no matter how long the screen stays open.
+                recent.extend_from_slice(&buf);
+                if recent.len() > RECENT_SPAN {
+                    recent.drain(..recent.len() - RECENT_SPAN);
+                }
+            }
             let onsets = detector.process(&buf);
             let had_onset = !onsets.is_empty();
             for ev in onsets {
@@ -186,6 +236,68 @@ fn run_worker(
             last_level = Instant::now();
         }
 
+        // Diagnostics display frame at a fixed 30 fps — the one place a
+        // continuous live view is allowed, and deliberately rate-limited here in
+        // the worker rather than repainting on every audio callback
+        // (`PERFORMANCE.md`, `MOTION.md`).
+        if let Some(ex) = extractor.as_mut() {
+            if last_frame.elapsed() >= FRAME_INTERVAL && recent.len() >= FEATURE_WINDOW_SAMPLES {
+                let waveform = envelope(&recent, WAVEFORM_POINTS);
+                let window = &recent[recent.len() - FEATURE_WINDOW_SAMPLES..];
+                let bands = ex.extract(window).spectral_bands.to_vec();
+                let _ = tx.send(CaptureEvent::Frame { waveform, bands });
+                ctx.request_repaint();
+                last_frame = Instant::now();
+            }
+        }
+
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Decimate `samples` to `points` buckets, each the maximum absolute amplitude
+/// in its bucket. This is a peak envelope: drawn symmetrically about the centre
+/// line it reads as a waveform, and unlike naive stride-sampling it cannot miss
+/// a transient that falls between sample points — which matters here, because
+/// the whole app is about spotting taps.
+fn envelope(samples: &[f32], points: usize) -> Vec<f32> {
+    if samples.is_empty() || points == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(points);
+    for i in 0..points {
+        let lo = i * samples.len() / points;
+        let hi = ((i + 1) * samples.len() / points).max(lo + 1).min(samples.len());
+        let mut m = 0.0f32;
+        for &s in &samples[lo..hi] {
+            m = m.max(s.abs());
+        }
+        out.push(m);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_has_requested_length_and_catches_peaks() {
+        // A single spike anywhere must survive decimation (a stride-sampler
+        // could step right over it).
+        let mut samples = vec![0.0f32; 4000];
+        samples[1234] = 0.9;
+        let env = envelope(&samples, 256);
+        assert_eq!(env.len(), 256);
+        assert!(env.iter().any(|v| (*v - 0.9).abs() < 1e-6), "peak was lost");
+        assert!(env.iter().all(|v| *v >= 0.0), "envelope is magnitude only");
+    }
+
+    #[test]
+    fn envelope_handles_degenerate_input() {
+        assert!(envelope(&[], 16).is_empty());
+        assert!(envelope(&[0.5, 0.5], 0).is_empty());
+        // More requested points than samples must not panic or produce empties.
+        assert_eq!(envelope(&[0.2, 0.4], 8).len(), 8);
     }
 }

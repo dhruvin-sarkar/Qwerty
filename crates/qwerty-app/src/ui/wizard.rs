@@ -21,7 +21,7 @@ use qwerty_core::profile::{
     DeviceFingerprint, Profile, ProfileId, SensingMode, ZoneId, ZoneLayout,
 };
 
-use crate::capture_worker::{CaptureEvent, LiveCapture};
+use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::shell::Palette;
 
 /// Supported zone counts (`DESIGN.md`: 2, 4, 6, 8).
@@ -106,7 +106,7 @@ pub struct Wizard {
 
 impl Wizard {
     pub fn new(ctx: &egui::Context) -> Self {
-        let capture = LiveCapture::start(None, ctx.clone());
+        let capture = LiveCapture::start(None, ctx.clone(), CaptureDetail::Standard);
         let zone_count = 4;
         Self {
             step: Step::Environment,
@@ -207,6 +207,10 @@ impl Wizard {
                     }
                     _ => {}
                 },
+                // The wizard requests `CaptureDetail::Standard`, so the worker
+                // never computes display frames for it. Named explicitly rather
+                // than swept up by a catch-all arm.
+                CaptureEvent::Frame { .. } => {}
                 CaptureEvent::Failed(msg) => self.capture_error = Some(msg),
             }
         }

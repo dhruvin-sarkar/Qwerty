@@ -20,9 +20,11 @@ chrono = { workspace = true }
 # Phase 5 — action dispatch. Cross-platform action crates here; the Windows-only
 # ones are under the target table below so a future Linux build still compiles.
 arboard = { workspace = true }
+tts = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+winrt-toast = { workspace = true }
 # Phase 3 — GUI shell, tray icon, global hotkey (ROADMAP.md).
 eframe = { workspace = true }
 egui = { workspace = true }

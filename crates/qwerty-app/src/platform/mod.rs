@@ -34,17 +34,14 @@ pub enum ActionError {
     LaunchFailed { target: String, reason: String },
     /// Reading or writing the system clipboard failed.
     Clipboard(String),
-    /// Text-to-speech was unavailable or failed. Constructed once the `tts`
-    /// backend lands (currently `speak` returns `Unsupported`).
-    #[allow(dead_code)]
+    /// Text-to-speech was unavailable or failed (from the `tts` backend).
     Speech(String),
     /// Synthesizing a keystroke failed (e.g. an unrecognized key name).
     Keystroke(String),
     /// Capturing the screen failed.
     Screenshot(String),
-    /// Showing a toast notification failed. Constructed once the `winrt-toast`
-    /// backend lands (currently `notify` returns `Unsupported`).
-    #[allow(dead_code)]
+    /// Showing a toast notification failed, or this app's notification identity
+    /// (AUMID) could not be registered with Windows.
     Notification(String),
     /// Playing a system sound failed.
     Sound(String),

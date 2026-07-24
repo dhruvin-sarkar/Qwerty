@@ -51,7 +51,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Diagnostics_Debug",
 ] }
 arboard = "3"
-# NOTE: tts (TTS) and winrt-toast (toasts) are intentionally NOT added yet —
-# they are not in the offline cache and the registry is currently unreachable.
-# WindowsPlatform::speak / notify return a clear Unsupported until they can be
-# fetched; every other action is implemented with windows + arboard (cached).
+# Speech + toast, the last two ActionSpec variants. These were stubbed as
+# Unsupported while the registry was unreachable; now fetched and implemented.
+# `tts` wraps SAPI/WinRT on Windows and is cross-platform, so it sits with the
+# other portable action crates; `winrt-toast` is Windows-only (target table).
+tts = "0.26"
+winrt-toast = "0.1"

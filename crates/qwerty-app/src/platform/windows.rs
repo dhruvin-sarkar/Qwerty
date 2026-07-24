@@ -6,11 +6,15 @@
 //! like the tray/hotkey setup) and everything runs on the UI thread, so the
 //! `!Send` `Tts` engine in a `RefCell` is fine.
 
+use std::cell::RefCell;
 use std::os::windows::process::CommandExt;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::process::Command;
 
 use arboard::{Clipboard, ImageData};
+use tts::Tts;
+use winrt_toast::{register, Toast, ToastManager};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Graphics::Gdi::{
@@ -34,10 +38,25 @@ use super::{ActionError, PlatformActions, ToastSpec};
 /// Run a launched command without flashing a console window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The Windows action backend. A unit struct today: `speak` (tts crate) and
-/// `notify` (winrt-toast crate) are pending — those crates aren't in the
-/// offline cache — so this holds no state yet.
-pub struct WindowsPlatform;
+/// The Application User Model ID this app registers itself under so Windows
+/// will display its toasts. Windows only shows a notification for a *registered*
+/// AUMID; see [`WindowsPlatform::notifier`].
+const AUM_ID: &str = "Qwerty.TapZones";
+
+/// The Windows action backend.
+///
+/// It holds two lazily-created, then long-lived, handles. Both live behind a
+/// `RefCell` because [`PlatformActions`] takes `&self` while these need `&mut`
+/// — sound here because every action is dispatched from the single UI thread
+/// (`ARCHITECTURE.md` → Threading model).
+pub struct WindowsPlatform {
+    /// The speech engine. It must be *kept alive*, not created per call:
+    /// dropping it releases the WinRT `MediaPlayer` that is still playing, which
+    /// cuts the utterance off mid-word.
+    tts: RefCell<Option<Tts>>,
+    /// The toast notifier, created once the AUMID has been registered.
+    toast: RefCell<Option<ToastManager>>,
+}
 
 impl Default for WindowsPlatform {
     fn default() -> Self {
@@ -47,7 +66,51 @@ impl Default for WindowsPlatform {
 
 impl WindowsPlatform {
     pub fn new() -> Self {
-        WindowsPlatform
+        WindowsPlatform {
+            tts: RefCell::new(None),
+            toast: RefCell::new(None),
+        }
+    }
+
+    /// The toast notifier, registering this app's AUMID on first use.
+    ///
+    /// Windows only displays a toast for a *registered* Application User Model
+    /// ID. `winrt_toast::register` writes
+    /// `HKCU\SOFTWARE\Classes\AppUserModelId\<id>` — no installer, no admin
+    /// rights — which is the sanctioned path for an unpackaged `.exe` like this
+    /// one. Skipping it would mean toasts are dropped by the platform with no
+    /// error at all. `ToastManager` holds only that id and derives `Clone`, so
+    /// callers take a cheap copy rather than hold a `RefCell` borrow across the
+    /// call.
+    fn notifier(&self) -> Result<ToastManager, ActionError> {
+        let mut slot = self.toast.borrow_mut();
+        if slot.is_none() {
+            let icon = std::env::current_exe().ok();
+            // `register` *asserts* (panics) instead of returning `Err` if the
+            // Kernel Transaction Manager hands back an invalid handle. Contain
+            // that: one failed notification must not take down the whole
+            // session. This is not swallowing an error — the cause is still
+            // surfaced as a specific, named `ActionError`.
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                register(AUM_ID, "Qwerty", icon.as_deref())
+            }));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(ActionError::Notification(format!(
+                        "could not register the notification identity ({AUM_ID}): {e}"
+                    )))
+                }
+                Err(_) => {
+                    return Err(ActionError::Notification(format!(
+                        "registering the notification identity ({AUM_ID}) panicked \
+                         inside winrt-toast"
+                    )))
+                }
+            }
+            *slot = Some(ToastManager::new(AUM_ID));
+        }
+        Ok(slot.as_ref().expect("notifier initialized above").clone())
     }
 
     /// Open a file/folder/app/URL with the shell's default "open" verb.
@@ -297,20 +360,47 @@ impl PlatformActions for WindowsPlatform {
         }
     }
 
-    fn speak(&self, _text: &str) -> Result<(), ActionError> {
-        // Pending: the `tts` crate isn't in the offline cache. Grounded impl
-        // (long-lived Tts in a RefCell, interrupt=true) is ready to drop in
-        // once the registry is reachable.
-        Err(ActionError::Unsupported(
-            "text-to-speech (tts crate not yet fetched)",
-        ))
+    fn speak(&self, text: &str) -> Result<(), ActionError> {
+        let mut slot = self.tts.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Tts::default().map_err(speech_err)?);
+        }
+        // `expect` on the line after the assignment above: genuinely unreachable.
+        let engine = slot.as_mut().expect("speech engine initialized above");
+        // interrupt = true: a newly tapped zone should speak now, not queue
+        // behind whatever the previous tap said.
+        engine.speak(text, true).map(|_utterance| ()).map_err(speech_err)
     }
 
-    fn notify(&self, _toast: &ToastSpec) -> Result<(), ActionError> {
-        // Pending: the `winrt-toast` crate isn't in the offline cache. Grounded
-        // impl (AUMID register + ToastManager) is ready once fetchable.
-        Err(ActionError::Unsupported(
-            "toast notifications (winrt-toast crate not yet fetched)",
-        ))
+    fn notify(&self, toast: &ToastSpec) -> Result<(), ActionError> {
+        let manager = self.notifier()?;
+        let mut card = Toast::new();
+        // Line 1 is the title, line 2 the body (`winrt-toast`'s ToastGeneric
+        // template). `&str` satisfies `Into<Text>` via its blanket impl.
+        card.text1(toast.title.as_str()).text2(toast.body.as_str());
+
+        // `show_with_callbacks`, never `show`: Windows reports some toast
+        // failures *asynchronously*, and `show` discards them (it passes `None`
+        // for `on_failed`), so a toast that never appears would return `Ok`.
+        // That is precisely the silent failure `CLAUDE.md` bans. The callback
+        // runs on a WinRT thread, not the UI thread, so it only logs.
+        manager
+            .show_with_callbacks(
+                &card,
+                None,
+                None,
+                Some(Box::new(|e| {
+                    eprintln!("warning: Windows failed to display the toast: {e}");
+                })),
+            )
+            .map_err(|e| ActionError::Notification(e.to_string()))
     }
+}
+
+/// Map a `tts` error into ours using `Debug`, not `Display`, deliberately:
+/// `tts::Error::WinRt`'s `Display` is the bare string "WinRT error" and drops
+/// the underlying HRESULT, which would leave the user (and the detective method)
+/// with an unactionable message.
+fn speech_err(e: tts::Error) -> ActionError {
+    ActionError::Speech(format!("{e:?}"))
 }

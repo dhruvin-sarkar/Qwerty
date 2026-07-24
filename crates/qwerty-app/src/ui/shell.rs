@@ -13,11 +13,12 @@ use std::time::Instant;
 use qwerty_core::profile::{Theme, ZoneId};
 
 use crate::app_state::{AppState, ListeningState, Screen};
-use crate::capture_worker::{CaptureEvent, LiveCapture};
+use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::hotkeys::Hotkeys;
 use crate::platform::{platform_for_this_os, PlatformActions};
 use crate::tray::{Tray, TrayCommand};
 use crate::ui::action_editor::ActionEditor;
+use crate::ui::diagnostics::DiagnosticsScreen;
 use crate::ui::evaluation::EvaluationScreen;
 use crate::ui::motion;
 use crate::ui::theme::{tokens_for, Color, Tokens};
@@ -77,6 +78,9 @@ struct QwertyApp {
     /// The Evaluation screen (guided held-out test + report history). Owns its
     /// own mic while a run is active; the shell yields the Home mic to it.
     evaluation: EvaluationScreen,
+    /// The Diagnostics screen (live waveform/spectrogram/feature space). Owns
+    /// its own mic while that screen is open; the shell starts and stops it.
+    diagnostics: DiagnosticsScreen,
 }
 
 impl QwertyApp {
@@ -123,6 +127,7 @@ impl QwertyApp {
             action_editor: ActionEditor::default(),
             selected_zone: None,
             evaluation: EvaluationScreen::default(),
+            diagnostics: DiagnosticsScreen::default(),
         }
     }
 
@@ -134,7 +139,11 @@ impl QwertyApp {
         match self.state.listening {
             ListeningState::Listening if self.capture.is_none() => {
                 self.live = LiveStatus::default();
-                self.capture = Some(LiveCapture::start(None, ctx.clone()));
+                self.capture = Some(LiveCapture::start(
+                    None,
+                    ctx.clone(),
+                    CaptureDetail::Standard,
+                ));
             }
             ListeningState::Paused | ListeningState::Error if self.capture.is_some() => {
                 self.capture = None; // Drop stops the worker + closes the device.
@@ -157,6 +166,9 @@ impl QwertyApp {
                         self.live.rejects += 1;
                     }
                 }
+                // Home listening requests `CaptureDetail::Standard`; display
+                // frames belong to the Diagnostics screen's own capture.
+                CaptureEvent::Frame { .. } => {}
                 CaptureEvent::Failed(msg) => {
                     self.live.error = Some(msg);
                     self.state.listening = ListeningState::Error;
@@ -257,11 +269,24 @@ impl eframe::App for QwertyApp {
         if self.state.screen != Screen::Evaluation {
             self.evaluation.stop_run();
         }
-        if self.evaluation.is_running() {
+        if self.state.screen != Screen::Diagnostics {
+            // Leaving Diagnostics closes its mic and, with it, the 30 fps
+            // repaint — the "redraw stops within one frame of navigating away"
+            // requirement in `ACCEPTANCE.md`.
+            self.diagnostics.stop();
+        }
+
+        let diagnostics_open = self.state.screen == Screen::Diagnostics;
+        if self.evaluation.is_running() || diagnostics_open {
+            // A screen-owned capture takes the device. Close the Home stream
+            // first, then hand it over — never both open at once.
             if self.state.listening == ListeningState::Listening {
                 self.state.listening = ListeningState::Paused;
             }
             self.capture = None; // Drop stops the Home worker + closes the device.
+            if diagnostics_open && !self.diagnostics.is_active() {
+                self.diagnostics.start(ctx);
+            }
         } else {
             // Start/stop the mic to match listening state and absorb capture events.
             self.reconcile_capture(ctx);
@@ -283,7 +308,7 @@ impl eframe::App for QwertyApp {
             .show(ctx, |ui| match self.state.screen {
                 Screen::Home => self.home(ui, &pal),
                 Screen::Zones => self.zones(ui, &pal),
-                Screen::Diagnostics => placeholder(ui, &pal, "Diagnostics", "Phase 6"),
+                Screen::Diagnostics => self.diagnostics.ui(ui, &pal, &self.state),
                 Screen::Evaluation => self.evaluation.ui(ui, &pal, &self.state),
                 Screen::Settings => self.settings(ui, &pal, now),
             });
@@ -640,12 +665,6 @@ const THEME_CHOICES: [(Theme, &str); 5] = [
     (Theme::Aurora, "Aurora"),
     (Theme::HighContrast, "High contrast"),
 ];
-
-fn placeholder(ui: &mut egui::Ui, pal: &Palette, title: &str, phase: &str) {
-    ui.heading(egui::RichText::new(title).color(pal.text).size(26.0));
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new(format!("This screen arrives in {phase}.")).color(pal.secondary));
-}
 
 /// A status pill combining a color *and* a glyph *and* text — never color alone
 /// (`DESIGN.md` → Accessibility).

@@ -28,7 +28,7 @@ use qwerty_core::features::{FeatureExtractor, FEATURE_WINDOW_SAMPLES, SAMPLE_RAT
 use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 
 use crate::app_state::AppState;
-use crate::capture_worker::{CaptureEvent, LiveCapture};
+use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::shell::Palette;
 
 /// Configurable held-out tap counts (`DESIGN.md`: "N taps per zone (default 15,
@@ -90,7 +90,7 @@ struct EvalRun {
 impl EvalRun {
     fn new(ctx: &egui::Context, profile: &Profile, taps_per_zone: u32) -> Self {
         Self {
-            capture: LiveCapture::start(None, ctx.clone()),
+            capture: LiveCapture::start(None, ctx.clone(), CaptureDetail::Standard),
             extractor: FeatureExtractor::new(),
             classifier: profile.classifier.clone(),
             profile_id: profile.id,
@@ -175,6 +175,9 @@ impl EvalRun {
                         self.armed = false;
                     }
                 }
+                // Evaluation requests `CaptureDetail::Standard`; display frames
+                // are a Diagnostics-only concern.
+                CaptureEvent::Frame { .. } => {}
                 CaptureEvent::Failed(msg) => self.capture_error = Some(msg),
             }
         }
