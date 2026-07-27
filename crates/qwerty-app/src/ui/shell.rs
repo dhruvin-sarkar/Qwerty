@@ -1502,22 +1502,31 @@ fn visuals_for(t: &Tokens) -> egui::Visuals {
     v.widgets.noninteractive.bg_stroke.color = c32(t.border);
     v.window_stroke.color = c32(t.border);
 
-    // Inactive controls sit on the surface layer with a border.
-    v.widgets.inactive.bg_fill = c32(t.bg_surface);
-    v.widgets.inactive.weak_bg_fill = c32(t.bg_surface);
+    // Inactive controls carry a raised elevated fill + border, so a button
+    // reads as a tactile surface rather than flat text on the panel.
+    v.widgets.inactive.bg_fill = c32(t.bg_elevated);
+    v.widgets.inactive.weak_bg_fill = c32(t.bg_elevated);
     v.widgets.inactive.bg_stroke.color = c32(t.border);
     v.widgets.inactive.fg_stroke.color = c32(t.text_primary);
+    v.widgets.inactive.expansion = 0.0;
 
-    // Hover raises to the elevated layer with an accent edge.
-    v.widgets.hovered.bg_fill = c32(t.bg_elevated);
-    v.widgets.hovered.weak_bg_fill = c32(t.bg_elevated);
+    // Hover: an accent-tinted fill, an accent edge, and a hair of growth — the
+    // control visibly lifts toward the pointer (egui animates `expansion`).
+    let hover_fill = c32(Color::lerp(t.bg_elevated, t.accent, 0.10));
+    v.widgets.hovered.bg_fill = hover_fill;
+    v.widgets.hovered.weak_bg_fill = hover_fill;
     v.widgets.hovered.bg_stroke.color = c32(t.accent);
     v.widgets.hovered.fg_stroke.color = c32(t.text_primary);
+    v.widgets.hovered.expansion = 1.5;
 
-    // Active / pressed uses the accent as the fill.
+    // Active / pressed: accent fill, with the label in `on_color(accent)` so it
+    // stays legible on every theme's accent, and the growth released (presses
+    // "in" rather than staying lifted).
     v.widgets.active.bg_fill = c32(t.accent);
     v.widgets.active.weak_bg_fill = c32(t.accent);
     v.widgets.active.bg_stroke.color = c32(t.accent);
+    v.widgets.active.fg_stroke.color = c32(on_color(t.accent));
+    v.widgets.active.expansion = 0.0;
 
     // Selection (and thus selectable_label highlight) uses a translucent accent.
     let a = t.accent;
