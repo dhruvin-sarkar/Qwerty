@@ -31,7 +31,7 @@ use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::{mix, primary_button, section, Palette};
+use crate::ui::shell::{mix, primary_button, screen_header, section, Palette};
 use crate::ui::style::{space, text};
 
 /// Configurable held-out tap counts (`DESIGN.md`: "N taps per zone (default 15,
@@ -296,8 +296,12 @@ impl EvaluationScreen {
     /// Render the screen. `state` is read-only here: the run holds its own clone
     /// of the classifier, and saving/listing reports are `&self` on `AppState`.
     pub fn ui(&mut self, ui: &mut egui::Ui, pal: &Palette, state: &AppState) {
-        ui.heading(egui::RichText::new("Evaluation").color(pal.text).size(text::TITLE));
-        ui.add_space(space::XS);
+        screen_header(
+            ui,
+            pal,
+            "Evaluation",
+            "Measure real accuracy on this exact desk and mic",
+        );
 
         let Some(profile) = state.active_profile.as_ref() else {
             ui.label(

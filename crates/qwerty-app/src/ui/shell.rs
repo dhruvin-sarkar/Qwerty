@@ -649,8 +649,7 @@ impl QwertyApp {
     }
 
     fn home(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.heading(egui::RichText::new("Home").color(pal.text).size(text::TITLE));
-        ui.add_space(space::XS);
+        screen_header(ui, pal, "Home", "Listening status and quick controls");
         if let Some(profile) = &self.state.active_profile {
             ui.label(
                 egui::RichText::new(format!(
@@ -1020,12 +1019,12 @@ impl QwertyApp {
     }
 
     fn zones(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.heading(
-            egui::RichText::new("Zones & profiles")
-                .color(pal.text)
-                .size(text::TITLE),
+        screen_header(
+            ui,
+            pal,
+            "Zones & profiles",
+            "Switch profiles, bind actions to each zone, and share calibrations",
         );
-        ui.add_space(space::SM);
         self.profile_switcher(ui, pal);
         self.profile_io(ui, pal);
 
@@ -1108,8 +1107,7 @@ impl QwertyApp {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, pal: &Palette, now: Instant) {
-        ui.heading(egui::RichText::new("Settings").color(pal.text).size(text::TITLE));
-        ui.add_space(space::LG);
+        screen_header(ui, pal, "Settings", "Appearance, startup, and privacy");
 
         // Each group is a card, so Settings reads as distinct panels at a glance
         // (DESIGN.md: settings understandable at a glance) rather than a flat run
@@ -1308,6 +1306,21 @@ fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
                 ui.label(egui::RichText::new(state.label()).color(pal.text).strong());
             });
         });
+}
+
+/// A screen's header: a large title plus a one-line subtitle in secondary text,
+/// then a block of space. Every top-level screen uses it, so they share one
+/// hierarchy (a bare heading over a wall of controls is the "plain screen" look
+/// this replaces). `pub(crate)` so the Diagnostics/Evaluation screens share it.
+pub(crate) fn screen_header(ui: &mut egui::Ui, pal: &Palette, title: &str, subtitle: &str) {
+    ui.heading(egui::RichText::new(title).color(pal.text).size(text::TITLE));
+    ui.add_space(space::XXS);
+    ui.label(
+        egui::RichText::new(subtitle)
+            .color(pal.secondary)
+            .size(text::BODY),
+    );
+    ui.add_space(space::LG);
 }
 
 /// A titled section label. `pub(crate)` so every screen shares one definition

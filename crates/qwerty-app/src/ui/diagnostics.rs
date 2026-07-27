@@ -29,8 +29,8 @@ use qwerty_core::profile::{Profile, SensingMode};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::{mix, section, Palette};
-use crate::ui::style::{space, text};
+use crate::ui::shell::{mix, screen_header, section, Palette};
+use crate::ui::style::space;
 
 /// Spectrogram scrollback, in columns. At the worker's ~33 fps frame rate this
 /// is a few seconds of history — enough to see a tap arrive and decay.
@@ -144,12 +144,12 @@ impl DiagnosticsScreen {
 
     /// Render the screen.
     pub fn ui(&mut self, ui: &mut egui::Ui, pal: &Palette, state: &AppState) {
-        ui.heading(
-            egui::RichText::new("Diagnostics")
-                .color(pal.text)
-                .size(text::TITLE),
+        screen_header(
+            ui,
+            pal,
+            "Diagnostics",
+            "See what the classifier hears, and why a tap lands where it does",
         );
-        ui.add_space(space::XS);
 
         let profile = state.active_profile.as_ref();
         self.drain(profile);
