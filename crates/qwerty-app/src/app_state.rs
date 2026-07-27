@@ -267,6 +267,85 @@ impl AppState {
         Ok(())
     }
 
+    /// The `Exports/` interchange folder beside `config.json` (sibling of
+    /// `Profiles/`) — where portable profile files are written by export and
+    /// read by import (`DESIGN.md`: "Import / export a profile"). `None` without
+    /// an `%APPDATA%` location.
+    fn exports_dir(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("Exports"))
+    }
+
+    /// Export the active profile to `Exports/<name>.json` as a portable,
+    /// human-inspectable file the user can copy to another machine or share
+    /// (`DESIGN.md`). Returns the path written. Errors (never silently) if there
+    /// is no active profile or no `%APPDATA%` location.
+    pub fn export_active_profile(&self) -> Result<PathBuf, String> {
+        let profile = self
+            .active_profile
+            .as_ref()
+            .ok_or("no active profile to export")?;
+        let dir = self
+            .exports_dir()
+            .ok_or("no %APPDATA% location is available to export")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{}.json", sanitize_filename(&profile.name)));
+        profile.save(&path).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// List the importable profile files in `Exports/` as `(path, display name)`,
+    /// sorted by name. The display name is the profile's own name when the file
+    /// loads, else the file stem, so a partially-corrupt drop is still listed by
+    /// filename rather than vanishing. Empty without an `Exports/` directory.
+    pub fn list_importable_profiles(&self) -> Vec<(PathBuf, String)> {
+        let Some(dir) = self.exports_dir() else {
+            return Vec::new();
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read exports directory {}: {e}",
+                    dir.display()
+                );
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = Profile::load(&path).map(|p| p.name).unwrap_or_else(|_| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("profile")
+                    .to_string()
+            });
+            out.push((path, name));
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
+    }
+
+    /// Import a profile from `path`: load + validate, assign a **fresh**
+    /// `ProfileId` so an import never overwrites an existing profile (even one
+    /// exported from this same machine), save it into `Profiles/`, and make it
+    /// active (`DESIGN.md`). Returns the new id. A missing/corrupt/version-
+    /// mismatched file fails fast via [`Profile::load`], leaving state unchanged.
+    pub fn import_profile(&mut self, path: &std::path::Path) -> Result<ProfileId, String> {
+        let mut profile = Profile::load(path).map_err(|e| e.to_string())?;
+        profile.id = ProfileId::new();
+        profile.updated_at = chrono::Utc::now();
+        self.save_profile(&profile)?; // persists, sets active, reloads into memory
+        Ok(profile.id)
+    }
+
     /// Core constructor from an already-resolved config and (optional) path.
     /// Tests pass `None` for the path so no real user file is ever touched.
     pub fn with_config(config: Config, config_path: Option<PathBuf>, system_dark: bool) -> Self {
@@ -479,6 +558,30 @@ fn config_file_path() -> Option<PathBuf> {
     Some(PathBuf::from(appdata).join("Qwerty").join("config.json"))
 }
 
+/// Make a profile name safe to use as an export filename: replace the
+/// Windows-illegal path characters (`< > : " / \ | ? *`) and control characters
+/// with `_`, trim surrounding whitespace and dots, and fall back to `profile`
+/// when nothing usable remains. The profile's real name inside the JSON is
+/// unchanged — this only shapes the filename.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "profile".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +681,38 @@ mod tests {
         s.config.active_profile_id = Some(id);
         // Already active → Ok early, without needing a path or disk access.
         assert!(s.switch_profile(id).is_ok());
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_illegal_chars_and_has_a_fallback() {
+        assert_eq!(sanitize_filename("Home desk"), "Home desk");
+        assert_eq!(sanitize_filename("a/b:c*d?"), "a_b_c_d_");
+        assert_eq!(sanitize_filename("  ..  "), "profile");
+        assert_eq!(sanitize_filename(""), "profile");
+    }
+
+    #[test]
+    fn exporting_without_an_active_profile_errors() {
+        // No active profile → a clear error, never a silent no-op.
+        assert!(test_state().export_active_profile().is_err());
+    }
+
+    #[test]
+    fn importing_a_missing_or_corrupt_file_fails_and_changes_nothing() {
+        let (mut s, dir) = temp_state("import_bad");
+        // Missing file.
+        assert!(s.import_profile(&dir.join("nope.json")).is_err());
+        // Corrupt file.
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "{ not a profile").unwrap();
+        assert!(s.import_profile(&bad).is_err());
+        // Neither touched the active profile.
+        assert!(s.active_profile.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_importable_is_empty_without_an_exports_dir() {
+        assert!(test_state().list_importable_profiles().is_empty());
     }
 }

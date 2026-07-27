@@ -8,6 +8,7 @@
 //! scheduled only while an animation (currently the theme cross-fade) is
 //! in flight, so a static screen costs no frames.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use qwerty_core::profile::{Theme, ZoneId};
@@ -97,8 +98,16 @@ struct QwertyApp {
     /// Cached summaries of all saved profiles, backing the Zones profile
     /// switcher (`DESIGN.md` → "Multiple desk profiles, switchable"). Refreshed
     /// only when the set changes — at startup, after the wizard saves a profile,
-    /// and after a switch — so the switcher never rescans the disk per frame.
+    /// and after a switch/export/import — so the switcher never rescans the disk
+    /// per frame.
     profiles: Vec<ProfileSummary>,
+    /// Cached `(path, display name)` of importable profile files in `Exports/`
+    /// (`DESIGN.md` → import/export). Refreshed alongside `profiles`.
+    importable: Vec<(PathBuf, String)>,
+    /// The last export/import success message (e.g. the path a profile was
+    /// exported to), shown inline under the Zones import/export controls.
+    /// Failures use the shared save-error banner instead. Transient UI only.
+    io_message: Option<String>,
 }
 
 impl QwertyApp {
@@ -167,6 +176,7 @@ impl QwertyApp {
         };
 
         let profiles = state.list_profiles();
+        let importable = state.list_importable_profiles();
         Self {
             state,
             tray,
@@ -184,6 +194,8 @@ impl QwertyApp {
             force_quit: false,
             window_visible: true,
             profiles,
+            importable,
+            io_message: None,
         }
     }
 
@@ -687,11 +699,76 @@ impl QwertyApp {
         );
     }
 
-    /// Re-read the saved-profile summaries from disk into the cache. Called at
-    /// the few points the set changes (startup, wizard save, switch), never per
-    /// frame.
+    /// Re-read the saved-profile summaries and the importable-file list from disk
+    /// into their caches. Called at the few points either set changes (startup,
+    /// wizard save, switch, export, import), never per frame.
     fn refresh_profiles(&mut self) {
         self.profiles = self.state.list_profiles();
+        self.importable = self.state.list_importable_profiles();
+    }
+
+    /// Export/import controls for the Zones screen (`DESIGN.md`: "Import / export
+    /// a profile"). Export writes the active profile to the `Exports/` folder;
+    /// import reads a profile from that folder as a new profile. Failures surface
+    /// in the shared save-error banner; a success path/name is shown inline.
+    fn profile_io(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.horizontal(|ui| {
+            if self.state.active_profile.is_some() && ui.button("Export profile").clicked() {
+                match self.state.export_active_profile() {
+                    Ok(path) => {
+                        self.io_message = Some(format!("Exported to {}", path.display()));
+                        self.save_error = None;
+                        self.refresh_profiles();
+                    }
+                    Err(e) => {
+                        self.io_message = None;
+                        self.save_error = Some(format!("Could not export profile: {e}"));
+                    }
+                }
+            }
+        });
+
+        if !self.importable.is_empty() {
+            ui.add_space(space::SM);
+            ui.label(
+                egui::RichText::new("Import a profile from the Exports folder")
+                    .color(pal.secondary)
+                    .size(text::CAPTION),
+            );
+            ui.add_space(space::XS);
+            let mut to_import: Option<PathBuf> = None;
+            ui.horizontal_wrapped(|ui| {
+                for (path, name) in &self.importable {
+                    if ui.button(format!("Import “{name}”")).clicked() {
+                        to_import = Some(path.clone());
+                    }
+                }
+            });
+            if let Some(path) = to_import {
+                match self.state.import_profile(&path) {
+                    Ok(_) => {
+                        self.selected_zone = None;
+                        self.io_message = Some("Imported a copy as a new profile.".to_string());
+                        self.save_error = None;
+                        self.refresh_profiles();
+                    }
+                    Err(e) => {
+                        self.io_message = None;
+                        self.save_error = Some(format!("Could not import profile: {e}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(msg) = &self.io_message {
+            ui.add_space(space::XS);
+            ui.label(
+                egui::RichText::new(msg)
+                    .color(pal.secondary)
+                    .size(text::CAPTION),
+            );
+        }
+        ui.add_space(space::MD);
     }
 
     /// A profile switcher for the Zones screen (`DESIGN.md`: "profile switcher"
@@ -749,6 +826,7 @@ impl QwertyApp {
         );
         ui.add_space(space::SM);
         self.profile_switcher(ui, pal);
+        self.profile_io(ui, pal);
 
         // Disjoint field borrows so the editor can hold the profile + platform
         // at once.
