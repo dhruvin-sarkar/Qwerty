@@ -615,12 +615,14 @@ impl Wizard {
                 layout,
             })
             .collect();
-        let fingerprint = DeviceFingerprint {
-            device_name: self.device_name.clone().unwrap_or_else(|| "unknown".into()),
-            // A stand-in capability hash (the full channel/format fingerprint
-            // from ARCHITECTURE.md → Microphone identity is a follow-up).
-            capability_hash: format!("sr{}", self.sample_rate.unwrap_or(0)),
-        };
+        // One shared constructor so the hash the profile is stamped with matches
+        // what the live device-change check compares against (the full
+        // channel/format fingerprint from ARCHITECTURE.md → Microphone identity
+        // is a follow-up; sample rate is the stand-in).
+        let fingerprint = DeviceFingerprint::from_device(
+            self.device_name.clone().unwrap_or_else(|| "unknown".into()),
+            self.sample_rate.unwrap_or(0),
+        );
         session
             .build_profile(
                 ProfileId::new(),

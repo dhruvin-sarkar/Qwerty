@@ -214,6 +214,21 @@ pub struct DeviceFingerprint {
     pub capability_hash: String,
 }
 
+impl DeviceFingerprint {
+    /// Build a fingerprint from a live device's name and negotiated sample rate.
+    /// The single place the `capability_hash` shape is defined, so calibration
+    /// (which stamps it into the profile) and the live device-change check
+    /// (which compares against it) can never drift apart. `ARCHITECTURE.md` →
+    /// Microphone identity notes the full channel/format fingerprint is a
+    /// follow-up; the sample rate is the stand-in until then.
+    pub fn from_device(device_name: impl Into<String>, sample_rate: u32) -> Self {
+        Self {
+            device_name: device_name.into(),
+            capability_hash: format!("sr{sample_rate}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ZoneLayout {
     /// All normalized 0.0–1.0 against the desk-diagram canvas.
@@ -251,6 +266,17 @@ impl Profile {
     /// Serialize to pretty JSON (the on-disk form).
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("Profile serializes")
+    }
+
+    /// Whether recalibration should be suggested because the live capture device
+    /// differs from the one this profile was calibrated on (`DESIGN.md`:
+    /// "prompts recalibration … when the bound microphone changes"). A tap's
+    /// acoustic signature is device-specific, so a classifier fitted on one mic
+    /// is not trustworthy on another; the UI surfaces this rather than silently
+    /// classifying against a stale model. Compares the full fingerprint, so a
+    /// changed name *or* changed capability (e.g. sample rate) both trigger it.
+    pub fn needs_recalibration_for(&self, current_device: &DeviceFingerprint) -> bool {
+        self.device_fingerprint != *current_device
     }
 
     /// Parse from JSON with the schema-version policy applied.
@@ -412,6 +438,23 @@ mod tests {
     use crate::features::{
         FeatureVector, CEPSTRAL_COEFF_COUNT, SPECTRAL_BAND_COUNT, TEMPORAL_FEATURE_COUNT,
     };
+
+    #[test]
+    fn device_fingerprint_from_device_uses_the_sample_rate_hash() {
+        let fp = DeviceFingerprint::from_device("USB Mic", 48_000);
+        assert_eq!(fp.device_name, "USB Mic");
+        assert_eq!(fp.capability_hash, "sr48000");
+    }
+
+    #[test]
+    fn needs_recalibration_only_when_the_device_differs() {
+        let p = sample_profile();
+        // Same device the profile was calibrated on → no prompt.
+        assert!(!p.needs_recalibration_for(&p.device_fingerprint.clone()));
+        // A different microphone → prompt.
+        let other = DeviceFingerprint::from_device("A Different Mic", 48_000);
+        assert!(p.needs_recalibration_for(&other));
+    }
 
     fn tiny_classifier() -> ClassifierParams {
         // Two crude clusters so a real (non-empty) classifier blob exists to

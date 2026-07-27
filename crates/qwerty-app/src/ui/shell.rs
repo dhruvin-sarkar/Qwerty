@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwerty_core::profile::{Theme, ZoneId};
+use qwerty_core::profile::{DeviceFingerprint, Theme, ZoneId};
 
 use crate::app_state::{AppState, ListeningState, ProfileSummary, Screen};
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
@@ -30,6 +30,9 @@ use crate::ui::wizard::{Wizard, WizardOutcome};
 #[derive(Default)]
 struct LiveStatus {
     device: Option<String>,
+    /// The live device's negotiated sample rate, paired with `device` to form
+    /// the current [`DeviceFingerprint`] for the device-change check.
+    sample_rate: Option<u32>,
     rms: f32,
     peak: f32,
     taps: u32,
@@ -232,7 +235,13 @@ impl QwertyApp {
             .unwrap_or_default();
         for ev in events {
             match ev {
-                CaptureEvent::Started { device_name, .. } => self.live.device = Some(device_name),
+                CaptureEvent::Started {
+                    device_name,
+                    sample_rate,
+                } => {
+                    self.live.device = Some(device_name);
+                    self.live.sample_rate = Some(sample_rate);
+                }
                 CaptureEvent::Level { rms, peak } => {
                     self.live.rms = rms;
                     self.live.peak = peak;
@@ -686,6 +695,32 @@ impl QwertyApp {
                         ))
                         .color(pal.text),
                     );
+
+                    // Device-change check: a tap's acoustic signature is
+                    // mic-specific, so a classifier fitted on one device is not
+                    // trustworthy on another. If the live device differs from the
+                    // one this profile was calibrated on, suggest recalibration
+                    // rather than silently classifying against a stale model
+                    // (`DESIGN.md`: prompt recalibration when the bound mic
+                    // changes; honest-accuracy framing).
+                    if let (Some(profile), Some(name), Some(sr)) = (
+                        self.state.active_profile.as_ref(),
+                        self.live.device.as_deref(),
+                        self.live.sample_rate,
+                    ) {
+                        let current = DeviceFingerprint::from_device(name, sr);
+                        if profile.needs_recalibration_for(&current) {
+                            ui.add_space(space::SM);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "⚠ Calibrated for “{}”, but “{name}” is active — \
+                                     recalibrate for reliable accuracy.",
+                                    profile.device_fingerprint.device_name
+                                ))
+                                .color(pal.warning),
+                            );
+                        }
+                    }
                 }
                 ListeningState::Error => {
                     ui.add_space(space::MD);
