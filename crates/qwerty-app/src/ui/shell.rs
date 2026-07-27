@@ -106,36 +106,48 @@ impl QwertyApp {
 
         // Single-reader event pump. `tray-icon` and `global-hotkey` each deliver
         // events on one process-global channel that hands each message to
-        // exactly one consumer, so we forward every event through an app-owned
-        // channel (drained by `Tray`/`Hotkeys`) and wake the UI from the same
-        // thread. Idle still costs nothing (the reader parks on `recv`), and no
-        // event is lost to a race between a blocked `recv` and a UI `try_recv`.
-        // Waking a hidden (tray-only) window is intended so a tray "Open"/"Quit"
-        // is processed promptly (`PERFORMANCE.md`).
-        let menu_rx = spawn_forward(
-            || tray_icon::menu::MenuEvent::receiver().recv().ok(),
-            cc.egui_ctx.clone(),
-        );
-        let tray_rx = spawn_forward(
-            || tray_icon::TrayIconEvent::receiver().recv().ok(),
-            cc.egui_ctx.clone(),
-        );
-        let hotkey_rx = spawn_forward(
-            || global_hotkey::GlobalHotKeyEvent::receiver().recv().ok(),
-            cc.egui_ctx.clone(),
-        );
+        // exactly one consumer. Create an app-owned channel per source, build
+        // Tray/Hotkeys with the receiving ends, then spawn the forwarder threads
+        // — each the sole reader of its global channel, forwarding into the app
+        // channel and waking the UI. Spawning only after successful construction
+        // means a failed Tray/Hotkeys never leaves a forwarder parked forever on
+        // its global receiver. Waking a hidden (tray-only) window is intended so
+        // a tray "Open"/"Quit" is processed promptly (`PERFORMANCE.md`).
+        let (menu_tx, menu_rx) = std::sync::mpsc::channel();
+        let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        let (hotkey_tx, hotkey_rx) = std::sync::mpsc::channel();
 
         // The tray must be created on this (the main / event-loop) thread on
         // Windows, which is where the eframe creator runs.
         let tray = match Tray::new(state.listening, menu_rx, tray_rx) {
-            Ok(t) => Some(t),
+            Ok(t) => {
+                let ctx = cc.egui_ctx.clone();
+                spawn_forward(
+                    menu_tx,
+                    || tray_icon::menu::MenuEvent::receiver().recv().ok(),
+                    ctx.clone(),
+                );
+                spawn_forward(
+                    tray_tx,
+                    || tray_icon::TrayIconEvent::receiver().recv().ok(),
+                    ctx,
+                );
+                Some(t)
+            }
             Err(e) => {
                 eprintln!("warning: tray icon unavailable: {e}");
                 None
             }
         };
         let hotkeys = match Hotkeys::new(hotkey_rx) {
-            Ok(h) => Some(h),
+            Ok(h) => {
+                spawn_forward(
+                    hotkey_tx,
+                    || global_hotkey::GlobalHotKeyEvent::receiver().recv().ok(),
+                    cc.egui_ctx.clone(),
+                );
+                Some(h)
+            }
             Err(e) => {
                 eprintln!("warning: global hotkey unavailable: {e}");
                 None
@@ -349,7 +361,10 @@ impl eframe::App for QwertyApp {
             self.diagnostics.stop();
         }
 
-        let diagnostics_open = self.state.screen == Screen::Diagnostics;
+        // Must agree with the stop condition above: a hidden Diagnostics screen
+        // stays stopped, or `needs_start()` would restart the mic the same frame
+        // it was stopped, churning open/close every frame behind a hidden window.
+        let diagnostics_open = self.window_visible && self.state.screen == Screen::Diagnostics;
         if self.evaluation.is_running() || diagnostics_open {
             // A screen-owned capture takes the device. Close the Home stream
             // first, then hand it over — never both open at once.
@@ -884,23 +899,22 @@ pub(crate) fn c32(c: Color) -> egui::Color32 {
 /// Spawn one background thread per external event source (tray, menu, hotkey).
 /// Each blocks on its process-global receiver and requests a repaint when an
 /// event arrives — parking (zero CPU) while idle. The receivers are `'static`
-/// and never disconnect, so `recv()` only returns on a real event.
 /// Spawn the single reader for one process-global event channel.
 ///
 /// `tray-icon` and `global-hotkey` each deliver events through one
 /// process-global crossbeam channel, and a crossbeam message goes to exactly
 /// one consumer — so each channel must have exactly one reader. This thread is
-/// it: it blocks on `recv_one`, forwards every event into an app-owned channel,
-/// and wakes the UI. `Tray`/`Hotkeys` then drain the returned channel each
-/// frame instead of the global one. (Previously a wake-thread `recv()` and the
-/// UI-thread `try_recv()` read the *same* global channel, so the parked
-/// wake-thread won every event and the UI never saw a tray/hotkey command.)
-fn spawn_forward<T, F>(mut recv_one: F, ctx: egui::Context) -> std::sync::mpsc::Receiver<T>
+/// it: it blocks on `recv_one`, forwards every event into `tx` (an app-owned
+/// channel drained by `Tray`/`Hotkeys`), and wakes the UI. (Previously a
+/// wake-thread `recv()` and the UI-thread `try_recv()` read the *same* global
+/// channel, so the parked wake-thread won every event and the UI never saw a
+/// tray/hotkey command.) Spawned only *after* its consumer is constructed, so a
+/// failed `Tray`/`Hotkeys` never leaves a reader parked forever on the global.
+fn spawn_forward<T, F>(tx: std::sync::mpsc::Sender<T>, mut recv_one: F, ctx: egui::Context)
 where
     T: Send + 'static,
     F: FnMut() -> Option<T> + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         while let Some(ev) = recv_one() {
             if tx.send(ev).is_err() {
@@ -909,7 +923,6 @@ where
             ctx.request_repaint();
         }
     });
-    rx
 }
 
 /// Read the OS dark-mode preference; default to dark when unknown (Midnight is
