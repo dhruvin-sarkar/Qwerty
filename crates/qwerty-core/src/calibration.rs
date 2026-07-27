@@ -373,6 +373,14 @@ impl CalibrationSession {
     /// Start a session for the given zones. `noise_floor` is the RMS measured in
     /// the environment-check step (pass 0.0 to skip the masking check).
     pub fn new(zone_ids: Vec<ZoneId>, taps_per_zone: usize, noise_floor: f32) -> Self {
+        // At least one zone is a precondition the wizard upholds (zones are
+        // placed before capture starts). Enforce it here so a violation fails
+        // loudly at construction, not as an out-of-bounds panic on the first
+        // `record_tap`/`undo_last`/`redo_current_zone` (`CLAUDE.md`: fail fast).
+        assert!(
+            !zone_ids.is_empty(),
+            "CalibrationSession requires at least one zone"
+        );
         let n = zone_ids.len();
         Self {
             extractor: FeatureExtractor::new(),
@@ -698,6 +706,14 @@ mod tests {
         // And it round-trips through JSON with no field loss.
         let back = Profile::from_json(&profile.to_json(), "p.json").unwrap();
         assert_eq!(back, profile);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one zone")]
+    fn new_rejects_zero_zones() {
+        // Zero zones would index-panic on the first tap; construction must
+        // reject it up front instead (fail fast).
+        CalibrationSession::new(vec![], 3, 0.0);
     }
 
     #[test]

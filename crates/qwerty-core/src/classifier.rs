@@ -286,6 +286,16 @@ impl ClassifierParams {
                 "each centroid must be length {FEATURE_DIM}"
             )));
         }
+        if self.examples.is_empty() {
+            // `classify`'s novelty gate takes the minimum distance over
+            // `examples`; with none it is always `f32::INFINITY`, so every tap
+            // is rejected forever. `train` always retains examples, so an empty
+            // list means a corrupt/hand-edited blob — fail loudly, don't ship a
+            // classifier that silently accepts nothing.
+            return Err(ClassifierError::MalformedParameters(
+                "classifier has no retained examples".into(),
+            ));
+        }
         if self
             .examples
             .iter()
@@ -485,6 +495,30 @@ mod tests {
         assert_eq!(
             ClassifierParams::train(&[], &[]),
             Err(ClassifierError::EmptyTrainingSet)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_classifier_with_no_examples() {
+        // train() always retains examples; an empty list can only come from a
+        // corrupt/hand-edited blob, where classify()'s novelty gate would then
+        // reject every tap. validate() must catch it up front.
+        let (za, zb) = (zone(1), zone(2));
+        let mut samples = Vec::new();
+        for j in 0..8 {
+            let jit = j as f32 * 1e-4;
+            samples.push((za, fv_from(0.0, jit)));
+            samples.push((zb, fv_from(5.0, jit)));
+        }
+        let mut clf = ClassifierParams::train(&samples, &[]).unwrap();
+        assert!(
+            clf.validate().is_ok(),
+            "a freshly trained classifier is valid"
+        );
+        clf.examples.clear();
+        assert!(
+            clf.validate().is_err(),
+            "a classifier with no retained examples must be rejected"
         );
     }
 

@@ -256,17 +256,34 @@ impl Profile {
     /// Parse from JSON with the schema-version policy applied.
     pub fn from_json(s: &str, file: &str) -> Result<Self, PersistenceError> {
         let profile: Profile = parse_versioned(s, PROFILE_SCHEMA_VERSION, file)?;
-        // The classifier blob is only version-checked at the outer schema level;
-        // validate its internal invariants so a stale or hand-edited profile
-        // fails loudly instead of silently truncating and misclassifying.
+        // Enforce the cross-field invariants a bare deserialize cannot, so a
+        // stale or hand-edited profile fails loudly rather than misbehaving later.
         profile
-            .classifier
             .validate()
-            .map_err(|e| PersistenceError::InvalidData {
+            .map_err(|reason| PersistenceError::InvalidData {
                 file: file.to_string(),
-                reason: e.to_string(),
+                reason,
             })?;
         Ok(profile)
+    }
+
+    /// Cross-field invariants a plain deserialize cannot enforce: the classifier
+    /// blob's internal consistency, and that every `ZoneLayout` coordinate is
+    /// finite. `serde_json` writes a non-finite `f32` as JSON `null`, which then
+    /// fails to deserialize — so validating here on **save** stops `write_atomic`
+    /// from atomically replacing a good profile with a permanently unloadable
+    /// one, and on **load** makes a corrupt file fail loudly. Returns a human
+    /// reason string on failure.
+    fn validate(&self) -> Result<(), String> {
+        self.classifier.validate().map_err(|e| e.to_string())?;
+        for zone in &self.zones {
+            let l = &zone.layout;
+            if !(l.x.is_finite() && l.y.is_finite() && l.width.is_finite() && l.height.is_finite())
+            {
+                return Err(format!("zone {:?} has a non-finite layout", zone.id));
+            }
+        }
+        Ok(())
     }
 
     /// Load from a file path, applying the schema-version policy.
@@ -275,8 +292,14 @@ impl Profile {
         Self::from_json(&s, &path.display().to_string())
     }
 
-    /// Write to a file path as pretty JSON.
+    /// Write to a file path as pretty JSON. Validates first, so a corrupt
+    /// in-memory profile is never atomically written over a good one on disk.
     pub fn save(&self, path: &std::path::Path) -> Result<(), PersistenceError> {
+        self.validate()
+            .map_err(|reason| PersistenceError::InvalidData {
+                file: path.display().to_string(),
+                reason,
+            })?;
         write_atomic(path, &self.to_json()).map_err(PersistenceError::Io)
     }
 }
@@ -475,6 +498,20 @@ mod tests {
         let p = sample_profile();
         let back = Profile::from_json(&p.to_json(), "p.json").unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn save_rejects_a_non_finite_zone_layout() {
+        // serde_json writes a non-finite f32 as JSON `null`, which then fails to
+        // load — so a profile with a NaN layout must be refused rather than
+        // atomically written over a good file (validate runs before write).
+        let mut p = sample_profile();
+        assert!(p.validate().is_ok(), "the sample profile is valid");
+        p.zones[0].layout.x = f32::NAN;
+        assert!(
+            p.validate().is_err(),
+            "a non-finite zone layout must be rejected"
+        );
     }
 
     #[test]
