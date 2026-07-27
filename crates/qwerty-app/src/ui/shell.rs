@@ -177,14 +177,11 @@ impl QwertyApp {
     /// capture events. Listening opens the device; pausing (or an error) drops
     /// the worker, which stops the stream via RAII. A capture failure moves the
     /// app into the `Error` state with a specific message (fail fast).
-    fn reconcile_capture(&mut self, ctx: &egui::Context) {
+    fn reconcile_capture(&mut self, ctx: &egui::Context, showing: bool) {
         match self.state.listening {
             ListeningState::Listening if self.capture.is_none() => {
                 self.live = LiveStatus::default();
                 let cap = LiveCapture::start(None, ctx.clone(), CaptureDetail::Standard);
-                // Match the new worker to the current window visibility: the
-                // global hotkey can start listening while hidden to the tray.
-                cap.set_visible(self.window_visible);
                 self.capture = Some(cap);
             }
             ListeningState::Paused | ListeningState::Error if self.capture.is_some() => {
@@ -222,6 +219,16 @@ impl QwertyApp {
                 }
             }
         }
+
+        // The Home meter only paints on Home while the window is showing.
+        // Everywhere else the mic keeps listening (onsets still fire and wake the
+        // UI) but its 50 ms level report drives a repaint no one can see, so mute
+        // it. Pushed every frame: a screen change, minimize, or restore delivers
+        // no discrete event, and this is the single owner of Home-capture
+        // visibility (the tray/close handlers only flip `window_visible`).
+        if let Some(cap) = &self.capture {
+            cap.set_visible(showing && self.state.screen == Screen::Home);
+        }
     }
 
     /// Apply tray/hotkey events and the close-to-tray policy. Returns after
@@ -241,13 +248,9 @@ impl QwertyApp {
                     TrayCommand::OpenWindow => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        // `window_visible` alone; capture/wizard visibility is
+                        // reconciled from `showing` every frame in `update`.
                         self.window_visible = true;
-                        if let Some(c) = &self.capture {
-                            c.set_visible(true);
-                        }
-                        if let Some(w) = self.wizard.as_mut() {
-                            w.set_visible(true);
-                        }
                     }
                     TrayCommand::Quit => {
                         // Force a real exit. Without this, the close-to-tray
@@ -275,13 +278,9 @@ impl QwertyApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // `window_visible` alone; capture/wizard visibility is reconciled
+            // from `showing` every frame in `update`.
             self.window_visible = false;
-            if let Some(c) = &self.capture {
-                c.set_visible(false);
-            }
-            if let Some(w) = self.wizard.as_mut() {
-                w.set_visible(false);
-            }
         }
     }
 }
@@ -314,11 +313,24 @@ impl eframe::App for QwertyApp {
         // Apply tray/hotkey events and the close-to-tray policy before painting.
         self.handle_external_events(ctx);
 
+        // A window hidden to the tray *or* minimized to the taskbar shows nothing,
+        // so no live view may drive the mic meter or a repaint behind it
+        // (`PERFORMANCE.md`). `window_visible` tracks the tray hide/show only; the
+        // OS title-bar minimize is a separate signal the tray path never sees.
+        // Fold both into one "is the window actually showing" truth and let every
+        // visibility gate below derive from it — a minimize or restore delivers no
+        // discrete event, so each gate is re-evaluated every frame from `showing`.
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let showing = self.window_visible && !minimized;
+
         // The calibration wizard takes over the entire window when active.
         if self.wizard.is_some() {
             self.capture = None; // the wizard owns its own mic
             if self.state.listening == ListeningState::Listening {
                 self.state.listening = ListeningState::Paused;
+            }
+            if let Some(w) = self.wizard.as_mut() {
+                w.set_visible(showing);
             }
             let tokens = self.effective_tokens(ctx, now);
             ctx.set_visuals(visuals_for(&tokens));
@@ -368,17 +380,17 @@ impl eframe::App for QwertyApp {
         // (`PERFORMANCE.md`), and a hidden Evaluation run stops like any
         // navigate-away. On leaving Diagnostics the mic + repaint stop within one
         // frame (`ACCEPTANCE.md`).
-        if !self.window_visible || self.state.screen != Screen::Evaluation {
+        if !showing || self.state.screen != Screen::Evaluation {
             self.evaluation.stop_run();
         }
-        if !self.window_visible || self.state.screen != Screen::Diagnostics {
+        if !showing || self.state.screen != Screen::Diagnostics {
             self.diagnostics.stop();
         }
 
         // Must agree with the stop condition above: a hidden Diagnostics screen
         // stays stopped, or `needs_start()` would restart the mic the same frame
         // it was stopped, churning open/close every frame behind a hidden window.
-        let diagnostics_open = self.window_visible && self.state.screen == Screen::Diagnostics;
+        let diagnostics_open = showing && self.state.screen == Screen::Diagnostics;
         if self.evaluation.is_running() || diagnostics_open {
             // A screen-owned capture takes the device. Close the Home stream
             // first, then hand it over — never both open at once.
@@ -396,7 +408,7 @@ impl eframe::App for QwertyApp {
             }
         } else {
             // Start/stop the mic to match listening state and absorb capture events.
-            self.reconcile_capture(ctx);
+            self.reconcile_capture(ctx, showing);
         }
 
         // Resolve this frame's effective tokens, advancing any theme cross-fade.
