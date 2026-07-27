@@ -149,6 +149,35 @@ pub enum ActionSpec {
     VisualOnly,
 }
 
+impl ActionSpec {
+    /// A short reason this action is not yet runnable because a required field
+    /// is blank, or `None` when it is complete. This is non-blocking editor
+    /// guidance: the action editor shows it so a half-filled action reads as
+    /// visibly incomplete *before* a tap fires it, instead of the action
+    /// silently no-op'ing or failing at dispatch. It is deliberately **not**
+    /// enforced by [`Profile::validate`] — a half-typed action is a normal
+    /// mid-edit state, not a corrupt profile. Exhaustive, so a new variant must
+    /// decide whether it has a required field.
+    pub fn incomplete_reason(&self) -> Option<&'static str> {
+        let blank = |s: &str| s.trim().is_empty();
+        match self {
+            ActionSpec::OpenApp { path } => blank(path).then_some("needs an application path"),
+            ActionSpec::OpenPath { path } => blank(path).then_some("needs a file or folder path"),
+            ActionSpec::OpenUrl { url } => blank(url).then_some("needs a URL"),
+            ActionSpec::RunCommand { command, .. } => blank(command).then_some("needs a command"),
+            ActionSpec::CopyToClipboard { text } => blank(text).then_some("needs text to copy"),
+            ActionSpec::Speak { text } => blank(text).then_some("needs text to speak"),
+            ActionSpec::ShowToast { title, body } => {
+                (blank(title) && blank(body)).then_some("needs a title or body")
+            }
+            ActionSpec::SendKeystroke { combo } => blank(&combo.key).then_some("needs a key"),
+            ActionSpec::PlaySound { .. }
+            | ActionSpec::Screenshot { .. }
+            | ActionSpec::VisualOnly => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config (config.json)
 // ---------------------------------------------------------------------------
@@ -438,6 +467,47 @@ mod tests {
     use crate::features::{
         FeatureVector, CEPSTRAL_COEFF_COUNT, SPECTRAL_BAND_COUNT, TEMPORAL_FEATURE_COUNT,
     };
+
+    #[test]
+    fn incomplete_reason_flags_only_blank_required_fields() {
+        // Blank required field → a reason; filled → none.
+        assert!(ActionSpec::OpenApp {
+            path: String::new()
+        }
+        .incomplete_reason()
+        .is_some());
+        assert!(ActionSpec::OpenApp { path: "app".into() }
+            .incomplete_reason()
+            .is_none());
+        assert!(ActionSpec::SendKeystroke {
+            combo: KeyCombo {
+                modifiers: vec![],
+                key: "   ".into()
+            }
+        }
+        .incomplete_reason()
+        .is_some());
+        // No-required-field actions are always complete.
+        assert!(ActionSpec::VisualOnly.incomplete_reason().is_none());
+        assert!(ActionSpec::PlaySound {
+            sound: SystemSound::Default
+        }
+        .incomplete_reason()
+        .is_none());
+        // A toast needs at least one of title/body.
+        assert!(ActionSpec::ShowToast {
+            title: String::new(),
+            body: String::new()
+        }
+        .incomplete_reason()
+        .is_some());
+        assert!(ActionSpec::ShowToast {
+            title: "Hi".into(),
+            body: String::new()
+        }
+        .incomplete_reason()
+        .is_none());
+    }
 
     #[test]
     fn device_fingerprint_from_device_uses_the_sample_rate_hash() {

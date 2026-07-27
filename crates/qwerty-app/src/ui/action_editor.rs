@@ -12,7 +12,7 @@ use qwerty_core::profile::{ActionSpec, Modifier, ScreenshotMode, SystemSound, Zo
 
 use crate::platform::{dispatch, PlatformActions};
 use crate::ui::shell::{card, Palette};
-use crate::ui::style::space;
+use crate::ui::style::{space, text};
 
 /// Transient editor state: the last Test result, scoped to the zone + row it
 /// was run on so it never bleeds onto a different zone's row.
@@ -242,6 +242,16 @@ impl ActionEditor {
                         });
                     });
                     changed |= action_fields(ui, pal, spec);
+                    // Non-blocking hint when a required field is still blank, so
+                    // an action that would silently do nothing on a tap reads as
+                    // incomplete here first (qwerty_core `incomplete_reason`).
+                    if let Some(reason) = spec.incomplete_reason() {
+                        ui.label(
+                            RichText::new(format!("⚠ {reason}"))
+                                .color(pal.warning)
+                                .size(text::CAPTION),
+                        );
+                    }
                 });
             });
             ui.add_space(space::SM);
