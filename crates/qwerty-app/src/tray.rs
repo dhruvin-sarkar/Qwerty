@@ -5,8 +5,13 @@
 //! The icon image swaps instantly on state change (no animation — `MOTION.md`
 //! → Tray icon state change). Icons are generated in memory as colored discs,
 //! so no image assets are committed to the repo (`CLAUDE.md`: no committed
-//! binaries). Tray/menu events land on process-global channels; the shell
-//! drains them each frame and a wake-thread requests a repaint on arrival.
+//! binaries). Tray/menu events arrive on one process-global channel that hands
+//! each message to exactly one consumer, so a single event-pump thread (see
+//! `ui::shell`) is its sole reader: it forwards every event into the app-owned
+//! channels this type drains, and wakes the UI. The tray must never read the
+//! global channel directly, or it would race that pump thread and lose events.
+
+use std::sync::mpsc::Receiver;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -49,11 +54,22 @@ pub struct Tray {
     open_id: MenuId,
     quit_id: MenuId,
     state: ListeningState,
+    /// App-owned channels fed by the event-pump threads in `ui::shell`. The
+    /// tray/menu crates deliver on a single process-global channel, so the UI
+    /// drains these forwarded copies rather than reading that global directly.
+    menu_rx: Receiver<MenuEvent>,
+    tray_rx: Receiver<TrayIconEvent>,
 }
 
 impl Tray {
-    /// Build the tray icon (reflecting `state`) and its menu.
-    pub fn new(state: ListeningState) -> Result<Self, TrayError> {
+    /// Build the tray icon (reflecting `state`) and its menu. `menu_rx`/`tray_rx`
+    /// are the app-owned channels the shell's event pump forwards menu and
+    /// tray-click events into; [`poll`](Self::poll) drains them.
+    pub fn new(
+        state: ListeningState,
+        menu_rx: Receiver<MenuEvent>,
+        tray_rx: Receiver<TrayIconEvent>,
+    ) -> Result<Self, TrayError> {
         let toggle = MenuItem::new("Toggle listening", true, None);
         let open = MenuItem::new("Open Qwerty", true, None);
         let quit = MenuItem::new("Quit", true, None);
@@ -78,6 +94,8 @@ impl Tray {
             open_id,
             quit_id,
             state,
+            menu_rx,
+            tray_rx,
         })
     }
 
@@ -96,7 +114,7 @@ impl Tray {
     /// A left click on the icon opens the window.
     pub fn poll(&self) -> Vec<TrayCommand> {
         let mut cmds = Vec::new();
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+        while let Ok(ev) = self.menu_rx.try_recv() {
             if ev.id == self.toggle_id {
                 cmds.push(TrayCommand::ToggleListening);
             } else if ev.id == self.open_id {
@@ -105,7 +123,7 @@ impl Tray {
                 cmds.push(TrayCommand::Quit);
             }
         }
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+        while let Ok(ev) = self.tray_rx.try_recv() {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,

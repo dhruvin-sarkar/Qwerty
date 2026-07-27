@@ -100,22 +100,37 @@ impl QwertyApp {
         let tokens = tokens_for(state.config.theme, system_dark);
         cc.egui_ctx.set_visuals(visuals_for(&tokens));
 
-        // Wake the UI when a tray/menu/hotkey event arrives. Each thread blocks
-        // on its process-global receiver and requests a repaint — so idle costs
-        // nothing (the thread parks) yet the UI reacts the instant an event
-        // lands, even with the window hidden to the tray (`PERFORMANCE.md`).
-        spawn_wake_thread(cc.egui_ctx.clone());
+        // Single-reader event pump. `tray-icon` and `global-hotkey` each deliver
+        // events on one process-global channel that hands each message to
+        // exactly one consumer, so we forward every event through an app-owned
+        // channel (drained by `Tray`/`Hotkeys`) and wake the UI from the same
+        // thread. Idle still costs nothing (the reader parks on `recv`), and no
+        // event is lost to a race between a blocked `recv` and a UI `try_recv`.
+        // Waking a hidden (tray-only) window is intended so a tray "Open"/"Quit"
+        // is processed promptly (`PERFORMANCE.md`).
+        let menu_rx = spawn_forward(
+            || tray_icon::menu::MenuEvent::receiver().recv().ok(),
+            cc.egui_ctx.clone(),
+        );
+        let tray_rx = spawn_forward(
+            || tray_icon::TrayIconEvent::receiver().recv().ok(),
+            cc.egui_ctx.clone(),
+        );
+        let hotkey_rx = spawn_forward(
+            || global_hotkey::GlobalHotKeyEvent::receiver().recv().ok(),
+            cc.egui_ctx.clone(),
+        );
 
         // The tray must be created on this (the main / event-loop) thread on
         // Windows, which is where the eframe creator runs.
-        let tray = match Tray::new(state.listening) {
+        let tray = match Tray::new(state.listening, menu_rx, tray_rx) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("warning: tray icon unavailable: {e}");
                 None
             }
         };
-        let hotkeys = match Hotkeys::new() {
+        let hotkeys = match Hotkeys::new(hotkey_rx) {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("warning: global hotkey unavailable: {e}");
@@ -855,20 +870,31 @@ pub(crate) fn c32(c: Color) -> egui::Color32 {
 /// Each blocks on its process-global receiver and requests a repaint when an
 /// event arrives — parking (zero CPU) while idle. The receivers are `'static`
 /// and never disconnect, so `recv()` only returns on a real event.
-fn spawn_wake_thread(ctx: egui::Context) {
-    let sources: [fn() -> bool; 3] = [
-        || tray_icon::TrayIconEvent::receiver().recv().is_ok(),
-        || tray_icon::menu::MenuEvent::receiver().recv().is_ok(),
-        || global_hotkey::GlobalHotKeyEvent::receiver().recv().is_ok(),
-    ];
-    for wait_for_event in sources {
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            while wait_for_event() {
-                ctx.request_repaint();
+/// Spawn the single reader for one process-global event channel.
+///
+/// `tray-icon` and `global-hotkey` each deliver events through one
+/// process-global crossbeam channel, and a crossbeam message goes to exactly
+/// one consumer — so each channel must have exactly one reader. This thread is
+/// it: it blocks on `recv_one`, forwards every event into an app-owned channel,
+/// and wakes the UI. `Tray`/`Hotkeys` then drain the returned channel each
+/// frame instead of the global one. (Previously a wake-thread `recv()` and the
+/// UI-thread `try_recv()` read the *same* global channel, so the parked
+/// wake-thread won every event and the UI never saw a tray/hotkey command.)
+fn spawn_forward<T, F>(mut recv_one: F, ctx: egui::Context) -> std::sync::mpsc::Receiver<T>
+where
+    T: Send + 'static,
+    F: FnMut() -> Option<T> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Some(ev) = recv_one() {
+            if tx.send(ev).is_err() {
+                break; // the UI dropped its receiver — nothing left to wake
             }
-        });
-    }
+            ctx.request_repaint();
+        }
+    });
+    rx
 }
 
 /// Read the OS dark-mode preference; default to dark when unknown (Midnight is
