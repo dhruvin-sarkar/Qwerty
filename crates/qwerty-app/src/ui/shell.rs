@@ -81,6 +81,10 @@ struct QwertyApp {
     /// The Diagnostics screen (live waveform/spectrogram/feature space). Owns
     /// its own mic while that screen is open; the shell starts and stops it.
     diagnostics: DiagnosticsScreen,
+    /// A profile-save failure to surface to the user as a dismissible banner
+    /// above the active screen. `None` when there is nothing to report.
+    /// Transient UI state only — never persisted.
+    save_error: Option<String>,
 }
 
 impl QwertyApp {
@@ -128,6 +132,7 @@ impl QwertyApp {
             selected_zone: None,
             evaluation: EvaluationScreen::default(),
             diagnostics: DiagnosticsScreen::default(),
+            save_error: None,
         }
     }
 
@@ -271,8 +276,13 @@ impl eframe::App for QwertyApp {
                 });
             if let Some(o) = outcome {
                 if let WizardOutcome::Saved(profile) = o {
-                    if let Err(e) = self.state.save_profile(&profile) {
-                        eprintln!("warning: could not save profile: {e}");
+                    match self.state.save_profile(&profile) {
+                        Ok(()) => self.save_error = None,
+                        Err(e) => {
+                            eprintln!("warning: could not save profile: {e}");
+                            self.save_error =
+                                Some(format!("Could not save “{}”: {e}", profile.name));
+                        }
                     }
                     self.state.screen = Screen::Home;
                 }
@@ -330,12 +340,15 @@ impl eframe::App for QwertyApp {
                     .fill(pal.base)
                     .inner_margin(egui::Margin::same(24)),
             )
-            .show(ctx, |ui| match self.state.screen {
-                Screen::Home => self.home(ui, &pal),
-                Screen::Zones => self.zones(ui, &pal),
-                Screen::Diagnostics => self.diagnostics.ui(ui, &pal, &self.state),
-                Screen::Evaluation => self.evaluation.ui(ui, &pal, &self.state),
-                Screen::Settings => self.settings(ui, &pal, now),
+            .show(ctx, |ui| {
+                self.save_error_banner(ui, &pal);
+                match self.state.screen {
+                    Screen::Home => self.home(ui, &pal),
+                    Screen::Zones => self.zones(ui, &pal),
+                    Screen::Diagnostics => self.diagnostics.ui(ui, &pal, &self.state),
+                    Screen::Evaluation => self.evaluation.ui(ui, &pal, &self.state),
+                    Screen::Settings => self.settings(ui, &pal, now),
+                }
             });
 
         // Launch the wizard at end of frame (set by a Calibrate button), after
@@ -388,6 +401,38 @@ impl QwertyApp {
         // Still animating: ask egui for another frame, then stop once settled.
         ctx.request_repaint();
         Tokens::lerp(&from, &to, eased)
+    }
+
+    /// A dismissible banner shown above the active screen when a profile save
+    /// fails. Without it, a persistence error would reach only stderr, leaving
+    /// the user believing an edit was stored when it was not — the silent
+    /// failure `CLAUDE.md` bans. It holds until dismissed (or cleared by a later
+    /// successful save), so it needs no timer and no continuous repaint.
+    fn save_error_banner(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let Some(msg) = self.save_error.clone() else {
+            return;
+        };
+        egui::Frame::default()
+            .fill(mix(pal.base, pal.danger, 0.15))
+            .stroke(egui::Stroke::new(1.0_f32, pal.danger))
+            .inner_margin(egui::Margin::same(12))
+            .corner_radius(egui::CornerRadius::same(8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("⚠ Couldn’t save")
+                            .color(pal.danger)
+                            .strong(),
+                    );
+                    ui.label(egui::RichText::new(&msg).color(pal.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Dismiss").clicked() {
+                            self.save_error = None;
+                        }
+                    });
+                });
+            });
+        ui.add_space(12.0);
     }
 
     fn nav_rail(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -552,6 +597,7 @@ impl QwertyApp {
             platform,
             selected_zone,
             launch_wizard,
+            save_error,
             ..
         } = self;
 
@@ -611,8 +657,12 @@ impl QwertyApp {
         });
 
         if changed {
-            if let Err(e) = state.save_active_profile() {
-                eprintln!("warning: could not save profile: {e}");
+            match state.save_active_profile() {
+                Ok(()) => *save_error = None,
+                Err(e) => {
+                    eprintln!("warning: could not save profile: {e}");
+                    *save_error = Some(format!("Could not save your changes: {e}"));
+                }
             }
         }
     }
