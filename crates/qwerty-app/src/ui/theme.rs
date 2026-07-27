@@ -7,8 +7,9 @@
 //! unit-testable; the shell maps them to egui `Visuals` at its boundary.
 //!
 //! Accessibility is a test, not a claim: WCAG relative-luminance contrast is
-//! computed here, and every theme's primary text clears AA (≥4.5:1) against its
-//! base, with High Contrast clearing AAA (≥7:1) — see the tests.
+//! computed here, and every theme's primary text — plus the accent and status
+//! colors, which are also rendered as text/glyphs — clears AA (≥4.5:1) against
+//! its base, with High Contrast clearing AAA (≥7:1) — see the tests.
 
 use qwerty_core::profile::Theme;
 
@@ -113,7 +114,10 @@ const DAYLIGHT: Tokens = Tokens {
     text_secondary: Color::rgb(0x55, 0x55, 0x5C),
     border: Color::rgb(0xE2, 0xDE, 0xD8),
     accent: Color::rgb(0x2D, 0x6C, 0xDF),
-    success: Color::rgb(0x1E, 0x87, 0x4B),
+    // Darkened from 0x1E874B (4.29:1 — below AA on bg_base) to 5.07:1, matching
+    // this theme's other status colors (danger 5.0, warning 5.1). See the
+    // semantic-color contrast test.
+    success: Color::rgb(0x1A, 0x7A, 0x43),
     warning: Color::rgb(0x8A, 0x63, 0x00),
     danger: Color::rgb(0xC2, 0x39, 0x34),
 };
@@ -321,6 +325,42 @@ mod tests {
         assert_eq!(
             tokens_for(Theme::System, false).bg_base,
             tokens_for(Theme::Daylight, false).bg_base
+        );
+    }
+
+    #[test]
+    fn semantic_colors_are_legible_as_text_on_backgrounds() {
+        // accent + status colors are not just fills — they are rendered as
+        // text/glyphs: the action editor's "✓ ran" / "⚠ …" badges, the
+        // selected-zone and nav labels (accent), the save-error banner (danger).
+        // Like primary text they must clear WCAG AA (4.5:1) on whatever panel
+        // they can appear over. Collect every shortfall so one run reports the
+        // whole picture instead of stopping at the first.
+        let mut failures = Vec::new();
+        for theme in CONCRETE_THEMES {
+            let t = tokens_for(theme, false);
+            for (cname, color) in [
+                ("accent", t.accent),
+                ("success", t.success),
+                ("warning", t.warning),
+                ("danger", t.danger),
+            ] {
+                for (bname, bg) in [
+                    ("bg_base", t.bg_base),
+                    ("bg_surface", t.bg_surface),
+                    ("bg_elevated", t.bg_elevated),
+                ] {
+                    let c = contrast_ratio(color, bg);
+                    if c < 4.5 {
+                        failures.push(format!("{theme:?} {cname} on {bname}: {c:.2}:1"));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "semantic colors below WCAG AA (4.5:1) as text:\n{}",
+            failures.join("\n")
         );
     }
 }
