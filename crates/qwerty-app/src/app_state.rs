@@ -197,22 +197,19 @@ impl AppState {
         }
     }
 
-    /// Persist the current config best-effort. A write failure is surfaced on
-    /// stderr; the in-memory setting still applies for this session. No-op when
-    /// there is no path (tests, or `%APPDATA%` unavailable).
-    pub fn save_config(&self) {
+    /// Persist the current config. Returns `Err` with a human-readable message
+    /// on a write failure so the caller can surface it (Settings routes it into
+    /// the save-error banner, `save_profile` propagates it) — the in-memory
+    /// setting still applies for the session. `Ok(())` no-op when there is no
+    /// path (tests, or `%APPDATA%` unavailable).
+    pub fn save_config(&self) -> Result<(), String> {
         let Some(path) = &self.config_path else {
-            return;
+            return Ok(());
         };
         if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("warning: could not create {}: {e}", parent.display());
-                return;
-            }
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        if let Err(e) = self.config.save(path) {
-            eprintln!("warning: could not save {}: {e}", path.display());
-        }
+        self.config.save(path).map_err(|e| e.to_string())
     }
 
     /// Persist a freshly calibrated profile to `%APPDATA%\Qwerty\Profiles\
@@ -227,7 +224,7 @@ impl AppState {
         let path = dir.join(format!("{}.json", profile.id));
         profile.save(&path).map_err(|e| e.to_string())?;
         self.config.active_profile_id = Some(profile.id);
-        self.save_config();
+        self.save_config()?;
         // Reflect the newly-saved profile in memory immediately.
         self.active_profile = Some(profile.clone());
         Ok(())

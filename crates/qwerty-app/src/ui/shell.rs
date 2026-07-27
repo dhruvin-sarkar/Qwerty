@@ -759,7 +759,9 @@ impl QwertyApp {
                 if ui.selectable_label(selected, text).clicked()
                     && self.state.begin_theme_switch(theme, now)
                 {
-                    self.state.save_config();
+                    if let Err(e) = self.state.save_config() {
+                        self.save_error = Some(e);
+                    }
                 }
             }
         });
@@ -779,7 +781,9 @@ impl QwertyApp {
             )
             .changed()
         {
-            self.state.save_config();
+            if let Err(e) = self.state.save_config() {
+                self.save_error = Some(e);
+            }
         }
         if ui
             .checkbox(
@@ -788,7 +792,9 @@ impl QwertyApp {
             )
             .changed()
         {
-            self.state.save_config();
+            if let Err(e) = self.state.save_config() {
+                self.save_error = Some(e);
+            }
         }
 
         ui.add_space(20.0);
@@ -800,7 +806,9 @@ impl QwertyApp {
             )
             .changed()
         {
-            self.state.save_config();
+            if let Err(e) = self.state.save_config() {
+                self.save_error = Some(e);
+            }
         }
         if self.state.config.debug_capture_enabled {
             ui.label(

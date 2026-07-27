@@ -88,6 +88,12 @@ impl DiagnosticsScreen {
         self.spectrogram.clear();
         self.last_tap = None;
         self.device_name = None;
+        // Clear the recorded failure too, so a later visit gets a fresh retry
+        // via `needs_start()`. Without this the screen is locked out for the rest
+        // of the session after one mic failure — even once the device recovers —
+        // because `needs_start()` requires `error.is_none()`. (Retry-loop safety
+        // is unaffected: `stop()` runs only on navigate-away/hide, not per frame.)
+        self.error = None;
     }
 
     /// Absorb worker events: display frames drive the waveform/spectrogram, and
