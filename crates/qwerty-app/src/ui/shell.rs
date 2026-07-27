@@ -799,17 +799,26 @@ impl QwertyApp {
 
         card(ui, pal, |ui| {
             section(ui, pal, "Startup");
-            if ui
-                .checkbox(
+            // "Start with Windows" has no OS startup entry wired behind it in
+            // this build, so it is shown disabled rather than as a toggle that
+            // silently persists a value nothing acts on (DESIGN.md honest
+            // framing; mirrors the Diagnostics "not available in this build"
+            // treatment of Active/Hybrid sensing). Registering a real startup
+            // entry is deferred to the packaging phase (`ROADMAP.md` Phase 9).
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(
                     &mut self.state.config.start_with_windows,
                     "Start Qwerty when I sign in",
-                )
-                .changed()
-            {
-                if let Err(e) = self.state.save_config() {
-                    self.save_error = Some(e);
-                }
-            }
+                ),
+            );
+            ui.label(
+                egui::RichText::new("Not available in this build yet.")
+                    .color(pal.secondary)
+                    .size(text::CAPTION),
+            );
+            ui.add_space(space::SM);
+            // This one *is* wired — the close-to-tray guard reads it.
             if ui
                 .checkbox(
                     &mut self.state.config.minimize_to_tray_on_close,
@@ -826,33 +835,30 @@ impl QwertyApp {
 
         card(ui, pal, |ui| {
             section(ui, pal, "Privacy");
-            if ui
-                .checkbox(
+            ui.label(
+                egui::RichText::new("Everything runs and stays on this machine. No network calls.")
+                    .color(pal.text),
+            );
+            ui.add_space(space::SM);
+            // Debug capture is not consumed anywhere in this build — no audio
+            // window is ever written to disk — so the control is shown disabled
+            // rather than a toggle whose warning claims a write that never
+            // happens. The privacy panel above all must not overstate what the
+            // app does (DESIGN.md honest framing). When the capture-to-disk path
+            // is built, this becomes a live toggle with the persistent
+            // "capture is ON" indicator DESIGN.md calls for.
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(
                     &mut self.state.config.debug_capture_enabled,
-                    "Enable debug audio capture (off by default)",
-                )
-                .changed()
-            {
-                if let Err(e) = self.state.save_config() {
-                    self.save_error = Some(e);
-                }
-            }
-            if self.state.config.debug_capture_enabled {
-                ui.label(
-                    egui::RichText::new(
-                        "⚠ Debug capture is ON — raw audio windows will be written to disk.",
-                    )
-                    .color(pal.warning),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new(
-                        "Everything runs and stays on this machine. No network calls.",
-                    )
+                    "Save raw audio windows to disk (debug)",
+                ),
+            );
+            ui.label(
+                egui::RichText::new("Not available in this build yet.")
                     .color(pal.secondary)
                     .size(text::CAPTION),
-                );
-            }
+            );
         });
     }
 }
