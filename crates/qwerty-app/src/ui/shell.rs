@@ -721,7 +721,7 @@ impl QwertyApp {
         let mut changed = false;
         ui.columns(2, |cols| {
             cols[0].label(egui::RichText::new(&profile.name).color(pal.text).strong());
-            cols[0].add_space(6.0);
+            cols[0].add_space(space::SM);
             for z in &profile.zones {
                 let sel = Some(z.id) == *selected_zone;
                 let text =
@@ -739,7 +739,7 @@ impl QwertyApp {
                             .color(pal.text)
                             .strong(),
                     );
-                    right.add_space(6.0);
+                    right.add_space(space::SM);
                     let zid = zone.id;
                     egui::ScrollArea::vertical().show(right, |ui| {
                         changed =
@@ -784,14 +784,14 @@ impl QwertyApp {
                 }
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(space::SM);
         ui.label(
             egui::RichText::new("System follows Windows; the rest are fixed themes.")
                 .color(pal.secondary)
                 .small(),
         );
 
-        ui.add_space(20.0);
+        ui.add_space(space::XL);
         section(ui, pal, "Startup");
         if ui
             .checkbox(
@@ -816,7 +816,7 @@ impl QwertyApp {
             }
         }
 
-        ui.add_space(20.0);
+        ui.add_space(space::XL);
         section(ui, pal, "Privacy");
         if ui
             .checkbox(

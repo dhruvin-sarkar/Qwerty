@@ -31,7 +31,8 @@ use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::{mix, section, Palette};
+use crate::ui::shell::{mix, primary_button, section, Palette};
+use crate::ui::style::{space, text};
 
 /// Configurable held-out tap counts (`DESIGN.md`: "N taps per zone (default 15,
 /// configurable)"). 15 is [`DEFAULT_EVAL_TAPS_PER_ZONE`].
@@ -292,8 +293,8 @@ impl EvaluationScreen {
     /// Render the screen. `state` is read-only here: the run holds its own clone
     /// of the classifier, and saving/listing reports are `&self` on `AppState`.
     pub fn ui(&mut self, ui: &mut egui::Ui, pal: &Palette, state: &AppState) {
-        ui.heading(egui::RichText::new("Evaluation").color(pal.text).size(26.0));
-        ui.add_space(4.0);
+        ui.heading(egui::RichText::new("Evaluation").color(pal.text).size(text::TITLE));
+        ui.add_space(space::XS);
 
         let Some(profile) = state.active_profile.as_ref() else {
             ui.label(
@@ -346,7 +347,7 @@ impl EvaluationScreen {
             ))
             .color(pal.secondary),
         );
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Taps per zone:").color(pal.text));
@@ -359,16 +360,16 @@ impl EvaluationScreen {
                 }
             }
         });
-        ui.add_space(14.0);
+        ui.add_space(space::LG);
 
-        if ui.button("Run evaluation").clicked() {
+        if primary_button(ui, pal, "Run evaluation").clicked() {
             // Request only — the shell starts the run at end of frame, after it
             // has closed the Home microphone (see `pending_start`).
             self.pending_start = Some(self.taps_per_zone.max(1));
             ui.ctx().request_repaint();
         }
 
-        ui.add_space(20.0);
+        ui.add_space(space::XL);
         self.history_ui(ui, pal);
     }
 
@@ -388,7 +389,7 @@ impl EvaluationScreen {
         }
 
         draw_trend(ui, pal, &self.history);
-        ui.add_space(8.0);
+        ui.add_space(space::SM);
         egui::ScrollArea::vertical()
             .max_height(180.0)
             .show(ui, |ui| {
@@ -425,7 +426,7 @@ impl EvaluationScreen {
 
             if let Some(err) = &run.capture_error {
                 ui.label(egui::RichText::new(format!("⚠ Microphone: {err}")).color(pal.danger));
-                ui.add_space(8.0);
+                ui.add_space(space::SM);
             }
 
             let zone = run.current_zone;
@@ -444,7 +445,7 @@ impl EvaluationScreen {
                 ))
                 .color(pal.text),
             );
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
 
             // Progress pips (color + shape, never color alone — DESIGN.md a11y).
             ui.horizontal_wrapped(|ui| {
@@ -456,10 +457,10 @@ impl EvaluationScreen {
                     };
                     ui.label(egui::RichText::new(glyph).color(color).size(18.0));
                 }
-                ui.add_space(8.0);
+                ui.add_space(space::SM);
                 ui.label(egui::RichText::new(format!("{count}/{target}")).color(pal.secondary));
             });
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
 
             // Last-tap feedback: names the predicted zone so a miss is visible.
             match &run.last {
@@ -487,7 +488,7 @@ impl EvaluationScreen {
                     );
                 }
             }
-            ui.add_space(12.0);
+            ui.add_space(space::MD);
 
             ui.horizontal(|ui| {
                 let arm_label = if run.armed { "Stop" } else { "Arm zone" };
@@ -501,7 +502,7 @@ impl EvaluationScreen {
                     run.undo_last();
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
 
             ui.horizontal(|ui| {
                 if !is_last
@@ -565,13 +566,13 @@ impl EvaluationScreen {
             ui.label(
                 egui::RichText::new(format!("{:.1}%", report.overall_accuracy * 100.0))
                     .color(color)
-                    .size(34.0)
+                    .size(text::DISPLAY)
                     .strong(),
             );
-            ui.add_space(10.0);
+            ui.add_space(space::MD);
             ui.label(egui::RichText::new(format!("{glyph} overall — {verdict}")).color(color));
         });
-        ui.add_space(6.0);
+        ui.add_space(space::SM);
 
         // A failed save must not cost the user the whole run: the computed
         // report is still in memory, so offer a retry rather than forcing a
@@ -607,7 +608,7 @@ impl EvaluationScreen {
                 ui.label(egui::RichText::new("Saving…").color(pal.secondary).small());
             }
         }
-        ui.add_space(14.0);
+        ui.add_space(space::LG);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Per-zone accuracy (accounts for rejections — DATA_MODEL.md), looked
@@ -621,7 +622,7 @@ impl EvaluationScreen {
                     .unwrap_or(0.0);
                 bar_row(ui, pal, label, acc);
             }
-            ui.add_space(14.0);
+            ui.add_space(space::LG);
 
             section(ui, pal, "Confusion matrix");
             ui.label(
@@ -632,9 +633,9 @@ impl EvaluationScreen {
                 .color(pal.secondary)
                 .small(),
             );
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             draw_confusion_matrix(ui, pal, &report.confusion_matrix, &res.zone_labels);
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             ui.label(
                 egui::RichText::new(format!(
                     "Rejected taps (heard, but recognized as no zone): {}",
@@ -646,7 +647,7 @@ impl EvaluationScreen {
                     pal.secondary
                 }),
             );
-            ui.add_space(14.0);
+            ui.add_space(space::LG);
 
             section(ui, pal, "Latency");
             let l = &report.latency_ms;
@@ -663,15 +664,15 @@ impl EvaluationScreen {
                     .color(pal.secondary)
                     .small(),
             );
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
             draw_latency_histogram(ui, pal, &res.latencies_ms);
-            ui.add_space(14.0);
+            ui.add_space(space::LG);
 
             section(ui, pal, "Confidence distribution");
             draw_confidence_histogram(ui, pal, report);
         });
 
-        ui.add_space(14.0);
+        ui.add_space(space::LG);
         let run_again = ui.button("Run another evaluation").clicked();
 
         // Apply the transitions after every read of `res` is done.
@@ -780,7 +781,7 @@ fn draw_confusion_matrix(ui: &mut egui::Ui, pal: &Palette, matrix: &[Vec<u32>], 
     }
 
     // Numbered legend mapping the header numbers to zone labels.
-    ui.add_space(4.0);
+    ui.add_space(space::XS);
     for (i, label) in labels.iter().enumerate() {
         ui.label(
             egui::RichText::new(format!("{} = {label}", i + 1))

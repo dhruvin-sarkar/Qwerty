@@ -12,6 +12,7 @@ use qwerty_core::profile::{ActionSpec, Modifier, ScreenshotMode, SystemSound, Zo
 
 use crate::platform::{dispatch, PlatformActions};
 use crate::ui::shell::{card, Palette};
+use crate::ui::style::space;
 
 /// Transient editor state: the last Test result, scoped to the zone + row it
 /// was run on so it never bleeds onto a different zone's row.
@@ -243,7 +244,7 @@ impl ActionEditor {
                     changed |= action_fields(ui, pal, spec);
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(space::SM);
         }
 
         if ui.button("+ Add action").clicked() {

@@ -23,6 +23,7 @@ use qwerty_core::profile::{
 
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::shell::Palette;
+use crate::ui::style::{space, text};
 
 /// Supported zone counts (`DESIGN.md`: 2, 4, 6, 8).
 const ZONE_COUNTS: [usize; 4] = [2, 4, 6, 8];
@@ -164,7 +165,7 @@ impl Wizard {
             ui.heading(
                 egui::RichText::new(self.step.title())
                     .color(pal.text)
-                    .size(24.0),
+                    .size(text::TITLE),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Cancel").clicked() {
@@ -175,12 +176,12 @@ impl Wizard {
                 );
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
         if let Some(err) = &self.capture_error {
             ui.label(egui::RichText::new(format!("⚠ Microphone: {err}")).color(pal.danger));
         }
         ui.separator();
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         if self.cancelled {
             return Some(WizardOutcome::Cancelled);
@@ -266,7 +267,7 @@ impl Wizard {
             )
             .color(pal.secondary),
         );
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         let mic = self.device_name.as_deref().unwrap_or("opening microphone…");
         ui.label(
@@ -280,7 +281,7 @@ impl Wizard {
                 .desired_width(320.0)
                 .text("input"),
         );
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         // Live provisional verdict from the running mean.
         let floor = self.current_noise_floor();
@@ -296,7 +297,7 @@ impl Wizard {
             }
         };
         ui.label(egui::RichText::new(label).color(color).strong());
-        ui.add_space(16.0);
+        ui.add_space(space::LG);
 
         // fail blocks; warn allows proceeding.
         let enabled = quality.passes() && self.env_rms_count > 0;
@@ -315,7 +316,7 @@ impl Wizard {
             egui::RichText::new("How many zones, and what should they be called?")
                 .color(pal.secondary),
         );
-        ui.add_space(10.0);
+        ui.add_space(space::MD);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Zones:").color(pal.text));
             for n in ZONE_COUNTS {
@@ -328,11 +329,11 @@ impl Wizard {
                 }
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         let layouts = auto_layouts(self.zone_count);
         draw_desk_diagram(ui, pal, &layouts, &self.labels);
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         // Editable labels.
         egui::Grid::new("zone_labels")
@@ -345,7 +346,7 @@ impl Wizard {
                     ui.end_row();
                 }
             });
-        ui.add_space(16.0);
+        ui.add_space(space::LG);
 
         if ui.button("Next: capture taps").clicked() {
             let zone_ids: Vec<ZoneId> = (0..self.zone_count).map(|_| ZoneId::new()).collect();
@@ -378,7 +379,7 @@ impl Wizard {
             ))
             .color(pal.text),
         );
-        ui.add_space(10.0);
+        ui.add_space(space::MD);
 
         // Progress pips (color + shape, never color alone).
         ui.horizontal(|ui| {
@@ -390,10 +391,10 @@ impl Wizard {
                 };
                 ui.label(egui::RichText::new(glyph).color(color).size(20.0));
             }
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
             ui.label(egui::RichText::new(format!("{count}/{target}")).color(pal.secondary));
         });
-        ui.add_space(8.0);
+        ui.add_space(space::SM);
 
         // Last-tap feedback: specific reason, never generic.
         if let Some(fb) = self.last_feedback {
@@ -410,7 +411,7 @@ impl Wizard {
                     .small(),
             );
         }
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         let complete = session.current_zone_complete();
         let is_last = zone + 1 >= total_zones;
@@ -438,7 +439,7 @@ impl Wizard {
                 }
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
 
         if !is_last {
             if ui
@@ -477,7 +478,7 @@ impl Wizard {
                     )
                     .color(pal.secondary),
                 );
-                ui.add_space(10.0);
+                ui.add_space(space::MD);
                 let mut redo: Option<usize> = None;
                 for (i, acc) in report.per_zone_accuracy.iter().enumerate() {
                     let flagged = report.inconsistent_zones.contains(&i);
@@ -497,7 +498,7 @@ impl Wizard {
                         }
                     });
                 }
-                ui.add_space(16.0);
+                ui.add_space(space::LG);
                 if report.all_consistent() {
                     ui.label(egui::RichText::new("All zones look consistent.").color(pal.success));
                 } else {
@@ -508,7 +509,7 @@ impl Wizard {
                         .color(pal.warning),
                     );
                 }
-                ui.add_space(12.0);
+                ui.add_space(space::MD);
                 let cont = ui.button("Continue").clicked();
 
                 if let Some(i) = redo {
@@ -545,7 +546,7 @@ impl Wizard {
             )
             .color(pal.secondary),
         );
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
         ui.horizontal(|ui| {
             let arm_label = if self.neg_armed {
                 "Stop"
@@ -557,7 +558,7 @@ impl Wizard {
             }
             ui.label(egui::RichText::new(format!("{} captured", self.neg_count)).color(pal.text));
         });
-        ui.add_space(16.0);
+        ui.add_space(space::LG);
         if ui.button("Next: save").clicked() {
             self.neg_armed = false;
             self.step = Step::Save;
@@ -567,12 +568,12 @@ impl Wizard {
 
     fn save_step(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<WizardOutcome> {
         ui.label(egui::RichText::new("Name this profile and save it.").color(pal.secondary));
-        ui.add_space(10.0);
+        ui.add_space(space::MD);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Name:").color(pal.text));
             ui.text_edit_singleline(&mut self.profile_name);
         });
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
         ui.label(
             egui::RichText::new(
                 "Actions aren't assigned yet — after saving, open Zones & profiles to \
@@ -581,11 +582,11 @@ impl Wizard {
             .color(pal.secondary)
             .small(),
         );
-        ui.add_space(16.0);
+        ui.add_space(space::LG);
 
         if let Some(err) = &self.save_error {
             ui.label(egui::RichText::new(format!("⚠ {err}")).color(pal.danger));
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
         }
 
         let can_save = !self.profile_name.trim().is_empty() && self.session.is_some();

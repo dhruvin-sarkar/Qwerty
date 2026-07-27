@@ -51,9 +51,7 @@ pub mod radius {
 /// Type-size scale in logical points. One family (the platform default, per
 /// `DESIGN.md`), differentiated by size + weight only — never all-caps.
 pub mod text {
-    /// The single hero metric (the Evaluation headline accuracy number). Part of
-    /// the complete type scale; consumed as the Evaluation screen adopts it.
-    #[allow(dead_code)]
+    /// The single hero metric (the Evaluation headline accuracy number).
     pub const DISPLAY: f32 = 34.0;
     /// Screen headings ("Home", "Settings", …).
     pub const TITLE: f32 = 26.0;

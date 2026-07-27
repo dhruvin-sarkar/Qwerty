@@ -30,6 +30,7 @@ use qwerty_core::profile::{Profile, SensingMode};
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::shell::{mix, section, Palette};
+use crate::ui::style::{space, text};
 
 /// Spectrogram scrollback, in columns. At the worker's ~33 fps frame rate this
 /// is a few seconds of history — enough to see a tap arrive and decay.
@@ -146,16 +147,16 @@ impl DiagnosticsScreen {
         ui.heading(
             egui::RichText::new("Diagnostics")
                 .color(pal.text)
-                .size(26.0),
+                .size(text::TITLE),
         );
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
 
         let profile = state.active_profile.as_ref();
         self.drain(profile);
 
         if let Some(err) = &self.error {
             ui.label(egui::RichText::new(format!("⚠ Microphone: {err}")).color(pal.danger));
-            ui.add_space(8.0);
+            ui.add_space(space::SM);
         } else {
             let mic = self.device_name.as_deref().unwrap_or("opening microphone…");
             ui.label(
@@ -164,12 +165,12 @@ impl DiagnosticsScreen {
                     .small(),
             );
         }
-        ui.add_space(10.0);
+        ui.add_space(space::MD);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             section(ui, pal, "Waveform");
             draw_waveform(ui, pal, &self.waveform);
-            ui.add_space(14.0);
+            ui.add_space(space::LG);
 
             section(ui, pal, "Spectrogram");
             ui.label(
@@ -180,9 +181,9 @@ impl DiagnosticsScreen {
                 .color(pal.secondary)
                 .small(),
             );
-            ui.add_space(4.0);
+            ui.add_space(space::XS);
             draw_spectrogram(ui, pal, &self.spectrogram);
-            ui.add_space(14.0);
+            ui.add_space(space::LG);
 
             section(ui, pal, "Feature space — last tap");
             match (profile, &self.last_tap) {
@@ -202,7 +203,7 @@ impl DiagnosticsScreen {
                 }
                 (Some(profile), Some(tap)) => draw_feature_space(ui, pal, profile, tap),
             }
-            ui.add_space(16.0);
+            ui.add_space(space::LG);
 
             section(ui, pal, "Sensing mode");
             draw_sensing_mode(ui, pal, profile);
@@ -308,7 +309,7 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
             )
             .color(pal.warning),
         );
-        ui.add_space(8.0);
+        ui.add_space(space::SM);
     }
 
     // A non-finite input yields infinite distances from `feature_space` (its
@@ -383,7 +384,7 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
         });
     }
 
-    ui.add_space(10.0);
+    ui.add_space(space::MD);
     let s = &tap.space;
     let (glyph, color, verdict) = if s.accepted {
         ("✓", pal.success, "accepted")
@@ -430,7 +431,7 @@ fn draw_sensing_mode(ui: &mut egui::Ui, pal: &Palette, profile: Option<&Profile>
         ),
         None => ui.label(egui::RichText::new("No profile is active.").color(pal.secondary)),
     };
-    ui.add_space(8.0);
+    ui.add_space(space::SM);
 
     for (mode, blurb, available) in [
         (
@@ -460,7 +461,7 @@ fn draw_sensing_mode(ui: &mut egui::Ui, pal: &Palette, profile: Option<&Profile>
         );
     }
 
-    ui.add_space(8.0);
+    ui.add_space(space::SM);
     ui.label(
         egui::RichText::new(
             "Active and Hybrid sensing need an inaudible probe-tone subsystem — audio \
