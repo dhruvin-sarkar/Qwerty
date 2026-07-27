@@ -118,6 +118,11 @@ struct QwertyApp {
     /// confirm click). Disarmed on any profile-set change (see `refresh_profiles`)
     /// so it never carries over to a different active profile. Transient UI only.
     confirm_delete: bool,
+    /// The screen shown last frame, used to detect a navigation change and start
+    /// the screen-transition fade (`MOTION.md` → Screen transition).
+    last_screen: Screen,
+    /// When the current screen-transition fade began; `None` once it has settled.
+    screen_fade_start: Option<Instant>,
 }
 
 impl QwertyApp {
@@ -212,6 +217,8 @@ impl QwertyApp {
             io_message: None,
             duplicate_name: String::new(),
             confirm_delete: false,
+            last_screen: Screen::Home,
+            screen_fade_start: None,
         }
     }
 
@@ -467,6 +474,29 @@ impl eframe::App for QwertyApp {
 
         self.nav_rail(ctx, &pal);
 
+        // Screen-transition fade (`MOTION.md` → Screen transition): when the nav
+        // selection changes the incoming content fades in over `motion::STANDARD`
+        // rather than hard-cutting. The panel background and rail stay put; only
+        // the content Ui's opacity ramps. Repaints only while the fade is live.
+        if self.state.screen != self.last_screen {
+            self.last_screen = self.state.screen;
+            self.screen_fade_start = Some(now);
+        }
+        let content_opacity = match self.screen_fade_start {
+            Some(started_at) => {
+                let elapsed = now.saturating_duration_since(started_at);
+                if elapsed >= motion::STANDARD {
+                    self.screen_fade_start = None;
+                    1.0
+                } else {
+                    ctx.request_repaint();
+                    motion::STANDARD_EASE
+                        .eval(elapsed.as_secs_f32() / motion::STANDARD.as_secs_f32())
+                }
+            }
+            None => 1.0,
+        };
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -474,6 +504,9 @@ impl eframe::App for QwertyApp {
                     .inner_margin(style::margin(space::XL)),
             )
             .show(ctx, |ui| {
+                if content_opacity < 1.0 {
+                    ui.multiply_opacity(content_opacity);
+                }
                 self.save_error_banner(ui, &pal);
                 match self.state.screen {
                     Screen::Home => self.home(ui, &pal),
