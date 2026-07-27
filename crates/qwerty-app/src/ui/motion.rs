@@ -16,15 +16,15 @@ use std::time::Duration;
 //
 // MOTION.md requires the *complete* token set to exist as one vocabulary, up
 // front (ROADMAP.md Phase 3: establish the motion foundation before animated
-// screens). Only `STANDARD` (theme cross-fade) is consumed in Phase 3; the
-// others are the tokens the Phase 4/6 animations will use, so they carry
-// `#[allow(dead_code)]` rather than being omitted and re-derived per component.
+// screens). `STANDARD` (theme cross-fade) and `INSTANT`/`QUICK` (navigation
+// hover + selection glide, MOTION.md → Navigation selection) are consumed;
+// `DELIBERATE` remains for the Phase 4 wizard step transition, so it alone
+// still carries `#[allow(dead_code)]` rather than being omitted and re-derived
+// per component.
 
 /// Tiny state flips: hover, toggle, checkbox.
-#[allow(dead_code)]
 pub const INSTANT: Duration = Duration::from_millis(100);
 /// Button press feedback, tab switches, zone highlight pulse.
-#[allow(dead_code)]
 pub const QUICK: Duration = Duration::from_millis(180);
 /// Screen/step transitions, panel expand/collapse, theme cross-fade.
 pub const STANDARD: Duration = Duration::from_millis(250);

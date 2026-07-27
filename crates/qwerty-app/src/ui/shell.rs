@@ -857,30 +857,51 @@ const THEME_CHOICES: [(Theme, &str); 5] = [
 
 /// One navigation row: a full-width, left-aligned pill. The selected row fills
 /// with a faint accent tint *and* shows a leading accent bar — position and
-/// color, so selection never rides on color alone (`DESIGN.md` → Accessibility);
-/// hover previews with a fainter tint of the same accent. Visuals are static —
-/// a moving/settling selection animation would need a `MOTION.md` entry first,
-/// so this stays a purely visual refinement. The row is keyboard-focusable with
-/// a visible accent focus ring and carries a `WidgetInfo` so the screen reader
-/// announces it as a selectable item with its label and selected state.
+/// color, so selection never rides on color alone (`DESIGN.md` → Accessibility).
+/// Selection and hover glide rather than snap (`MOTION.md` → Navigation
+/// selection): the tint, bar, and label color cross-fade over `motion::QUICK`
+/// on selection and `motion::INSTANT` on hover, driven by egui's
+/// `animate_bool_with_time`, which schedules a repaint only while a row is
+/// mid-transition and stops once it settles (redraw discipline). The row is
+/// keyboard-focusable with a visible accent focus ring and carries a
+/// `WidgetInfo` so the screen reader announces it as a selectable item with its
+/// label and selected state.
 fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected: bool) -> bool {
     let height = 36.0;
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
 
-    let fill = if selected {
-        mix(pal.surface, pal.accent, 0.16)
-    } else if resp.hovered() {
-        mix(pal.surface, pal.accent, 0.07)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
+    // Eased 0→1 progress for selection and (unselected-only) hover. Distinct ids
+    // per row so each animates independently; the built-in stops repainting once
+    // a value settles, so an idle rail costs no frames (`PERFORMANCE.md`).
+    let sel_t = ui.ctx().animate_bool_with_time(
+        egui::Id::new(("nav_sel", label)),
+        selected,
+        motion::QUICK.as_secs_f32(),
+    );
+    let hover_t = ui.ctx().animate_bool_with_time(
+        egui::Id::new(("nav_hover", label)),
+        resp.hovered() && !selected,
+        motion::INSTANT.as_secs_f32(),
+    );
+
     let painter = ui.painter();
-    if fill != egui::Color32::TRANSPARENT {
-        painter.rect_filled(rect, style::rounding(radius::SM), fill);
+    // Selected tint dominates; hover previews a fainter tint of the same accent.
+    let tint = 0.16 * sel_t + 0.07 * hover_t;
+    if tint > 0.001 {
+        painter.rect_filled(
+            rect,
+            style::rounding(radius::SM),
+            mix(pal.surface, pal.accent, tint),
+        );
     }
-    if selected {
-        let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, height));
+    // Leading accent bar grows from the vertical center as the row is selected.
+    if sel_t > 0.001 {
+        let bar_h = height * sel_t;
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x, rect.center().y - bar_h * 0.5),
+            egui::vec2(3.0, bar_h),
+        );
         painter.rect_filled(bar, style::rounding(radius::SM), pal.accent);
     }
     if resp.has_focus() {
@@ -891,13 +912,13 @@ fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected
             egui::StrokeKind::Inside,
         );
     }
-    let ink = if selected { pal.accent } else { pal.text };
+    // Label color cross-fades text → accent as the row becomes selected.
     painter.text(
         egui::pos2(rect.min.x + space::MD, rect.center().y),
         egui::Align2::LEFT_CENTER,
         format!("{glyph}   {label}"),
         egui::FontId::proportional(text::BODY),
-        ink,
+        mix(pal.text, pal.accent, sel_t),
     );
     resp.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
