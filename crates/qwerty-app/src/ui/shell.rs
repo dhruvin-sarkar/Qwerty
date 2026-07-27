@@ -769,80 +769,91 @@ impl QwertyApp {
         ui.heading(egui::RichText::new("Settings").color(pal.text).size(text::TITLE));
         ui.add_space(space::LG);
 
-        section(ui, pal, "Theme");
-        ui.horizontal_wrapped(|ui| {
-            for (theme, name) in THEME_CHOICES {
-                let selected = self.state.config.theme == theme;
-                let text =
-                    egui::RichText::new(name).color(if selected { pal.accent } else { pal.text });
-                if ui.selectable_label(selected, text).clicked()
-                    && self.state.begin_theme_switch(theme, now)
-                {
-                    if let Err(e) = self.state.save_config() {
-                        self.save_error = Some(e);
+        // Each group is a card, so Settings reads as distinct panels at a glance
+        // (DESIGN.md: settings understandable at a glance) rather than a flat run
+        // of labels and checkboxes.
+        card(ui, pal, |ui| {
+            section(ui, pal, "Theme");
+            ui.horizontal_wrapped(|ui| {
+                for (theme, name) in THEME_CHOICES {
+                    let selected = self.state.config.theme == theme;
+                    let text = egui::RichText::new(name)
+                        .color(if selected { pal.accent } else { pal.text });
+                    if ui.selectable_label(selected, text).clicked()
+                        && self.state.begin_theme_switch(theme, now)
+                    {
+                        if let Err(e) = self.state.save_config() {
+                            self.save_error = Some(e);
+                        }
                     }
+                }
+            });
+            ui.add_space(space::SM);
+            ui.label(
+                egui::RichText::new("System follows Windows; the rest are fixed themes.")
+                    .color(pal.secondary)
+                    .size(text::CAPTION),
+            );
+        });
+        ui.add_space(space::MD);
+
+        card(ui, pal, |ui| {
+            section(ui, pal, "Startup");
+            if ui
+                .checkbox(
+                    &mut self.state.config.start_with_windows,
+                    "Start Qwerty when I sign in",
+                )
+                .changed()
+            {
+                if let Err(e) = self.state.save_config() {
+                    self.save_error = Some(e);
+                }
+            }
+            if ui
+                .checkbox(
+                    &mut self.state.config.minimize_to_tray_on_close,
+                    "Minimize to the tray when the window is closed",
+                )
+                .changed()
+            {
+                if let Err(e) = self.state.save_config() {
+                    self.save_error = Some(e);
                 }
             }
         });
-        ui.add_space(space::SM);
-        ui.label(
-            egui::RichText::new("System follows Windows; the rest are fixed themes.")
-                .color(pal.secondary)
-                .small(),
-        );
+        ui.add_space(space::MD);
 
-        ui.add_space(space::XL);
-        section(ui, pal, "Startup");
-        if ui
-            .checkbox(
-                &mut self.state.config.start_with_windows,
-                "Start Qwerty when I sign in",
-            )
-            .changed()
-        {
-            if let Err(e) = self.state.save_config() {
-                self.save_error = Some(e);
-            }
-        }
-        if ui
-            .checkbox(
-                &mut self.state.config.minimize_to_tray_on_close,
-                "Minimize to the tray when the window is closed",
-            )
-            .changed()
-        {
-            if let Err(e) = self.state.save_config() {
-                self.save_error = Some(e);
-            }
-        }
-
-        ui.add_space(space::XL);
-        section(ui, pal, "Privacy");
-        if ui
-            .checkbox(
-                &mut self.state.config.debug_capture_enabled,
-                "Enable debug audio capture (off by default)",
-            )
-            .changed()
-        {
-            if let Err(e) = self.state.save_config() {
-                self.save_error = Some(e);
-            }
-        }
-        if self.state.config.debug_capture_enabled {
-            ui.label(
-                egui::RichText::new(
-                    "⚠ Debug capture is ON — raw audio windows will be written to disk.",
+        card(ui, pal, |ui| {
+            section(ui, pal, "Privacy");
+            if ui
+                .checkbox(
+                    &mut self.state.config.debug_capture_enabled,
+                    "Enable debug audio capture (off by default)",
                 )
-                .color(pal.warning),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new("Everything runs and stays on this machine. No network calls.")
+                .changed()
+            {
+                if let Err(e) = self.state.save_config() {
+                    self.save_error = Some(e);
+                }
+            }
+            if self.state.config.debug_capture_enabled {
+                ui.label(
+                    egui::RichText::new(
+                        "⚠ Debug capture is ON — raw audio windows will be written to disk.",
+                    )
+                    .color(pal.warning),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "Everything runs and stays on this machine. No network calls.",
+                    )
                     .color(pal.secondary)
-                    .small(),
-            );
-        }
+                    .size(text::CAPTION),
+                );
+            }
+        });
     }
 }
 
