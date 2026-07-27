@@ -114,6 +114,18 @@ impl OnsetDetector {
             }
             let rms = hop_rms(&self.buf[start..start + HOP]);
 
+            // A corrupt hop (a NaN/Inf sample from a device glitch/underrun)
+            // must never reach the noise-floor EMA: `alpha*NaN + (1-alpha)*x`
+            // stays NaN forever, which then collapses the onset threshold to
+            // `ABS_FLOOR` (since `NaN.max(x) == x`) and silently floods false
+            // triggers with no recovery short of a restart. Consume the hop and
+            // move on, leaving `noise_floor`/`prev_hop_rms` at their last good
+            // value (`CLAUDE.md`: fail fast, no silent non-recoverable drift).
+            if !rms.is_finite() {
+                self.processed_hops += 1;
+                continue;
+            }
+
             let elevated = rms > (self.noise_floor * ONSET_RATIO).max(ABS_FLOOR);
             let sharp = rms > self.prev_hop_rms * ATTACK_RATIO;
 
@@ -246,6 +258,31 @@ mod tests {
                 "tap at amp {amp} should be accepted",
             );
         }
+    }
+
+    #[test]
+    fn a_nan_sample_does_not_poison_the_noise_floor() {
+        let mut d = OnsetDetector::new();
+        // Warm the adaptive floor above ABS_FLOOR with steady background energy.
+        d.process(&sustained_tone(FEATURE_WINDOW_SAMPLES * 2, 0.05));
+        assert!(d.noise_floor.is_finite() && d.noise_floor > ABS_FLOOR);
+
+        // A single corrupt sample must not turn the floor into NaN (which would
+        // collapse the onset threshold to ABS_FLOOR and flood false triggers).
+        d.process(&[f32::NAN]);
+        d.process(&sustained_tone(FEATURE_WINDOW_SAMPLES, 0.05));
+        assert!(
+            d.noise_floor.is_finite(),
+            "noise floor became non-finite after a NaN sample: {}",
+            d.noise_floor
+        );
+
+        // …and the detector still works: a clean tap is still accepted.
+        let events = d.process(&clip_with(tap(FEATURE_WINDOW_SAMPLES, 0.8)));
+        assert!(
+            events.iter().any(|e| e.is_transient),
+            "detector must still detect a real tap after a NaN sample"
+        );
     }
 
     #[test]
