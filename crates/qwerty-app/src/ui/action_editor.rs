@@ -84,6 +84,32 @@ impl Kind {
         }
     }
 
+    /// What a synchronous `Ok` from [`dispatch`](crate::platform::dispatch)
+    /// actually proves for this kind.
+    ///
+    /// Most actions complete inline, so `Ok` means the effect happened. But a
+    /// toast and spoken text are handed to Windows subsystems that report
+    /// success or failure *asynchronously* — a toast can still be suppressed by
+    /// Focus Assist or disabled notifications, and TTS runs on its own worker —
+    /// so there `Ok` means only "handed off". Painting "✓ ran" in that case is
+    /// the misleading success `CLAUDE.md` bans; the badge says "sent" instead.
+    ///
+    /// Exhaustive on purpose: a new variant must decide which side it is on.
+    fn success_is_confirmed(self) -> bool {
+        match self {
+            Kind::ShowToast | Kind::Speak => false,
+            Kind::OpenApp
+            | Kind::OpenPath
+            | Kind::OpenUrl
+            | Kind::RunCommand
+            | Kind::CopyToClipboard
+            | Kind::PlaySound
+            | Kind::SendKeystroke
+            | Kind::Screenshot
+            | Kind::VisualOnly => true,
+        }
+    }
+
     /// A fresh empty value of this kind (used when the user switches type).
     fn default_spec(self) -> ActionSpec {
         match self {
@@ -193,7 +219,19 @@ impl ActionEditor {
                             }
                             match row_status {
                                 Some(Ok(())) => {
-                                    ui.label(RichText::new("✓ ran").color(pal.success));
+                                    // A synchronous `Ok` confirms most actions ran, but a
+                                    // toast/speech only report success asynchronously — say
+                                    // "sent", not "ran", and carry the caveat in the hover.
+                                    if Kind::of(spec).success_is_confirmed() {
+                                        ui.label(RichText::new("✓ ran").color(pal.success));
+                                    } else {
+                                        ui.label(RichText::new("✓ sent").color(pal.success))
+                                            .on_hover_text(
+                                                "Handed off to Windows. This action reports \
+                                                 success asynchronously, so the check means it \
+                                                 was dispatched — confirm it actually appeared.",
+                                            );
+                                    }
                                 }
                                 Some(Err(e)) => {
                                     ui.label(RichText::new(format!("⚠ {e}")).color(pal.danger));
@@ -353,4 +391,38 @@ fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Kind;
+
+    #[test]
+    fn toast_and_speech_are_not_confirmed() {
+        // Their success is only known asynchronously, so the Test badge must
+        // say "sent", never claim "ran".
+        assert!(!Kind::ShowToast.success_is_confirmed());
+        assert!(!Kind::Speak.success_is_confirmed());
+    }
+
+    #[test]
+    fn inline_actions_are_confirmed() {
+        for k in [
+            Kind::OpenApp,
+            Kind::OpenPath,
+            Kind::OpenUrl,
+            Kind::RunCommand,
+            Kind::CopyToClipboard,
+            Kind::PlaySound,
+            Kind::SendKeystroke,
+            Kind::Screenshot,
+            Kind::VisualOnly,
+        ] {
+            assert!(
+                k.success_is_confirmed(),
+                "{} completes inline; its Test badge should say ran",
+                k.label()
+            );
+        }
+    }
 }
