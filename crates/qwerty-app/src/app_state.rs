@@ -241,6 +241,39 @@ impl AppState {
         self.save_profile(&p)
     }
 
+    /// Persist the active profile on shutdown, but *only if* its in-memory
+    /// state differs from what is already on disk. Returns whether a write
+    /// actually happened.
+    ///
+    /// Free-text action fields commit on focus loss (`action_editor`), so a
+    /// quit — which exits without a final blur — would drop a value that was
+    /// typed but not yet committed, even though it is already live in the
+    /// in-memory profile. Saving here closes that gap.
+    ///
+    /// The equality check is exact because editing a profile never stamps
+    /// `updated_at`: an uncommitted edit differs in content while `updated_at`
+    /// still matches the last save, so the profiles compare unequal and we save
+    /// (stamping a fresh time, correctly, since a real edit occurred); an
+    /// untouched profile round-trips equal to its on-disk copy (guaranteed by
+    /// `qwerty_core`'s `profile_round_trips_with_no_field_loss`) and is skipped,
+    /// so a no-op quit neither rewrites the file nor advances `updated_at`.
+    pub fn save_active_profile_if_changed(&mut self) -> Result<bool, String> {
+        let Some(current) = self.active_profile.clone() else {
+            return Ok(false);
+        };
+        // A profile that loads and equals the in-memory copy has no unsaved
+        // edit. Every other case (differs, file missing, unreadable) means the
+        // good in-memory profile should win, so fall through and save.
+        if let Some(dir) = self.profiles_dir() {
+            let path = dir.join(format!("{}.json", current.id));
+            if Profile::load(&path).is_ok_and(|on_disk| on_disk == current) {
+                return Ok(false);
+            }
+        }
+        self.save_active_profile()?;
+        Ok(true)
+    }
+
     /// Persist a finished evaluation report to
     /// `Evaluations/<profile-id>/<timestamp>.json` and return the path written.
     /// The filename uses a filesystem-safe compact timestamp (`:` is illegal in

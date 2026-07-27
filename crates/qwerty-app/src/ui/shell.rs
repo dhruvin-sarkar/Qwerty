@@ -224,6 +224,22 @@ impl QwertyApp {
 }
 
 impl eframe::App for QwertyApp {
+    /// Persist the active profile once on real shutdown.
+    ///
+    /// A free-text action field commits to disk on focus loss, but quitting —
+    /// tray "Quit" (`ViewportCommand::Close`) or the window close button —
+    /// exits without a final frame in which the focused field blurs, so a
+    /// just-typed value, though already live in the in-memory profile, would
+    /// never be written. eframe calls `on_exit` exactly once on a true exit and
+    /// *not* on the minimize-to-tray `CancelClose`, so it is the one choke point
+    /// that covers every quit route without touching the hot path.
+    /// `save_active_profile_if_changed` no-ops when nothing was edited.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Err(e) = self.state.save_active_profile_if_changed() {
+            eprintln!("warning: could not save profile on exit: {e}");
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
 
