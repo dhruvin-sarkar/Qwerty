@@ -308,6 +308,15 @@ impl Profile {
         self.device_fingerprint != *current_device
     }
 
+    /// How many of this profile's zones have no action bound yet. A freshly
+    /// calibrated profile is saved with zones but no actions (the wizard's save
+    /// step says exactly this), so those zones tap-detect but do nothing until
+    /// the user binds them. Home uses this to nudge toward the action editor
+    /// rather than leaving silently-inert zones unexplained.
+    pub fn unbound_zone_count(&self) -> usize {
+        self.zones.iter().filter(|z| z.actions.is_empty()).count()
+    }
+
     /// Parse from JSON with the schema-version policy applied.
     pub fn from_json(s: &str, file: &str) -> Result<Self, PersistenceError> {
         let profile: Profile = parse_versioned(s, PROFILE_SCHEMA_VERSION, file)?;
@@ -467,6 +476,14 @@ mod tests {
     use crate::features::{
         FeatureVector, CEPSTRAL_COEFF_COUNT, SPECTRAL_BAND_COUNT, TEMPORAL_FEATURE_COUNT,
     };
+
+    #[test]
+    fn unbound_zone_count_counts_zones_without_actions() {
+        let mut p = sample_profile(); // its one zone has actions
+        assert_eq!(p.unbound_zone_count(), 0);
+        p.zones[0].actions.clear();
+        assert_eq!(p.unbound_zone_count(), 1);
+    }
 
     #[test]
     fn incomplete_reason_flags_only_blank_required_fields() {

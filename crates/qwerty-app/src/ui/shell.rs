@@ -731,6 +731,23 @@ impl QwertyApp {
             }
         });
 
+        // Nudge toward binding actions: a freshly calibrated profile has zones
+        // but no actions, so those zones detect taps yet do nothing until bound.
+        if let Some(profile) = &self.state.active_profile {
+            let unbound = profile.unbound_zone_count();
+            if unbound > 0 {
+                ui.add_space(space::LG);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ Unbound zones: {unbound} of {}. Open Zones & profiles to bind an \
+                         action to each.",
+                        profile.zones.len()
+                    ))
+                    .color(pal.warning),
+                );
+            }
+        }
+
         ui.add_space(space::LG);
         // Honest-accuracy framing (DESIGN.md): never imply an unearned number.
         ui.label(
