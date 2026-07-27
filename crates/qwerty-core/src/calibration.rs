@@ -123,6 +123,8 @@ pub enum CalibrationError {
     },
     /// Per-zone metadata (labels/layouts) didn't match the zone count.
     ZoneMetaMismatch { zones: usize, meta: usize },
+    /// The number of per-zone sample groups didn't match the zone count.
+    SampleGroupCountMismatch { zones: usize, groups: usize },
     /// The underlying classifier could not be fit.
     Training(ClassifierError),
 }
@@ -140,6 +142,9 @@ impl std::fmt::Display for CalibrationError {
             ),
             CalibrationError::ZoneMetaMismatch { zones, meta } => {
                 write!(f, "{meta} zone labels/layouts provided for {zones} zones")
+            }
+            CalibrationError::SampleGroupCountMismatch { zones, groups } => {
+                write!(f, "{groups} sample groups provided for {zones} zones")
             }
             CalibrationError::Training(e) => write!(f, "could not train classifier: {e}"),
         }
@@ -337,9 +342,9 @@ fn validate_counts(
     }
     // per_zone_samples must align with zone_ids.
     if per_zone_samples.len() != zone_ids.len() {
-        return Err(CalibrationError::ZoneMetaMismatch {
+        return Err(CalibrationError::SampleGroupCountMismatch {
             zones: zone_ids.len(),
-            meta: per_zone_samples.len(),
+            groups: per_zone_samples.len(),
         });
     }
     for (zi, samples) in per_zone_samples.iter().enumerate() {
@@ -653,6 +658,24 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sample_group_count_mismatch_is_a_distinct_named_error() {
+        // Two zones but only one sample group: the diagnostic must name the
+        // sample-group mismatch, not reuse the zone labels/layouts message.
+        let err = leave_one_out_consistency(&[zone(1), zone(2)], &[cluster(0.0, 4)]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CalibrationError::SampleGroupCountMismatch {
+                    zones: 2,
+                    groups: 1
+                }
+            ),
+            "expected a sample-group mismatch, got {err:?}"
+        );
+        assert!(err.to_string().contains("sample groups"));
     }
 
     #[test]
