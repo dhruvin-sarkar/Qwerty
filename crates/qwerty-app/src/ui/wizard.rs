@@ -403,6 +403,9 @@ impl Wizard {
             if ui.button("Undo last").clicked() {
                 if let Some(s) = &mut self.session {
                     s.undo_last();
+                    // Clear the stale per-tap feedback so it doesn't keep showing
+                    // "accepted" for a tap that was just undone (mirrors Redo).
+                    self.last_feedback = None;
                 }
             }
             if ui.button("Redo zone").clicked() {

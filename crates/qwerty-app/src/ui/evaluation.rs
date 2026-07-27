@@ -311,6 +311,16 @@ impl EvaluationScreen {
         if self.history_for != Some(profile_id) {
             self.history = state.list_evaluation_reports(profile_id);
             self.history_for = Some(profile_id);
+            // Drop a completed report from a different profile, so the screen
+            // never shows one profile's accuracy while another is active (e.g.
+            // after recalibrating into a fresh profile).
+            if self
+                .result
+                .as_ref()
+                .is_some_and(|r| r.report.profile_id != profile_id)
+            {
+                self.result = None;
+            }
         }
         if self.taps_per_zone == 0 {
             self.taps_per_zone = DEFAULT_EVAL_TAPS_PER_ZONE;

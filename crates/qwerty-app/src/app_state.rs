@@ -205,7 +205,10 @@ impl AppState {
             return;
         };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("warning: could not create {}: {e}", parent.display());
+                return;
+            }
         }
         if let Err(e) = self.config.save(path) {
             eprintln!("warning: could not save {}: {e}", path.display());
