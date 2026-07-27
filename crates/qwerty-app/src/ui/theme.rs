@@ -107,12 +107,18 @@ pub fn tokens_for(theme: Theme, system_prefers_dark: bool) -> Tokens {
 // WCAG AAA.
 
 const DAYLIGHT: Tokens = Tokens {
+    // Three distinct near-white layers (base < surface < elevated) instead of a
+    // flat white-on-white — base is left as-is because its accent contrast is
+    // already near the 4.5 floor, so the layering comes from lifting surface
+    // toward white and reserving pure white for elevated (cards/menus).
     bg_base: Color::rgb(0xFA, 0xF8, 0xF5),
-    bg_surface: Color::rgb(0xFF, 0xFF, 0xFF),
+    bg_surface: Color::rgb(0xFC, 0xFB, 0xF9),
     bg_elevated: Color::rgb(0xFF, 0xFF, 0xFF),
     text_primary: Color::rgb(0x1B, 0x1B, 0x1F),
     text_secondary: Color::rgb(0x55, 0x55, 0x5C),
-    border: Color::rgb(0xE2, 0xDE, 0xD8),
+    // A more defined border so panels and controls read crisply (borders carry
+    // no text, so this is free of the contrast constraints the fills have).
+    border: Color::rgb(0xD5, 0xCF, 0xC5),
     accent: Color::rgb(0x2D, 0x6C, 0xDF),
     // Darkened from 0x1E874B (4.29:1 — below AA on bg_base) to 5.07:1, matching
     // this theme's other status colors (danger 5.0, warning 5.1). See the
@@ -128,7 +134,7 @@ const MIDNIGHT: Tokens = Tokens {
     bg_elevated: Color::rgb(0x1C, 0x1C, 0x22),
     text_primary: Color::rgb(0xEC, 0xEC, 0xEF),
     text_secondary: Color::rgb(0xA0, 0xA0, 0xA8),
-    border: Color::rgb(0x26, 0x26, 0x2E),
+    border: Color::rgb(0x32, 0x32, 0x3C),
     accent: Color::rgb(0x4C, 0x8D, 0xFF),
     success: Color::rgb(0x35, 0xC4, 0x6B),
     warning: Color::rgb(0xE0, 0xA9, 0x3B),
@@ -141,7 +147,7 @@ const AURORA: Tokens = Tokens {
     bg_elevated: Color::rgb(0x1D, 0x24, 0x2D),
     text_primary: Color::rgb(0xE8, 0xED, 0xF2),
     text_secondary: Color::rgb(0x9A, 0xA6, 0xB2),
-    border: Color::rgb(0x23, 0x2C, 0x36),
+    border: Color::rgb(0x2E, 0x39, 0x46),
     accent: Color::rgb(0x45, 0xC4, 0xB4),
     success: Color::rgb(0x35, 0xC4, 0x6B),
     warning: Color::rgb(0xE0, 0xA9, 0x3B),
