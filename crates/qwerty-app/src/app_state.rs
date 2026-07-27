@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use qwerty_core::evaluation::EvaluationReport;
-use qwerty_core::profile::{Config, Profile, ProfileId, Theme};
+use qwerty_core::profile::{Config, Profile, ProfileId, Theme, ZoneId};
 
 /// The main-navigation destinations (`DESIGN.md` → Layout: a persistent
 /// left-hand rail, every area one click away). The calibration wizard is
@@ -288,6 +288,29 @@ impl AppState {
         let stamp = report.run_at.format("%Y%m%dT%H%M%S%3fZ").to_string();
         let path = dir.join(format!("{stamp}.json"));
         report.save(&path).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// Export a finished report as CSV beside its JSON at
+    /// `Evaluations/<profile-id>/<timestamp>.csv` (`DESIGN.md` → Evaluation:
+    /// "Exportable JSON/CSV"). Reuses the same filesystem-safe timestamp as
+    /// [`save_evaluation_report`](Self::save_evaluation_report), so the CSV and
+    /// JSON of one run pair up by name. `zone_ids`/`zone_labels` are in
+    /// confusion-matrix order (the Evaluation screen holds both from the run).
+    /// Returns the path written, or an error string — never a silent drop.
+    pub fn export_evaluation_csv(
+        &self,
+        report: &EvaluationReport,
+        zone_ids: &[ZoneId],
+        zone_labels: &[String],
+    ) -> Result<PathBuf, String> {
+        let dir = self
+            .profile_eval_dir(report.profile_id)
+            .ok_or("no %APPDATA% location is available to export the report")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let stamp = report.run_at.format("%Y%m%dT%H%M%S%3fZ").to_string();
+        let path = dir.join(format!("{stamp}.csv"));
+        std::fs::write(&path, report.to_csv(zone_ids, zone_labels)).map_err(|e| e.to_string())?;
         Ok(path)
     }
 

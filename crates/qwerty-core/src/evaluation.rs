@@ -156,6 +156,83 @@ impl EvaluationReport {
         serde_json::to_string_pretty(self).expect("EvaluationReport serializes")
     }
 
+    /// Render the report as a sectioned CSV (`DESIGN.md` → Evaluation:
+    /// "Exportable JSON/CSV"). Three blank-line-separated blocks — summary
+    /// metrics, the confusion matrix with each zone's accuracy, and the
+    /// confidence distribution — so a spreadsheet imports the whole report from
+    /// one file. `zone_ids`/`zone_labels` are supplied in confusion-matrix order
+    /// (the report keeps per-zone accuracy in an unordered map and the matrix by
+    /// index, so the ordered ids/labels — which the caller already holds — are
+    /// what align them). A missing/empty label falls back to `Zone N`, so
+    /// passing empty slices still yields a numerically-labeled matrix.
+    pub fn to_csv(&self, zone_ids: &[ZoneId], zone_labels: &[String]) -> String {
+        // RFC-4180 quoting: wrap in quotes and double any embedded quote when the
+        // field contains a comma, quote, or newline.
+        fn field(s: &str) -> String {
+            if s.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        }
+        let label = |i: usize| -> String {
+            zone_labels
+                .get(i)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("Zone {}", i + 1))
+        };
+
+        let mut out = String::new();
+
+        // Block 1 — summary metrics as metric,value rows.
+        out.push_str("metric,value\n");
+        out.push_str(&format!("run_at,{}\n", field(&self.run_at.to_rfc3339())));
+        out.push_str(&format!("overall_accuracy,{:.4}\n", self.overall_accuracy));
+        out.push_str(&format!("taps_per_zone,{}\n", self.taps_per_zone));
+        out.push_str(&format!("rejected_taps,{}\n", self.rejected_tap_count));
+        out.push_str(&format!("latency_p50_ms,{:.1}\n", self.latency_ms.p50));
+        out.push_str(&format!("latency_p95_ms,{:.1}\n", self.latency_ms.p95));
+        out.push_str(&format!("latency_p99_ms,{:.1}\n", self.latency_ms.p99));
+        out.push_str(&format!("latency_max_ms,{:.1}\n", self.latency_ms.max));
+
+        // Block 2 — confusion matrix (rows = actual, cols = predicted) with the
+        // zone's accuracy as a trailing column.
+        out.push('\n');
+        out.push_str("actual\\predicted");
+        for j in 0..self.confusion_matrix.len() {
+            out.push(',');
+            out.push_str(&field(&label(j)));
+        }
+        out.push_str(",accuracy\n");
+        for (i, row) in self.confusion_matrix.iter().enumerate() {
+            out.push_str(&field(&label(i)));
+            for &count in row {
+                out.push_str(&format!(",{count}"));
+            }
+            let acc = zone_ids
+                .get(i)
+                .and_then(|z| self.per_zone_accuracy.get(z))
+                .copied()
+                .unwrap_or(0.0);
+            out.push_str(&format!(",{acc:.4}\n"));
+        }
+
+        // Block 3 — confidence distribution over the histogram's own range.
+        out.push('\n');
+        out.push_str("confidence_bin,count\n");
+        let h = &self.confidence_distribution;
+        let b = h.bins.len().max(1);
+        let w = (h.max - h.min) / b as f32;
+        for (i, &count) in h.bins.iter().enumerate() {
+            let lo = h.min + i as f32 * w;
+            let hi = h.min + (i + 1) as f32 * w;
+            out.push_str(&format!("{lo:.2}-{hi:.2},{count}\n"));
+        }
+
+        out
+    }
+
     /// Parse from JSON with the shared schema-version policy applied, then check
     /// structural integrity. A file whose version matches but whose contents are
     /// internally inconsistent — a ragged (non-square) confusion matrix, or a
@@ -382,6 +459,55 @@ impl EvaluationAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_exports_to_csv_with_all_sections() {
+        let z0 = ZoneId::new();
+        let z1 = ZoneId::new();
+        let mut acc = EvaluationAccumulator::new(vec![z0, z1], 2);
+        acc.record(z0, Some(z0), 0.9, 40.0); // correct
+        acc.record(z0, Some(z1), 0.5, 55.0); // misclassified
+        acc.record(z1, Some(z1), 0.8, 45.0); // correct
+        acc.record(z1, None, 0.1, 60.0); // rejected
+        let report = acc.finish(ProfileId::new(), Utc::now());
+
+        let csv = report.to_csv(&[z0, z1], &["Left".to_string(), "Right".to_string()]);
+        // Summary block.
+        assert!(csv.contains("overall_accuracy,"), "missing summary metric");
+        assert!(csv.contains("latency_p95_ms,"), "missing latency metric");
+        // Matrix block: header with labels + trailing accuracy column.
+        assert!(
+            csv.contains("actual\\predicted,Left,Right,accuracy"),
+            "missing matrix header, got:\n{csv}"
+        );
+        // Each matrix row is label + one count per zone + accuracy.
+        let left_row = csv
+            .lines()
+            .find(|l| l.starts_with("Left,"))
+            .expect("Left matrix row present");
+        assert_eq!(
+            left_row.split(',').count(),
+            4,
+            "row = label + 2 counts + accuracy"
+        );
+        // Confidence block present.
+        assert!(csv.contains("confidence_bin,count"), "missing confidence block");
+    }
+
+    #[test]
+    fn to_csv_falls_back_to_numbered_labels_and_escapes_commas() {
+        let z0 = ZoneId::new();
+        let mut acc = EvaluationAccumulator::new(vec![z0], 1);
+        acc.record(z0, Some(z0), 0.9, 40.0);
+        let report = acc.finish(ProfileId::new(), Utc::now());
+
+        // No labels supplied → "Zone 1" fallback in the matrix.
+        assert!(report.to_csv(&[z0], &[]).contains("Zone 1"));
+        // A label containing a comma is RFC-4180 quoted.
+        assert!(report
+            .to_csv(&[z0], &["A,B".to_string()])
+            .contains("\"A,B\""));
+    }
     use uuid::Uuid;
 
     fn zone(n: u128) -> ZoneId {

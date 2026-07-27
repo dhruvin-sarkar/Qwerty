@@ -229,6 +229,7 @@ impl EvalRun {
             zone_ids: self.zone_ids.clone(),
             zone_labels: self.zone_labels.clone(),
             saved: None,
+            csv_export: None,
         }
     }
 }
@@ -244,6 +245,8 @@ struct FinishedRun {
     zone_labels: Vec<String>,
     /// `None` until persisted on the first result frame; then the save outcome.
     saved: Option<Result<PathBuf, String>>,
+    /// `None` until the user clicks "Export CSV"; then that export's outcome.
+    csv_export: Option<Result<PathBuf, String>>,
 }
 
 /// The persistent Evaluation-screen state (held by the shell across frames, like
@@ -673,10 +676,52 @@ impl EvaluationScreen {
         });
 
         ui.add_space(space::LG);
-        let run_again = ui.button("Run another evaluation").clicked();
+        let mut run_again = false;
+        // A just-clicked CSV export's outcome, applied to `self.result` after the
+        // `res` borrow ends (same deferred-mutation discipline as retry_save).
+        let mut new_csv: Option<Result<PathBuf, String>> = None;
+        ui.horizontal(|ui| {
+            run_again = ui.button("Run another evaluation").clicked();
+            // Export the report to CSV beside its JSON (DESIGN.md: exportable
+            // JSON/CSV). Disabled once a successful export exists so a second
+            // click can't rewrite the same file; re-enabled if the last attempt
+            // errored, so a failure is retryable.
+            let can_export = !matches!(res.csv_export, Some(Ok(_)));
+            if ui
+                .add_enabled(can_export, egui::Button::new("Export CSV"))
+                .clicked()
+            {
+                new_csv = Some(state.export_evaluation_csv(
+                    &res.report,
+                    &res.zone_ids,
+                    &res.zone_labels,
+                ));
+            }
+        });
+        // Show the just-produced export outcome, else any prior one.
+        match new_csv.as_ref().or(res.csv_export.as_ref()) {
+            Some(Ok(path)) => {
+                ui.label(
+                    egui::RichText::new(format!("Exported CSV: {}", path.display()))
+                        .color(pal.secondary)
+                        .size(text::CAPTION),
+                );
+            }
+            Some(Err(e)) => {
+                ui.label(
+                    egui::RichText::new(format!("⚠ Could not export CSV: {e}")).color(pal.danger),
+                );
+            }
+            None => {}
+        }
 
         // Apply the transitions after every read of `res` is done.
-        if retry_save {
+        if let Some(outcome) = new_csv {
+            if let Some(r) = &mut self.result {
+                r.csv_export = Some(outcome);
+            }
+            ui.ctx().request_repaint();
+        } else if retry_save {
             if let Some(r) = &mut self.result {
                 r.saved = None; // re-attempts the save on the next frame
             }
