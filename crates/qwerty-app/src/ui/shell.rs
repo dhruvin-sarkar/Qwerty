@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use qwerty_core::profile::{Theme, ZoneId};
 
-use crate::app_state::{AppState, ListeningState, Screen};
+use crate::app_state::{AppState, ListeningState, ProfileSummary, Screen};
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::hotkeys::Hotkeys;
 use crate::platform::{platform_for_this_os, PlatformActions};
@@ -94,6 +94,11 @@ struct QwertyApp {
     /// suppression of the live/level repaints while hidden (`PERFORMANCE.md`: a
     /// tray-hidden window must pump no frames).
     window_visible: bool,
+    /// Cached summaries of all saved profiles, backing the Zones profile
+    /// switcher (`DESIGN.md` → "Multiple desk profiles, switchable"). Refreshed
+    /// only when the set changes — at startup, after the wizard saves a profile,
+    /// and after a switch — so the switcher never rescans the disk per frame.
+    profiles: Vec<ProfileSummary>,
 }
 
 impl QwertyApp {
@@ -161,6 +166,7 @@ impl QwertyApp {
             }
         };
 
+        let profiles = state.list_profiles();
         Self {
             state,
             tray,
@@ -177,6 +183,7 @@ impl QwertyApp {
             save_error: None,
             force_quit: false,
             window_visible: true,
+            profiles,
         }
     }
 
@@ -358,6 +365,7 @@ impl eframe::App for QwertyApp {
                         Ok(()) => {
                             self.state.screen = Screen::Home;
                             self.wizard = None;
+                            self.refresh_profiles();
                         }
                         Err(e) => {
                             eprintln!("warning: could not save profile: {e}");
@@ -679,6 +687,60 @@ impl QwertyApp {
         );
     }
 
+    /// Re-read the saved-profile summaries from disk into the cache. Called at
+    /// the few points the set changes (startup, wizard save, switch), never per
+    /// frame.
+    fn refresh_profiles(&mut self) {
+        self.profiles = self.state.list_profiles();
+    }
+
+    /// A profile switcher for the Zones screen (`DESIGN.md`: "profile switcher"
+    /// on Zones & profiles). Only shown when more than one profile exists —
+    /// with a single profile there is nothing to switch between and the header
+    /// already names it. Switching persists the choice, reloads the profile, and
+    /// refreshes the cache; a load/persist failure surfaces in the save-error
+    /// banner rather than silently leaving the wrong profile active.
+    fn profile_switcher(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        if self.profiles.len() < 2 {
+            return;
+        }
+        let active_name = self
+            .state
+            .active_profile
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Select a profile".to_string());
+        let mut target: Option<qwerty_core::profile::ProfileId> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Profile").color(pal.secondary));
+            egui::ComboBox::from_id_salt("profile_switcher")
+                .selected_text(active_name)
+                .show_ui(ui, |ui| {
+                    for p in &self.profiles {
+                        let label = format!(
+                            "{}   ·   {} zone{}",
+                            p.name,
+                            p.zone_count,
+                            if p.zone_count == 1 { "" } else { "s" }
+                        );
+                        if ui.selectable_label(p.is_active, label).clicked() && !p.is_active {
+                            target = Some(p.id);
+                        }
+                    }
+                });
+        });
+        if let Some(id) = target {
+            match self.state.switch_profile(id) {
+                Ok(()) => {
+                    self.selected_zone = None;
+                    self.refresh_profiles();
+                }
+                Err(e) => self.save_error = Some(format!("Could not switch profile: {e}")),
+            }
+        }
+        ui.add_space(space::MD);
+    }
+
     fn zones(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.heading(
             egui::RichText::new("Zones & profiles")
@@ -686,6 +748,7 @@ impl QwertyApp {
                 .size(text::TITLE),
         );
         ui.add_space(space::SM);
+        self.profile_switcher(ui, pal);
 
         // Disjoint field borrows so the editor can hold the profile + platform
         // at once.

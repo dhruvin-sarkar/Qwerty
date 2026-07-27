@@ -94,6 +94,18 @@ pub struct ThemeTransition {
     pub started_at: Instant,
 }
 
+/// A lightweight summary of a saved profile for the switcher (`DESIGN.md` →
+/// "Multiple desk profiles, switchable"). Avoids handing the whole [`Profile`]
+/// to the UI just to render a name in a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummary {
+    pub id: ProfileId,
+    pub name: String,
+    pub zone_count: usize,
+    /// Whether this is the currently active profile.
+    pub is_active: bool,
+}
+
 /// The one owner of UI-thread state.
 pub struct AppState {
     pub config: Config,
@@ -181,6 +193,78 @@ impl AppState {
             Ok(p) => self.active_profile = Some(p),
             Err(e) => eprintln!("warning: could not load active profile: {e}"),
         }
+    }
+
+    /// List every saved profile by scanning `Profiles/`, sorted by name
+    /// (`DESIGN.md` → "Multiple desk profiles, switchable"). A file that fails to
+    /// load is logged and skipped rather than aborting the whole list — exactly
+    /// how [`list_evaluation_reports`](Self::list_evaluation_reports) treats a bad
+    /// report — so one corrupt profile never hides the others. A missing
+    /// directory is the ordinary "no profiles yet" case (empty, silent); any
+    /// other read error is logged, so an I/O fault is not disguised as "none".
+    pub fn list_profiles(&self) -> Vec<ProfileSummary> {
+        let Some(dir) = self.profiles_dir() else {
+            return Vec::new();
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read profiles directory {}: {e}",
+                    dir.display()
+                );
+                return Vec::new();
+            }
+        };
+        let active = self.config.active_profile_id;
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match Profile::load(&path) {
+                Ok(p) => out.push(ProfileSummary {
+                    is_active: Some(p.id) == active,
+                    id: p.id,
+                    name: p.name,
+                    zone_count: p.zones.len(),
+                }),
+                Err(e) => eprintln!(
+                    "warning: skipping unreadable profile {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Make `id` the active profile: persist the choice and load it into memory.
+    /// The profile is loaded *before* the switch is committed, so a missing or
+    /// corrupt target fails fast and leaves the current active profile untouched
+    /// (no dangling `active_profile_id` pointing at an unloadable file). A
+    /// config-write failure rolls the id back. A no-op (`Ok`) when `id` is
+    /// already active.
+    pub fn switch_profile(&mut self, id: ProfileId) -> Result<(), String> {
+        if self.config.active_profile_id == Some(id) {
+            return Ok(());
+        }
+        let dir = self
+            .profiles_dir()
+            .ok_or("no %APPDATA% location is available to switch profiles")?;
+        let path = dir.join(format!("{id}.json"));
+        // Prove it loads before committing the switch.
+        Profile::load(&path).map_err(|e| e.to_string())?;
+        let previous = self.config.active_profile_id;
+        self.config.active_profile_id = Some(id);
+        if let Err(e) = self.save_config() {
+            self.config.active_profile_id = previous; // undo on persist failure
+            return Err(e);
+        }
+        self.reload_active_profile();
+        Ok(())
     }
 
     /// Core constructor from an already-resolved config and (optional) path.
@@ -444,5 +528,55 @@ mod tests {
         assert_eq!(Screen::ALL.len(), 5);
         assert_eq!(Screen::Home.label(), "Home");
         assert_eq!(Screen::Settings.label(), "Settings");
+    }
+
+    /// A throwaway state whose config/profiles live under a unique temp dir, so
+    /// profile-management I/O is exercised without touching the real %APPDATA%.
+    fn temp_state(tag: &str) -> (AppState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("qwerty_test_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Profiles")).unwrap();
+        let config_path = dir.join("config.json");
+        (
+            AppState::with_config(Config::default(), Some(config_path), true),
+            dir,
+        )
+    }
+
+    #[test]
+    fn list_profiles_skips_non_json_and_corrupt_files() {
+        let (s, dir) = temp_state("list_skips");
+        let profiles = dir.join("Profiles");
+        std::fs::write(profiles.join("notes.txt"), "not a profile").unwrap();
+        std::fs::write(profiles.join("broken.json"), "{ not valid profile").unwrap();
+        // Neither loads as a profile, so the list is empty — and never panics on
+        // the junk file.
+        assert!(s.list_profiles().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_profiles_is_empty_without_a_profiles_dir() {
+        // No config path → no %APPDATA% location → empty, never an error.
+        assert!(test_state().list_profiles().is_empty());
+    }
+
+    #[test]
+    fn switch_to_a_missing_profile_fails_and_keeps_the_current_active() {
+        let (mut s, dir) = temp_state("switch_missing");
+        let original = s.config.active_profile_id;
+        assert!(s.switch_profile(ProfileId::new()).is_err());
+        // The failed switch left the active id untouched (no dangling pointer).
+        assert_eq!(s.config.active_profile_id, original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn switching_to_the_already_active_profile_is_a_noop_ok() {
+        let mut s = test_state();
+        let id = ProfileId::new();
+        s.config.active_profile_id = Some(id);
+        // Already active → Ok early, without needing a path or disk access.
+        assert!(s.switch_profile(id).is_ok());
     }
 }
