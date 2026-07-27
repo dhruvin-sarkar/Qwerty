@@ -332,10 +332,10 @@ mod tests {
     fn semantic_colors_are_legible_as_text_on_backgrounds() {
         // accent + status colors are not just fills — they are rendered as
         // text/glyphs: the action editor's "✓ ran" / "⚠ …" badges, the
-        // selected-zone and nav labels (accent), the save-error banner (danger).
-        // Like primary text they must clear WCAG AA (4.5:1) on whatever panel
-        // they can appear over. Collect every shortfall so one run reports the
-        // whole picture instead of stopping at the first.
+        // selected-zone and nav labels (accent), the save-error banner's ⚠ glyph
+        // and border (danger on the elevated fill). Like primary text they must
+        // clear WCAG AA (4.5:1) on whatever panel they can appear over. Collect
+        // every shortfall so one run reports the whole picture, not just the first.
         let mut failures = Vec::new();
         for theme in CONCRETE_THEMES {
             let t = tokens_for(theme, false);

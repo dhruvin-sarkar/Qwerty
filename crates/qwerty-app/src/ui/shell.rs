@@ -85,6 +85,10 @@ struct QwertyApp {
     /// above the active screen. `None` when there is nothing to report.
     /// Transient UI state only — never persisted.
     save_error: Option<String>,
+    /// Set by the tray "Quit" item so the close-to-tray guard lets the close
+    /// proceed to a real exit instead of hiding the window. One-shot: once the
+    /// user has chosen to quit there is no path back, so it is never reset.
+    force_quit: bool,
 }
 
 impl QwertyApp {
@@ -133,6 +137,7 @@ impl QwertyApp {
             evaluation: EvaluationScreen::default(),
             diagnostics: DiagnosticsScreen::default(),
             save_error: None,
+            force_quit: false,
         }
     }
 
@@ -206,6 +211,11 @@ impl QwertyApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     TrayCommand::Quit => {
+                        // Force a real exit. Without this, the close-to-tray
+                        // guard below turns this Close into a hide whenever
+                        // `minimize_to_tray_on_close` is set (its default), so
+                        // "Quit" would only hide the window and never exit.
+                        self.force_quit = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
@@ -215,12 +225,14 @@ impl QwertyApp {
             tray.set_state(self.state.listening);
         }
 
-        // Close-to-tray: intercept the window-close request and hide instead,
-        // when configured and a tray exists to restore from. Otherwise let the
-        // close proceed and the app exits.
+        // Close-to-tray: a user window-close (the X) hides to the tray instead
+        // of exiting, when configured and a tray exists to restore from. The
+        // tray "Quit" item sets `force_quit` to opt out of this so it always
+        // reaches a real exit. Otherwise the close proceeds and the app exits.
         if ctx.input(|i| i.viewport().close_requested())
             && self.state.config.minimize_to_tray_on_close
             && self.tray.is_some()
+            && !self.force_quit
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -231,14 +243,15 @@ impl QwertyApp {
 impl eframe::App for QwertyApp {
     /// Persist the active profile once on real shutdown.
     ///
-    /// A free-text action field commits to disk on focus loss, but quitting —
-    /// tray "Quit" (`ViewportCommand::Close`) or the window close button —
-    /// exits without a final frame in which the focused field blurs, so a
-    /// just-typed value, though already live in the in-memory profile, would
-    /// never be written. eframe calls `on_exit` exactly once on a true exit and
-    /// *not* on the minimize-to-tray `CancelClose`, so it is the one choke point
-    /// that covers every quit route without touching the hot path.
-    /// `save_active_profile_if_changed` no-ops when nothing was edited.
+    /// A free-text action field commits to disk on focus loss, but exiting
+    /// leaves no final frame in which the focused field blurs, so a just-typed
+    /// value — already live in the in-memory profile — would never be written.
+    /// eframe calls `on_exit` exactly once on a genuine exit and *not* on the
+    /// minimize-to-tray `CancelClose`, so it is the one choke point covering
+    /// every real quit route (tray "Quit", which forces the close past the
+    /// close-to-tray guard, and the window button when not minimizing to tray)
+    /// without touching the hot path. `save_active_profile_if_changed` no-ops
+    /// when nothing was edited.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Err(e) = self.state.save_active_profile_if_changed() {
             eprintln!("warning: could not save profile on exit: {e}");
@@ -412,16 +425,23 @@ impl QwertyApp {
         let Some(msg) = self.save_error.clone() else {
             return;
         };
+        // Neutral raised fill with a danger border + glyph — not a danger-tinted
+        // fill. The error reads from color + glyph + border (DESIGN.md: never
+        // color alone), while the heading and message stay in text_primary so
+        // they clear WCAG AA. Danger *text* on a danger-tinted fill did not
+        // (4.05:1 in Daylight); every color used here is a pairing the theme
+        // contrast tests already cover (text on a layer; danger on bg_elevated).
         egui::Frame::default()
-            .fill(mix(pal.base, pal.danger, 0.15))
-            .stroke(egui::Stroke::new(1.0_f32, pal.danger))
+            .fill(pal.elevated)
+            .stroke(egui::Stroke::new(1.5_f32, pal.danger))
             .inner_margin(egui::Margin::same(12))
             .corner_radius(egui::CornerRadius::same(8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠").color(pal.danger).strong());
                     ui.label(
-                        egui::RichText::new("⚠ Couldn’t save")
-                            .color(pal.danger)
+                        egui::RichText::new("Couldn’t save")
+                            .color(pal.text)
                             .strong(),
                     );
                     ui.label(egui::RichText::new(&msg).color(pal.text));
