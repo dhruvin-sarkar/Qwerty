@@ -111,6 +111,10 @@ struct QwertyApp {
     /// The name typed for a "Duplicate profile" action, before it is applied.
     /// Cleared after a successful duplicate. Transient UI only.
     duplicate_name: String,
+    /// Whether the destructive "Delete profile" action is armed (awaiting a
+    /// confirm click). Disarmed on any profile-set change (see `refresh_profiles`)
+    /// so it never carries over to a different active profile. Transient UI only.
+    confirm_delete: bool,
 }
 
 impl QwertyApp {
@@ -200,6 +204,7 @@ impl QwertyApp {
             importable,
             io_message: None,
             duplicate_name: String::new(),
+            confirm_delete: false,
         }
     }
 
@@ -709,6 +714,10 @@ impl QwertyApp {
     fn refresh_profiles(&mut self) {
         self.profiles = self.state.list_profiles();
         self.importable = self.state.list_importable_profiles();
+        // Any change to the profile set (switch/duplicate/import/delete/wizard
+        // save) disarms a pending delete so it can't fall through onto a
+        // different active profile than the one the user armed it for.
+        self.confirm_delete = false;
     }
 
     /// Export/import controls for the Zones screen (`DESIGN.md`: "Import / export
@@ -815,6 +824,51 @@ impl QwertyApp {
                         self.save_error = Some(format!("Could not import profile: {e}"));
                     }
                 }
+            }
+        }
+
+        // Delete (destructive: removes the profile's calibration and evaluation
+        // history). A two-click confirm — obviously destructive, in danger
+        // colour — so a stray click can't wipe a calibration (`DESIGN.md`: make
+        // destructive actions obviously destructive).
+        if self.state.active_profile.is_some() {
+            ui.add_space(space::SM);
+            if self.confirm_delete {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Delete this profile and its evaluation history?")
+                            .color(pal.danger),
+                    );
+                    if ui
+                        .button(egui::RichText::new("Delete").color(pal.danger).strong())
+                        .clicked()
+                    {
+                        let id = self.state.active_profile.as_ref().map(|p| p.id);
+                        self.confirm_delete = false;
+                        if let Some(id) = id {
+                            match self.state.delete_profile(id) {
+                                Ok(()) => {
+                                    self.selected_zone = None;
+                                    self.io_message = Some("Profile deleted.".to_string());
+                                    self.save_error = None;
+                                    self.refresh_profiles();
+                                }
+                                Err(e) => {
+                                    self.save_error =
+                                        Some(format!("Could not delete profile: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_delete = false;
+                    }
+                });
+            } else if ui
+                .button(egui::RichText::new("Delete profile").color(pal.danger))
+                .clicked()
+            {
+                self.confirm_delete = true;
             }
         }
 

@@ -371,6 +371,36 @@ impl AppState {
         Ok(copy.id)
     }
 
+    /// Delete a profile: remove its `Profiles/<id>.json` and its
+    /// `Evaluations/<id>/` history (which would otherwise be orphaned), and if it
+    /// was the active profile, clear the active selection so the app drops to the
+    /// no-profile state rather than pointing at a file that no longer exists.
+    /// Idempotent: deleting an already-absent profile is `Ok` (the end state —
+    /// gone — is the same), so a double-click can't error. The eval-history
+    /// removal is best-effort; its absence is not a failure.
+    pub fn delete_profile(&mut self, id: ProfileId) -> Result<(), String> {
+        let dir = self
+            .profiles_dir()
+            .ok_or("no %APPDATA% location is available to delete profiles")?;
+        let path = dir.join(format!("{id}.json"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            // Already gone → the target state is already achieved; proceed to
+            // clear the active selection if needed rather than reporting failure.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if let Some(eval_dir) = self.profile_eval_dir(id) {
+            let _ = std::fs::remove_dir_all(&eval_dir); // best-effort cleanup
+        }
+        if self.config.active_profile_id == Some(id) {
+            self.config.active_profile_id = None;
+            self.active_profile = None;
+            self.save_config()?;
+        }
+        Ok(())
+    }
+
     /// Core constructor from an already-resolved config and (optional) path.
     /// Tests pass `None` for the path so no real user file is ever touched.
     pub fn with_config(config: Config, config_path: Option<PathBuf>, system_dark: bool) -> Self {
@@ -745,5 +775,42 @@ mod tests {
     fn duplicating_without_an_active_profile_errors() {
         // Nothing to copy → a clear error, never a silent empty profile.
         assert!(test_state().duplicate_active_profile("Game").is_err());
+    }
+
+    #[test]
+    fn deleting_the_active_profile_removes_its_file_and_clears_active() {
+        let (mut s, dir) = temp_state("delete_active");
+        let id = ProfileId::new();
+        let path = dir.join("Profiles").join(format!("{id}.json"));
+        std::fs::write(&path, "{}").unwrap(); // a stand-in file (delete is a file op)
+        s.config.active_profile_id = Some(id);
+
+        assert!(s.delete_profile(id).is_ok());
+        assert!(!path.exists(), "the profile file should be gone");
+        assert_eq!(s.config.active_profile_id, None, "active must be cleared");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_non_active_profile_leaves_the_active_selection() {
+        let (mut s, dir) = temp_state("delete_other");
+        let active = ProfileId::new();
+        let other = ProfileId::new();
+        let other_path = dir.join("Profiles").join(format!("{other}.json"));
+        std::fs::write(&other_path, "{}").unwrap();
+        s.config.active_profile_id = Some(active);
+
+        assert!(s.delete_profile(other).is_ok());
+        assert!(!other_path.exists());
+        assert_eq!(s.config.active_profile_id, Some(active));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_an_absent_profile_is_ok_and_idempotent() {
+        let (mut s, dir) = temp_state("delete_absent");
+        // Never created — deleting it still succeeds (target state already met).
+        assert!(s.delete_profile(ProfileId::new()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
