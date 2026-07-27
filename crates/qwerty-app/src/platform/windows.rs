@@ -13,8 +13,8 @@ use std::path::Path;
 use std::process::Command;
 
 use arboard::{Clipboard, ImageData};
+use qwerty_core::profile::{KeyCombo, Modifier, ScreenshotMode, SystemSound};
 use tts::Tts;
-use winrt_toast::{register, Toast, ToastManager};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Graphics::Gdi::{
@@ -23,15 +23,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, MB_ICONASTERISK, MB_ICONEXCLAMATION, MB_ICONHAND, MB_OK, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNORMAL,
 };
-use qwerty_core::profile::{KeyCombo, Modifier, ScreenshotMode, SystemSound};
+use winrt_toast::{register, Toast, ToastManager};
 
 use super::{ActionError, PlatformActions, ToastSpec};
 
@@ -159,7 +159,10 @@ fn vk_of(name: &str) -> Result<(VIRTUAL_KEY, bool), ActionError> {
             return Ok((VIRTUAL_KEY(c as u16), false));
         }
     }
-    if let Some(num) = n.strip_prefix(['F', 'f']).and_then(|d| d.parse::<u16>().ok()) {
+    if let Some(num) = n
+        .strip_prefix(['F', 'f'])
+        .and_then(|d| d.parse::<u16>().ok())
+    {
         if (1..=12).contains(&num) {
             return Ok((VIRTUAL_KEY(0x70 + num - 1), false)); // VK_F1 = 0x70
         }
@@ -173,7 +176,11 @@ fn vk_of(name: &str) -> Result<(VIRTUAL_KEY, bool), ActionError> {
         "up" => (0x26, true),
         "right" => (0x27, true),
         "down" => (0x28, true),
-        other => return Err(ActionError::Keystroke(format!("unrecognized key \"{other}\""))),
+        other => {
+            return Err(ActionError::Keystroke(format!(
+                "unrecognized key \"{other}\""
+            )))
+        }
     };
     Ok((VIRTUAL_KEY(vk), ext))
 }
@@ -328,9 +335,9 @@ impl PlatformActions for WindowsPlatform {
                     ..Default::default()
                 };
                 let mut buf = vec![0u8; (w as usize) * (h as usize) * 4]; // BGRX
-                // With a buffer supplied, GetDIBits returns the number of scan
-                // lines copied; require the FULL height, not merely nonzero, so
-                // a short copy is a loud error rather than a truncated image.
+                                                                          // With a buffer supplied, GetDIBits returns the number of scan
+                                                                          // lines copied; require the FULL height, not merely nonzero, so
+                                                                          // a short copy is a loud error rather than a truncated image.
                 let lines = GetDIBits(
                     mem,
                     bmp,

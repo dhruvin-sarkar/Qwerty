@@ -509,13 +509,19 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
         v["confusion_matrix"] = serde_json::json!([[1, 0], [0]]);
         let err = EvaluationReport::from_json(&v.to_string(), "eval.json").unwrap_err();
-        assert!(matches!(err, PersistenceError::InvalidData { .. }), "got {err:?}");
+        assert!(
+            matches!(err, PersistenceError::InvalidData { .. }),
+            "got {err:?}"
+        );
 
         // So is a per-zone map that disagrees with the matrix size.
         let mut v2: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
         v2["per_zone_accuracy"] = serde_json::json!({ za.to_string(): 1.0 });
         let err2 = EvaluationReport::from_json(&v2.to_string(), "eval.json").unwrap_err();
-        assert!(matches!(err2, PersistenceError::InvalidData { .. }), "got {err2:?}");
+        assert!(
+            matches!(err2, PersistenceError::InvalidData { .. }),
+            "got {err2:?}"
+        );
     }
 
     #[test]

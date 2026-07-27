@@ -308,7 +308,11 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
     // A non-finite input yields infinite distances from `feature_space` (its
     // documented defensive behaviour). Bail before the bar math, or `d / max_d`
     // would be inf/inf = NaN and paint garbage-width rects.
-    if tap.space.zones.iter().any(|z| !z.centroid_distance.is_finite())
+    if tap
+        .space
+        .zones
+        .iter()
+        .any(|z| !z.centroid_distance.is_finite())
         || !tap.space.nearest_example_distance.is_finite()
     {
         ui.label(
@@ -356,7 +360,11 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
             painter.rect_filled(
                 egui::Rect::from_min_size(r.min, egui::vec2(w, r.height())),
                 egui::CornerRadius::same(3),
-                if is_winner { pal.success } else { pal.secondary },
+                if is_winner {
+                    pal.success
+                } else {
+                    pal.secondary
+                },
             );
             let marker = if is_winner { "●" } else { "○" };
             ui.label(
@@ -408,12 +416,13 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
 fn draw_sensing_mode(ui: &mut egui::Ui, pal: &Palette, profile: Option<&Profile>) {
     match profile.map(|p| p.sensing_mode) {
         Some(mode) => ui.label(
-            egui::RichText::new(format!("This profile was calibrated with {} sensing.", mode_name(mode)))
-                .color(pal.text),
+            egui::RichText::new(format!(
+                "This profile was calibrated with {} sensing.",
+                mode_name(mode)
+            ))
+            .color(pal.text),
         ),
-        None => ui.label(
-            egui::RichText::new("No profile is active.").color(pal.secondary),
-        ),
+        None => ui.label(egui::RichText::new("No profile is active.").color(pal.secondary)),
     };
     ui.add_space(8.0);
 

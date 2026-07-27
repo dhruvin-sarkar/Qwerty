@@ -301,7 +301,10 @@ pub enum PersistenceError {
     /// The file parsed and its version matched, but its contents fail an
     /// internal integrity check (e.g. classifier dimensions inconsistent with
     /// this build). Loaded loudly-refused, never silently accepted.
-    InvalidData { file: String, reason: String },
+    InvalidData {
+        file: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for PersistenceError {
@@ -476,8 +479,7 @@ mod tests {
 
     #[test]
     fn schema_version_mismatch_is_a_named_error() {
-        let mut v: serde_json::Value =
-            serde_json::from_str(&Config::default().to_json()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&Config::default().to_json()).unwrap();
         v["schema_version"] = serde_json::json!(999);
         let err = Config::from_json(&v.to_string(), "config.json").unwrap_err();
         match err {

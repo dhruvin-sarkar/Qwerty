@@ -277,7 +277,9 @@ fn envelope(samples: &[f32], points: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(points);
     for i in 0..points {
         let lo = i * samples.len() / points;
-        let hi = ((i + 1) * samples.len() / points).max(lo + 1).min(samples.len());
+        let hi = ((i + 1) * samples.len() / points)
+            .max(lo + 1)
+            .min(samples.len());
         let mut m = 0.0f32;
         for &s in &samples[lo..hi] {
             m = m.max(s.abs());

@@ -240,7 +240,10 @@ mod tests {
         for theme in CONCRETE_THEMES {
             let t = tokens_for(theme, false);
             let c = contrast_ratio(t.text_primary, t.bg_base);
-            assert!(c >= 4.5, "{theme:?} primary text contrast {c:.2} < 4.5 (AA)");
+            assert!(
+                c >= 4.5,
+                "{theme:?} primary text contrast {c:.2} < 4.5 (AA)"
+            );
         }
     }
 
@@ -274,7 +277,10 @@ mod tests {
                 ("bg_elevated", t.bg_elevated),
             ] {
                 let c = contrast_ratio(t.text_primary, bg);
-                assert!(c >= 4.5, "{theme:?} primary text on {name} contrast {c:.2} < 4.5 (AA)");
+                assert!(
+                    c >= 4.5,
+                    "{theme:?} primary text on {name} contrast {c:.2} < 4.5 (AA)"
+                );
             }
         }
     }

@@ -56,7 +56,10 @@ impl Step {
             Step::Negatives,
             Step::Save,
         ];
-        (order.iter().position(|s| *s == self).unwrap() + 1, order.len())
+        (
+            order.iter().position(|s| *s == self).unwrap() + 1,
+            order.len(),
+        )
     }
 
     fn title(self) -> &'static str {
@@ -139,12 +142,18 @@ impl Wizard {
         // Header: title + step indicator + cancel.
         let (idx, total) = self.step.position();
         ui.horizontal(|ui| {
-            ui.heading(egui::RichText::new(self.step.title()).color(pal.text).size(24.0));
+            ui.heading(
+                egui::RichText::new(self.step.title())
+                    .color(pal.text)
+                    .size(24.0),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Cancel").clicked() {
                     self.cancelled = true;
                 }
-                ui.label(egui::RichText::new(format!("Step {idx} of {total}")).color(pal.secondary));
+                ui.label(
+                    egui::RichText::new(format!("Step {idx} of {total}")).color(pal.secondary),
+                );
             });
         });
         ui.add_space(4.0);
@@ -168,8 +177,12 @@ impl Wizard {
         };
 
         // Keep the meter/level live while a mic step is on screen.
-        if matches!(self.step, Step::Environment | Step::Capture | Step::Negatives) {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        if matches!(
+            self.step,
+            Step::Environment | Step::Capture | Step::Negatives
+        ) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
         }
         outcome
     }
@@ -178,7 +191,10 @@ impl Wizard {
     fn drain_capture(&mut self) {
         for ev in self.capture.poll() {
             match ev {
-                CaptureEvent::Started { device_name, sample_rate } => {
+                CaptureEvent::Started {
+                    device_name,
+                    sample_rate,
+                } => {
                     self.device_name = Some(device_name);
                     self.sample_rate = Some(sample_rate);
                 }
@@ -189,7 +205,11 @@ impl Wizard {
                         self.env_rms_count += 1;
                     }
                 }
-                CaptureEvent::Onset { window, is_transient, .. } => match self.step {
+                CaptureEvent::Onset {
+                    window,
+                    is_transient,
+                    ..
+                } => match self.step {
                     Step::Capture if self.armed && is_transient => {
                         if let Some(s) = &mut self.session {
                             self.last_feedback = Some(s.record_tap(&window));
@@ -227,9 +247,17 @@ impl Wizard {
         ui.add_space(12.0);
 
         let mic = self.device_name.as_deref().unwrap_or("opening microphone…");
-        ui.label(egui::RichText::new(format!("Mic: {mic}")).color(pal.secondary).small());
+        ui.label(
+            egui::RichText::new(format!("Mic: {mic}"))
+                .color(pal.secondary)
+                .small(),
+        );
         let frac = self.level_peak.clamp(0.0, 1.0).sqrt();
-        ui.add(egui::ProgressBar::new(frac).desired_width(320.0).text("input"));
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .desired_width(320.0)
+                .text("input"),
+        );
         ui.add_space(12.0);
 
         // Live provisional verdict from the running mean.
@@ -237,9 +265,10 @@ impl Wizard {
         let quality = assess_environment(floor);
         let (color, label) = match quality {
             EnvironmentQuality::Quiet => (pal.success, "Quiet — good to go"),
-            EnvironmentQuality::Moderate => {
-                (pal.warning, "A bit noisy — calibration may be less reliable")
-            }
+            EnvironmentQuality::Moderate => (
+                pal.warning,
+                "A bit noisy — calibration may be less reliable",
+            ),
             EnvironmentQuality::TooNoisy => {
                 (pal.danger, "Too loud — quiet the room before continuing")
             }
@@ -249,7 +278,10 @@ impl Wizard {
 
         // fail blocks; warn allows proceeding.
         let enabled = quality.passes() && self.env_rms_count > 0;
-        if ui.add_enabled(enabled, egui::Button::new("Next: lay out zones")).clicked() {
+        if ui
+            .add_enabled(enabled, egui::Button::new("Next: lay out zones"))
+            .clicked()
+        {
             self.noise_floor = floor;
             self.step = Step::Layout;
         }
@@ -265,7 +297,10 @@ impl Wizard {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Zones:").color(pal.text));
             for n in ZONE_COUNTS {
-                if ui.selectable_label(self.zone_count == n, n.to_string()).clicked() {
+                if ui
+                    .selectable_label(self.zone_count == n, n.to_string())
+                    .clicked()
+                {
                     self.zone_count = n;
                     self.labels = resize_labels(std::mem::take(&mut self.labels), n);
                 }
@@ -278,13 +313,16 @@ impl Wizard {
         ui.add_space(12.0);
 
         // Editable labels.
-        egui::Grid::new("zone_labels").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            for (i, label) in self.labels.iter_mut().enumerate() {
-                ui.label(egui::RichText::new(format!("Zone {}", i + 1)).color(pal.secondary));
-                ui.text_edit_singleline(label);
-                ui.end_row();
-            }
-        });
+        egui::Grid::new("zone_labels")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for (i, label) in self.labels.iter_mut().enumerate() {
+                    ui.label(egui::RichText::new(format!("Zone {}", i + 1)).color(pal.secondary));
+                    ui.text_edit_singleline(label);
+                    ui.end_row();
+                }
+            });
         ui.add_space(16.0);
 
         if ui.button("Next: capture taps").clicked() {
@@ -337,10 +375,18 @@ impl Wizard {
 
         // Last-tap feedback: specific reason, never generic.
         if let Some(fb) = self.last_feedback {
-            let color = if fb.is_accepted() { pal.success } else { pal.warning };
+            let color = if fb.is_accepted() {
+                pal.success
+            } else {
+                pal.warning
+            };
             ui.label(egui::RichText::new(fb.reason()).color(color));
         } else {
-            ui.label(egui::RichText::new("Arm the zone, then tap.").color(pal.secondary).small());
+            ui.label(
+                egui::RichText::new("Arm the zone, then tap.")
+                    .color(pal.secondary)
+                    .small(),
+            );
         }
         ui.add_space(12.0);
 
@@ -348,7 +394,10 @@ impl Wizard {
         let is_last = zone + 1 >= total_zones;
         ui.horizontal(|ui| {
             let arm_label = if self.armed { "Stop" } else { "Arm zone" };
-            if ui.add_enabled(!complete, egui::Button::new(arm_label)).clicked() {
+            if ui
+                .add_enabled(!complete, egui::Button::new(arm_label))
+                .clicked()
+            {
                 self.armed = !self.armed;
             }
             if ui.button("Undo last").clicked() {
@@ -367,14 +416,20 @@ impl Wizard {
         ui.add_space(12.0);
 
         if !is_last {
-            if ui.add_enabled(complete, egui::Button::new("Next zone")).clicked() {
+            if ui
+                .add_enabled(complete, egui::Button::new("Next zone"))
+                .clicked()
+            {
                 if let Some(s) = &mut self.session {
                     s.advance_zone();
                     self.armed = false;
                     self.last_feedback = None;
                 }
             }
-        } else if ui.add_enabled(complete, egui::Button::new("Check consistency")).clicked() {
+        } else if ui
+            .add_enabled(complete, egui::Button::new("Check consistency"))
+            .clicked()
+        {
             self.armed = false;
             self.consistency = Some(
                 self.session
@@ -467,7 +522,11 @@ impl Wizard {
         );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            let arm_label = if self.neg_armed { "Stop" } else { "Arm negatives" };
+            let arm_label = if self.neg_armed {
+                "Stop"
+            } else {
+                "Arm negatives"
+            };
             if ui.button(arm_label).clicked() {
                 self.neg_armed = !self.neg_armed;
             }
@@ -505,7 +564,10 @@ impl Wizard {
         }
 
         let can_save = !self.profile_name.trim().is_empty() && self.session.is_some();
-        if ui.add_enabled(can_save, egui::Button::new("Save profile")).clicked() {
+        if ui
+            .add_enabled(can_save, egui::Button::new("Save profile"))
+            .clicked()
+        {
             match self.build() {
                 Ok(profile) => return Some(WizardOutcome::Saved(Box::new(profile))),
                 Err(e) => self.save_error = Some(e),
@@ -615,8 +677,7 @@ fn draw_desk_diagram(ui: &mut egui::Ui, pal: &Palette, layouts: &[ZoneLayout], l
     }
 
     // Laptop marker across the middle.
-    let laptop =
-        egui::Rect::from_center_size(area.center(), egui::vec2(area.width() * 0.34, 26.0));
+    let laptop = egui::Rect::from_center_size(area.center(), egui::vec2(area.width() * 0.34, 26.0));
     painter.rect_filled(laptop, egui::CornerRadius::same(4), pal.accent);
     painter.text(
         laptop.center(),

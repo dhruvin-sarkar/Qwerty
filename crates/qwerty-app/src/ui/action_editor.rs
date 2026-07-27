@@ -87,15 +87,23 @@ impl Kind {
     /// A fresh empty value of this kind (used when the user switches type).
     fn default_spec(self) -> ActionSpec {
         match self {
-            Kind::OpenApp => ActionSpec::OpenApp { path: String::new() },
-            Kind::OpenPath => ActionSpec::OpenPath { path: String::new() },
+            Kind::OpenApp => ActionSpec::OpenApp {
+                path: String::new(),
+            },
+            Kind::OpenPath => ActionSpec::OpenPath {
+                path: String::new(),
+            },
             Kind::OpenUrl => ActionSpec::OpenUrl { url: String::new() },
             Kind::RunCommand => ActionSpec::RunCommand {
                 command: String::new(),
                 args: Vec::new(),
             },
-            Kind::CopyToClipboard => ActionSpec::CopyToClipboard { text: String::new() },
-            Kind::Speak => ActionSpec::Speak { text: String::new() },
+            Kind::CopyToClipboard => ActionSpec::CopyToClipboard {
+                text: String::new(),
+            },
+            Kind::Speak => ActionSpec::Speak {
+                text: String::new(),
+            },
             Kind::PlaySound => ActionSpec::PlaySound {
                 sound: SystemSound::Default,
             },
@@ -305,7 +313,12 @@ fn action_fields(ui: &mut egui::Ui, pal: &Palette, spec: &mut ActionSpec) -> boo
         }
         ActionSpec::SendKeystroke { combo } => {
             ui.horizontal(|ui| {
-                for m in [Modifier::Ctrl, Modifier::Shift, Modifier::Alt, Modifier::Win] {
+                for m in [
+                    Modifier::Ctrl,
+                    Modifier::Shift,
+                    Modifier::Alt,
+                    Modifier::Win,
+                ] {
                     let mut on = combo.modifiers.contains(&m);
                     if ui.checkbox(&mut on, format!("{m:?}")).changed() {
                         if on {

@@ -184,13 +184,28 @@ impl AudioCapture {
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => build_input_stream::<f32>(
-                &device, &config, producer, ch, dropped.clone(), failed.clone(),
+                &device,
+                &config,
+                producer,
+                ch,
+                dropped.clone(),
+                failed.clone(),
             ),
             cpal::SampleFormat::I16 => build_input_stream::<i16>(
-                &device, &config, producer, ch, dropped.clone(), failed.clone(),
+                &device,
+                &config,
+                producer,
+                ch,
+                dropped.clone(),
+                failed.clone(),
             ),
             cpal::SampleFormat::U16 => build_input_stream::<u16>(
-                &device, &config, producer, ch, dropped.clone(), failed.clone(),
+                &device,
+                &config,
+                producer,
+                ch,
+                dropped.clone(),
+                failed.clone(),
             ),
             other => return Err(CaptureError::UnsupportedFormat(other)),
         }

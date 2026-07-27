@@ -156,7 +156,8 @@ impl AppState {
     /// (`DATA_MODEL.md`). Reports are kept per-profile so the Evaluation screen
     /// can show one profile's accuracy trend over time.
     fn profile_eval_dir(&self, profile_id: ProfileId) -> Option<PathBuf> {
-        self.evaluations_dir().map(|d| d.join(profile_id.to_string()))
+        self.evaluations_dir()
+            .map(|d| d.join(profile_id.to_string()))
     }
 
     /// (Re)load the active profile named by `config.active_profile_id` from
@@ -170,7 +171,10 @@ impl AppState {
         };
         let path = dir.join(format!("{id}.json"));
         if !path.exists() {
-            eprintln!("warning: active profile {id} not found at {}", path.display());
+            eprintln!(
+                "warning: active profile {id} not found at {}",
+                path.display()
+            );
             return;
         }
         match Profile::load(&path) {

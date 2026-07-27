@@ -87,7 +87,9 @@ fn print_usage() {
     println!("  qwerty-app --live [zones] [taps] [device] calibrate then classify taps live (default 4 zones, 10 taps)");
     println!("  qwerty-app --themes                       show the 5 theme palettes + WCAG contrast check");
     println!();
-    println!("  [device] = a list index (see --list-devices) or a name substring, e.g. \"Realtek\".");
+    println!(
+        "  [device] = a list index (see --list-devices) or a name substring, e.g. \"Realtek\"."
+    );
 }
 
 fn fail(e: &dyn std::error::Error) -> ! {

@@ -23,7 +23,9 @@ use std::time::Duration;
 use chrono::Utc;
 
 use qwerty_core::classifier::ClassifierParams;
-use qwerty_core::evaluation::{EvaluationAccumulator, EvaluationReport, DEFAULT_EVAL_TAPS_PER_ZONE};
+use qwerty_core::evaluation::{
+    EvaluationAccumulator, EvaluationReport, DEFAULT_EVAL_TAPS_PER_ZONE,
+};
 use qwerty_core::features::{FeatureExtractor, FEATURE_WINDOW_SAMPLES, SAMPLE_RATE_HZ};
 use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 
@@ -108,7 +110,10 @@ impl EvalRun {
 
     /// Accepted taps recorded so far for a given zone index.
     fn count_for(&self, zone_idx: usize) -> u32 {
-        self.records.iter().filter(|r| r.zone_idx == zone_idx).count() as u32
+        self.records
+            .iter()
+            .filter(|r| r.zone_idx == zone_idx)
+            .count() as u32
     }
 
     fn current_count(&self) -> u32 {
@@ -210,7 +215,12 @@ impl EvalRun {
     fn finish(&self) -> FinishedRun {
         let mut acc = EvaluationAccumulator::new(self.zone_ids.clone(), self.taps_per_zone);
         for r in &self.records {
-            acc.record(self.zone_ids[r.zone_idx], r.predicted, r.confidence, r.latency_ms);
+            acc.record(
+                self.zone_ids[r.zone_idx],
+                r.predicted,
+                r.confidence,
+                r.latency_ms,
+            );
         }
         FinishedRun {
             report: acc.finish(self.profile_id, Utc::now()),
@@ -369,26 +379,28 @@ impl EvaluationScreen {
 
         draw_trend(ui, pal, &self.history);
         ui.add_space(8.0);
-        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-            // Most recent first.
-            for r in self.history.iter().rev() {
-                let pass = r.overall_accuracy >= TARGET_ACCURACY;
-                let (glyph, color) = if pass {
-                    ("✓", pal.success)
-                } else {
-                    ("▲", pal.warning)
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{glyph}  {}   ·   {:.1}% overall   ·   {} taps/zone",
-                        r.run_at.format("%Y-%m-%d %H:%M UTC"),
-                        r.overall_accuracy * 100.0,
-                        r.taps_per_zone,
-                    ))
-                    .color(color),
-                );
-            }
-        });
+        egui::ScrollArea::vertical()
+            .max_height(180.0)
+            .show(ui, |ui| {
+                // Most recent first.
+                for r in self.history.iter().rev() {
+                    let pass = r.overall_accuracy >= TARGET_ACCURACY;
+                    let (glyph, color) = if pass {
+                        ("✓", pal.success)
+                    } else {
+                        ("▲", pal.warning)
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{glyph}  {}   ·   {:.1}% overall   ·   {} taps/zone",
+                            r.run_at.format("%Y-%m-%d %H:%M UTC"),
+                            r.overall_accuracy * 100.0,
+                            r.taps_per_zone,
+                        ))
+                        .color(color),
+                    );
+                }
+            });
     }
 
     /// A running guided test: prompt the current zone, show progress + per-tap
@@ -865,7 +877,10 @@ fn draw_trend(ui: &mut egui::Ui, pal: &Palette, history: &[EvaluationReport]) {
         .map(|(i, rep)| egui::pos2(x_of(i), y_of(rep.overall_accuracy)))
         .collect();
     if pts.len() >= 2 {
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0_f32, pal.accent)));
+        painter.add(egui::Shape::line(
+            pts,
+            egui::Stroke::new(2.0_f32, pal.accent),
+        ));
     }
     for (i, rep) in history.iter().enumerate() {
         let color = if rep.overall_accuracy >= TARGET_ACCURACY {
@@ -881,4 +896,3 @@ fn draw_trend(ui: &mut egui::Ui, pal: &Palette, history: &[EvaluationReport]) {
             .small(),
     );
 }
-

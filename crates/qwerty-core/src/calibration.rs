@@ -609,7 +609,10 @@ mod tests {
         let ids = [zone(1), zone(2), zone(3)];
         let samples = [cluster(0.0, 8), cluster(6.0, 8), cluster(12.0, 8)];
         let report = leave_one_out_consistency(&ids, &samples).unwrap();
-        assert!(report.all_consistent(), "tight clusters should be consistent");
+        assert!(
+            report.all_consistent(),
+            "tight clusters should be consistent"
+        );
         assert!(report.per_zone_accuracy.iter().all(|&a| a >= 0.8));
     }
 
@@ -636,7 +639,11 @@ mod tests {
         ));
         assert!(matches!(
             leave_one_out_consistency(&[zone(1), zone(2)], &[cluster(0.0, 1), cluster(5.0, 4)]),
-            Err(CalibrationError::NotEnoughSamples { zone: 0, have: 1, .. })
+            Err(CalibrationError::NotEnoughSamples {
+                zone: 0,
+                have: 1,
+                ..
+            })
         ));
     }
 

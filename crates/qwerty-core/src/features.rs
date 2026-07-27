@@ -46,8 +46,7 @@ pub const SPECTRAL_BAND_COUNT: usize = 16;
 pub const CEPSTRAL_COEFF_COUNT: usize = 12;
 
 /// Total flattened feature dimensionality.
-pub const FEATURE_DIM: usize =
-    TEMPORAL_FEATURE_COUNT + SPECTRAL_BAND_COUNT + CEPSTRAL_COEFF_COUNT;
+pub const FEATURE_DIM: usize = TEMPORAL_FEATURE_COUNT + SPECTRAL_BAND_COUNT + CEPSTRAL_COEFF_COUNT;
 
 /// Lowest frequency (Hz) of the spectral band bank. Below this is mostly
 /// desk rumble / DC drift and is not discriminative.
@@ -324,9 +323,9 @@ mod tests {
     fn output_is_always_finite() {
         let mut ex = FeatureExtractor::new();
         for input in [
-            vec![0.0; FEATURE_WINDOW_SAMPLES],               // silence
-            sine(440.0, FEATURE_WINDOW_SAMPLES),             // tone
-            vec![1.0; FEATURE_WINDOW_SAMPLES],               // DC / clipped
+            vec![0.0; FEATURE_WINDOW_SAMPLES],   // silence
+            sine(440.0, FEATURE_WINDOW_SAMPLES), // tone
+            vec![1.0; FEATURE_WINDOW_SAMPLES],   // DC / clipped
         ] {
             let fv = ex.extract(&input);
             assert!(fv.is_finite(), "non-finite features for an input");
@@ -338,7 +337,10 @@ mod tests {
         let mut ex = FeatureExtractor::new();
         let fv = ex.extract(&sine(3000.0, FEATURE_WINDOW_SAMPLES));
         let sum: f32 = fv.spectral_bands.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-3, "bands should sum to ~1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-3,
+            "bands should sum to ~1, got {sum}"
+        );
     }
 
     #[test]

@@ -151,7 +151,11 @@ impl QwertyApp {
             _ => {}
         }
 
-        let events = self.capture.as_ref().map(LiveCapture::poll).unwrap_or_default();
+        let events = self
+            .capture
+            .as_ref()
+            .map(LiveCapture::poll)
+            .unwrap_or_default();
         for ev in events {
             match ev {
                 CaptureEvent::Started { device_name, .. } => self.live.device = Some(device_name),
@@ -284,11 +288,11 @@ impl eframe::App for QwertyApp {
                 self.state.listening = ListeningState::Paused;
             }
             self.capture = None; // Drop stops the Home worker + closes the device.
-            // Start the Diagnostics capture only when it has neither a live
-            // stream nor an already-recorded failure. Checking `needs_start`
-            // (not just "no live stream") is what stops a failed device from
-            // being respawned every frame in a silent retry loop — the failure
-            // stays visible on screen until the user leaves and returns.
+                                 // Start the Diagnostics capture only when it has neither a live
+                                 // stream nor an already-recorded failure. Checking `needs_start`
+                                 // (not just "no live stream") is what stops a failed device from
+                                 // being respawned every frame in a silent retry loop — the failure
+                                 // stays visible on screen until the user leaves and returns.
             if diagnostics_open && self.diagnostics.needs_start() {
                 self.diagnostics.start(ctx);
             }
@@ -392,8 +396,11 @@ impl QwertyApp {
                 for screen in Screen::ALL {
                     let selected = self.state.screen == screen;
                     let label = format!("{}   {}", screen.glyph(), screen.label());
-                    let text = egui::RichText::new(label)
-                        .color(if selected { pal.accent } else { pal.text });
+                    let text = egui::RichText::new(label).color(if selected {
+                        pal.accent
+                    } else {
+                        pal.text
+                    });
                     if ui.selectable_label(selected, text).clicked() {
                         self.state.screen = screen;
                     }
@@ -470,7 +477,11 @@ impl QwertyApp {
                     ui.separator();
                     ui.add_space(6.0);
                     let mic = self.live.device.as_deref().unwrap_or("opening microphone…");
-                    ui.label(egui::RichText::new(format!("Mic: {mic}")).color(pal.secondary).small());
+                    ui.label(
+                        egui::RichText::new(format!("Mic: {mic}"))
+                            .color(pal.secondary)
+                            .small(),
+                    );
                     ui.add_space(4.0);
                     // Peak level, sqrt-shaped so quiet signals are still visible.
                     let frac = self.live.peak.clamp(0.0, 1.0).sqrt();
@@ -571,7 +582,8 @@ impl QwertyApp {
                     right.add_space(6.0);
                     let zid = zone.id;
                     egui::ScrollArea::vertical().show(right, |ui| {
-                        changed = action_editor.ui(ui, pal, zid, &mut zone.actions, platform.as_ref());
+                        changed =
+                            action_editor.ui(ui, pal, zid, &mut zone.actions, platform.as_ref());
                     });
                 }
                 None => {
@@ -597,8 +609,8 @@ impl QwertyApp {
         ui.horizontal_wrapped(|ui| {
             for (theme, name) in THEME_CHOICES {
                 let selected = self.state.config.theme == theme;
-                let text = egui::RichText::new(name)
-                    .color(if selected { pal.accent } else { pal.text });
+                let text =
+                    egui::RichText::new(name).color(if selected { pal.accent } else { pal.text });
                 if ui.selectable_label(selected, text).clicked()
                     && self.state.begin_theme_switch(theme, now)
                 {
@@ -689,7 +701,12 @@ fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
 /// A titled section label. `pub(crate)` so every screen shares one definition
 /// (the Settings, Evaluation, and Diagnostics screens all use it).
 pub(crate) fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
-    ui.label(egui::RichText::new(title).color(pal.text).strong().size(16.0));
+    ui.label(
+        egui::RichText::new(title)
+            .color(pal.text)
+            .strong()
+            .size(16.0),
+    );
     ui.add_space(6.0);
 }
 
