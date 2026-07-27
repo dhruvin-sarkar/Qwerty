@@ -106,6 +106,12 @@ pub enum CaptureEvent {
 pub struct LiveCapture {
     rx: Receiver<CaptureEvent>,
     stop: Arc<AtomicBool>,
+    /// UI-visibility gate. While `false` (window hidden to the tray) the worker
+    /// keeps capturing and still reports onsets — so a tap still fires its
+    /// action — but suppresses the continuous level/frame repaints that would
+    /// otherwise pump the UI at 20–30 fps for a window nobody can see
+    /// (`PERFORMANCE.md`: no frames while closed to the tray).
+    visible: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -117,13 +123,15 @@ impl LiveCapture {
     pub fn start(device: Option<String>, ctx: egui::Context, detail: CaptureDetail) -> Self {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_worker = stop.clone();
+        let visible = Arc::new(AtomicBool::new(true));
+        let (stop_worker, visible_worker) = (stop.clone(), visible.clone());
         let handle = std::thread::spawn(move || {
-            run_worker(device, tx, ctx, stop_worker, detail);
+            run_worker(device, tx, ctx, stop_worker, visible_worker, detail);
         });
         Self {
             rx,
             stop,
+            visible,
             handle: Some(handle),
         }
     }
@@ -131,6 +139,13 @@ impl LiveCapture {
     /// Drain all pending events (non-blocking).
     pub fn poll(&self) -> Vec<CaptureEvent> {
         self.rx.try_iter().collect()
+    }
+
+    /// Set whether the UI is visible. While hidden the worker still captures and
+    /// reports onsets (so taps keep firing actions), but stops the continuous
+    /// level/frame repaints, so a tray-hidden window pumps no frames.
+    pub fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Relaxed);
     }
 }
 
@@ -150,6 +165,7 @@ fn run_worker(
     tx: mpsc::Sender<CaptureEvent>,
     ctx: egui::Context,
     stop: Arc<AtomicBool>,
+    visible: Arc<AtomicBool>,
     detail: CaptureDetail,
 ) {
     let mut cap = match AudioCapture::open(device.as_deref()) {
@@ -233,13 +249,18 @@ fn run_worker(
         }
 
         if last_level.elapsed() >= LEVEL_INTERVAL {
-            let rms = if count > 0 {
-                (sum_sq / count as f64).sqrt() as f32
-            } else {
-                0.0
-            };
-            let _ = tx.send(CaptureEvent::Level { rms, peak });
-            ctx.request_repaint();
+            // Report the meter only while the UI is visible — a hidden window
+            // has no meter to animate. Reset the accumulators regardless, so
+            // they never grow unbounded and the RMS isn't stale on return.
+            if visible.load(Ordering::Relaxed) {
+                let rms = if count > 0 {
+                    (sum_sq / count as f64).sqrt() as f32
+                } else {
+                    0.0
+                };
+                let _ = tx.send(CaptureEvent::Level { rms, peak });
+                ctx.request_repaint();
+            }
             sum_sq = 0.0;
             count = 0;
             peak = 0.0;
@@ -251,7 +272,12 @@ fn run_worker(
         // the worker rather than repainting on every audio callback
         // (`PERFORMANCE.md`, `MOTION.md`).
         if let Some(ex) = extractor.as_mut() {
-            if last_frame.elapsed() >= FRAME_INTERVAL && recent.len() >= FEATURE_WINDOW_SAMPLES {
+            // Skip the whole frame (including the FFT) while hidden — no live
+            // view is on screen to consume it.
+            if visible.load(Ordering::Relaxed)
+                && last_frame.elapsed() >= FRAME_INTERVAL
+                && recent.len() >= FEATURE_WINDOW_SAMPLES
+            {
                 let waveform = envelope(&recent, WAVEFORM_POINTS);
                 let window = &recent[recent.len() - FEATURE_WINDOW_SAMPLES..];
                 let bands = ex.extract(window).spectral_bands;

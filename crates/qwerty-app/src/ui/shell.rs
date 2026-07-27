@@ -89,6 +89,10 @@ struct QwertyApp {
     /// proceed to a real exit instead of hiding the window. One-shot: once the
     /// user has chosen to quit there is no path back, so it is never reset.
     force_quit: bool,
+    /// Whether the main window is visible (vs hidden to the tray). Drives
+    /// suppression of the live/level repaints while hidden (`PERFORMANCE.md`: a
+    /// tray-hidden window must pump no frames).
+    window_visible: bool,
 }
 
 impl QwertyApp {
@@ -153,6 +157,7 @@ impl QwertyApp {
             diagnostics: DiagnosticsScreen::default(),
             save_error: None,
             force_quit: false,
+            window_visible: true,
         }
     }
 
@@ -164,11 +169,11 @@ impl QwertyApp {
         match self.state.listening {
             ListeningState::Listening if self.capture.is_none() => {
                 self.live = LiveStatus::default();
-                self.capture = Some(LiveCapture::start(
-                    None,
-                    ctx.clone(),
-                    CaptureDetail::Standard,
-                ));
+                let cap = LiveCapture::start(None, ctx.clone(), CaptureDetail::Standard);
+                // Match the new worker to the current window visibility: the
+                // global hotkey can start listening while hidden to the tray.
+                cap.set_visible(self.window_visible);
+                self.capture = Some(cap);
             }
             ListeningState::Paused | ListeningState::Error if self.capture.is_some() => {
                 self.capture = None; // Drop stops the worker + closes the device.
@@ -224,6 +229,10 @@ impl QwertyApp {
                     TrayCommand::OpenWindow => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.window_visible = true;
+                        if let Some(c) = &self.capture {
+                            c.set_visible(true);
+                        }
                     }
                     TrayCommand::Quit => {
                         // Force a real exit. Without this, the close-to-tray
@@ -251,6 +260,10 @@ impl QwertyApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible = false;
+            if let Some(c) = &self.capture {
+                c.set_visible(false);
+            }
         }
     }
 }
@@ -324,13 +337,15 @@ impl eframe::App for QwertyApp {
         // stop (PERFORMANCE.md — the Diagnostics/live views must not keep running
         // in the background). The same rule keeps a second capture stream from
         // fighting Home listening for the device.
-        if self.state.screen != Screen::Evaluation {
+        // A hidden window ends the live screens too, exactly as navigating away
+        // does: no mic and no 30 fps repaint run behind a tray-hidden window
+        // (`PERFORMANCE.md`), and a hidden Evaluation run stops like any
+        // navigate-away. On leaving Diagnostics the mic + repaint stop within one
+        // frame (`ACCEPTANCE.md`).
+        if !self.window_visible || self.state.screen != Screen::Evaluation {
             self.evaluation.stop_run();
         }
-        if self.state.screen != Screen::Diagnostics {
-            // Leaving Diagnostics closes its mic and, with it, the 30 fps
-            // repaint — the "redraw stops within one frame of navigating away"
-            // requirement in `ACCEPTANCE.md`.
+        if !self.window_visible || self.state.screen != Screen::Diagnostics {
             self.diagnostics.stop();
         }
 
