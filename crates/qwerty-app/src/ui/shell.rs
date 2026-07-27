@@ -1293,11 +1293,21 @@ fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
         ListeningState::Paused => (pal.secondary, "❚❚"),
         ListeningState::Error => (pal.danger, "▲"),
     };
-    ui.label(
-        egui::RichText::new(format!("{glyph}  {}", state.label()))
-            .color(color)
-            .strong(),
-    );
+    // A real rounded badge: a faint status-tinted fill and edge, the status
+    // colour on the glyph, the label in primary text (so it stays legible on
+    // any theme — the colour is carried by the glyph, never text alone).
+    egui::Frame::default()
+        .fill(mix(pal.surface, color, 0.14))
+        .stroke(egui::Stroke::new(1.0_f32, mix(pal.surface, color, 0.45)))
+        .corner_radius(style::rounding(radius::MD))
+        .inner_margin(egui::Margin::symmetric(space::MD as i8, space::XS as i8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::SM;
+                ui.label(egui::RichText::new(glyph).color(color).strong());
+                ui.label(egui::RichText::new(state.label()).color(pal.text).strong());
+            });
+        });
 }
 
 /// A titled section label. `pub(crate)` so every screen shares one definition
