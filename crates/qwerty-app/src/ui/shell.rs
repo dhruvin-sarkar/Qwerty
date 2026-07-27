@@ -21,7 +21,8 @@ use crate::ui::action_editor::ActionEditor;
 use crate::ui::diagnostics::DiagnosticsScreen;
 use crate::ui::evaluation::EvaluationScreen;
 use crate::ui::motion;
-use crate::ui::theme::{tokens_for, Color, Tokens};
+use crate::ui::style::{self, radius, space, text};
+use crate::ui::theme::{on_color, tokens_for, Color, Tokens};
 use crate::ui::wizard::{Wizard, WizardOutcome};
 
 /// Live input status while listening, drained from the capture worker.
@@ -103,6 +104,12 @@ impl QwertyApp {
         // egui default palette (`PERFORMANCE.md`: no flash of unstyled content).
         let tokens = tokens_for(state.config.theme, system_dark);
         cc.egui_ctx.set_visuals(visuals_for(&tokens));
+        // Spacing and roundness are theme-independent, so egui's global Spacing
+        // is configured once here from the design tokens. The per-frame
+        // `set_visuals` cross-fade replaces only the *color* half of the style,
+        // leaving this breathing room intact (`style::configure_spacing`).
+        cc.egui_ctx
+            .style_mut(|s| style::configure_spacing(&mut s.spacing));
 
         // Single-reader event pump. `tray-icon` and `global-hotkey` each deliver
         // events on one process-global channel that hands each message to
@@ -340,7 +347,7 @@ impl eframe::App for QwertyApp {
                 .frame(
                     egui::Frame::default()
                         .fill(pal.base)
-                        .inner_margin(egui::Margin::same(28)),
+                        .inner_margin(style::margin(space::XXL)),
                 )
                 .show(ctx, |ui| {
                     outcome = self.wizard.as_mut().and_then(|w| w.ui(ui, &pal));
@@ -422,7 +429,7 @@ impl eframe::App for QwertyApp {
             .frame(
                 egui::Frame::default()
                     .fill(pal.base)
-                    .inner_margin(egui::Margin::same(24)),
+                    .inner_margin(style::margin(space::XL)),
             )
             .show(ctx, |ui| {
                 self.save_error_banner(ui, &pal);
@@ -505,8 +512,8 @@ impl QwertyApp {
         egui::Frame::default()
             .fill(pal.elevated)
             .stroke(egui::Stroke::new(1.5_f32, pal.danger))
-            .inner_margin(egui::Margin::same(12))
-            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(style::margin(space::MD))
+            .corner_radius(style::rounding(radius::MD))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("⚠").color(pal.danger).strong());
@@ -523,7 +530,7 @@ impl QwertyApp {
                     });
                 });
             });
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
     }
 
     fn nav_rail(&mut self, ctx: &egui::Context, pal: &Palette) {
@@ -533,30 +540,30 @@ impl QwertyApp {
             .frame(
                 egui::Frame::default()
                     .fill(pal.surface)
-                    .inner_margin(egui::Margin::same(16)),
+                    .inner_margin(style::margin(space::LG)),
             )
             .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.heading(egui::RichText::new("Qwerty").color(pal.text));
+                // Brand lockup: wordmark + quiet descriptor.
+                ui.add_space(space::XS);
+                ui.label(
+                    egui::RichText::new("Qwerty")
+                        .color(pal.text)
+                        .strong()
+                        .size(text::HEADING),
+                );
                 ui.label(
                     egui::RichText::new("acoustic tap zones")
                         .color(pal.secondary)
-                        .small(),
+                        .size(text::CAPTION),
                 );
-                ui.add_space(20.0);
+                ui.add_space(space::LG);
 
                 for screen in Screen::ALL {
                     let selected = self.state.screen == screen;
-                    let label = format!("{}   {}", screen.glyph(), screen.label());
-                    let text = egui::RichText::new(label).color(if selected {
-                        pal.accent
-                    } else {
-                        pal.text
-                    });
-                    if ui.selectable_label(selected, text).clicked() {
+                    if nav_item(ui, pal, screen.glyph(), screen.label(), selected) {
                         self.state.screen = screen;
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(space::XXS);
                 }
 
                 // Pin a compact listening-status pill to the bottom of the rail.
@@ -567,8 +574,8 @@ impl QwertyApp {
     }
 
     fn home(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.heading(egui::RichText::new("Home").color(pal.text).size(26.0));
-        ui.add_space(4.0);
+        ui.heading(egui::RichText::new("Home").color(pal.text).size(text::TITLE));
+        ui.add_space(space::XS);
         if let Some(profile) = &self.state.active_profile {
             ui.label(
                 egui::RichText::new(format!(
@@ -585,22 +592,22 @@ impl QwertyApp {
                     .color(pal.secondary),
             );
         }
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
         let calibrate_label = if self.state.active_profile.is_some() {
             "Recalibrate / new profile"
         } else {
             "Calibrate a new profile"
         };
-        if ui.button(calibrate_label).clicked() {
+        if primary_button(ui, pal, calibrate_label).clicked() {
             self.launch_wizard = true;
         }
-        ui.add_space(20.0);
+        ui.add_space(space::XL);
 
         // Status card.
         card(ui, pal, |ui| {
             ui.horizontal(|ui| {
                 status_pill(ui, pal, self.state.listening);
-                ui.add_space(12.0);
+                ui.add_space(space::MD);
                 let verb = match self.state.listening {
                     ListeningState::Listening => "Pause",
                     ListeningState::Paused => "Start listening",
@@ -612,29 +619,29 @@ impl QwertyApp {
                 }
             });
             if self.hotkeys.is_some() {
-                ui.add_space(8.0);
+                ui.add_space(space::SM);
                 ui.label(
                     egui::RichText::new(format!(
                         "Toggle listening from anywhere with {}.",
                         Hotkeys::DEFAULT_LABEL
                     ))
                     .color(pal.secondary)
-                    .small(),
+                    .size(text::CAPTION),
                 );
             }
 
             match self.state.listening {
                 ListeningState::Listening => {
-                    ui.add_space(10.0);
+                    ui.add_space(space::MD);
                     ui.separator();
-                    ui.add_space(6.0);
+                    ui.add_space(space::SM);
                     let mic = self.live.device.as_deref().unwrap_or("opening microphone…");
                     ui.label(
                         egui::RichText::new(format!("Mic: {mic}"))
                             .color(pal.secondary)
-                            .small(),
+                            .size(text::CAPTION),
                     );
-                    ui.add_space(4.0);
+                    ui.add_space(space::XS);
                     // Peak level, sqrt-shaped so quiet signals are still visible.
                     let frac = self.live.peak.clamp(0.0, 1.0).sqrt();
                     ui.add(
@@ -642,7 +649,7 @@ impl QwertyApp {
                             .desired_width(260.0)
                             .text(format!("input {:.0}%", frac * 100.0)),
                     );
-                    ui.add_space(4.0);
+                    ui.add_space(space::XS);
                     ui.label(
                         egui::RichText::new(format!(
                             "taps {}   ·   rejected {}",
@@ -652,7 +659,7 @@ impl QwertyApp {
                     );
                 }
                 ListeningState::Error => {
-                    ui.add_space(10.0);
+                    ui.add_space(space::MD);
                     let msg = self.live.error.as_deref().unwrap_or("audio device error");
                     ui.label(egui::RichText::new(format!("⚠ {msg}")).color(pal.danger));
                 }
@@ -660,7 +667,7 @@ impl QwertyApp {
             }
         });
 
-        ui.add_space(16.0);
+        ui.add_space(space::LG);
         // Honest-accuracy framing (DESIGN.md): never imply an unearned number.
         ui.label(
             egui::RichText::new(
@@ -676,9 +683,9 @@ impl QwertyApp {
         ui.heading(
             egui::RichText::new("Zones & profiles")
                 .color(pal.text)
-                .size(26.0),
+                .size(text::TITLE),
         );
-        ui.add_space(8.0);
+        ui.add_space(space::SM);
 
         // Disjoint field borrows so the editor can hold the profile + platform
         // at once.
@@ -699,8 +706,8 @@ impl QwertyApp {
                 )
                 .color(pal.secondary),
             );
-            ui.add_space(10.0);
-            if ui.button("Calibrate a new profile").clicked() {
+            ui.add_space(space::MD);
+            if primary_button(ui, pal, "Calibrate a new profile").clicked() {
                 *launch_wizard = true;
             }
             return;
@@ -759,8 +766,8 @@ impl QwertyApp {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, pal: &Palette, now: Instant) {
-        ui.heading(egui::RichText::new("Settings").color(pal.text).size(26.0));
-        ui.add_space(16.0);
+        ui.heading(egui::RichText::new("Settings").color(pal.text).size(text::TITLE));
+        ui.add_space(space::LG);
 
         section(ui, pal, "Theme");
         ui.horizontal_wrapped(|ui| {
@@ -848,6 +855,56 @@ const THEME_CHOICES: [(Theme, &str); 5] = [
     (Theme::HighContrast, "High contrast"),
 ];
 
+/// One navigation row: a full-width, left-aligned pill. The selected row fills
+/// with a faint accent tint *and* shows a leading accent bar — position and
+/// color, so selection never rides on color alone (`DESIGN.md` → Accessibility);
+/// hover previews with a fainter tint of the same accent. Visuals are static —
+/// a moving/settling selection animation would need a `MOTION.md` entry first,
+/// so this stays a purely visual refinement. The row is keyboard-focusable with
+/// a visible accent focus ring and carries a `WidgetInfo` so the screen reader
+/// announces it as a selectable item with its label and selected state.
+fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected: bool) -> bool {
+    let height = 36.0;
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+
+    let fill = if selected {
+        mix(pal.surface, pal.accent, 0.16)
+    } else if resp.hovered() {
+        mix(pal.surface, pal.accent, 0.07)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let painter = ui.painter();
+    if fill != egui::Color32::TRANSPARENT {
+        painter.rect_filled(rect, style::rounding(radius::SM), fill);
+    }
+    if selected {
+        let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, height));
+        painter.rect_filled(bar, style::rounding(radius::SM), pal.accent);
+    }
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect,
+            style::rounding(radius::SM),
+            egui::Stroke::new(2.0_f32, pal.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let ink = if selected { pal.accent } else { pal.text };
+    painter.text(
+        egui::pos2(rect.min.x + space::MD, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{glyph}   {label}"),
+        egui::FontId::proportional(text::BODY),
+        ink,
+    );
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
+    });
+    resp.clicked()
+}
+
 /// A status pill combining a color *and* a glyph *and* text — never color alone
 /// (`DESIGN.md` → Accessibility).
 fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
@@ -870,9 +927,9 @@ pub(crate) fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
         egui::RichText::new(title)
             .color(pal.text)
             .strong()
-            .size(16.0),
+            .size(text::SECTION),
     );
-    ui.add_space(6.0);
+    ui.add_space(space::SM);
 }
 
 /// Linear blend between two colors, `t` in `[0, 1]` (0 = `a`, 1 = `b`).
@@ -889,9 +946,26 @@ pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui:
     egui::Frame::default()
         .fill(pal.elevated)
         .stroke(egui::Stroke::new(1.0_f32, pal.border))
-        .inner_margin(egui::Margin::same(16))
-        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(style::margin(space::LG))
+        .corner_radius(style::rounding(radius::MD))
         .show(ui, add);
+}
+
+/// A filled-accent primary button — the one unmistakable call to action on a
+/// screen (`DESIGN.md`: "Make primary actions unmistakable"). Its label is
+/// painted in `on_color(accent)`, so it clears WCAG AA on every theme's accent
+/// (proved by the theme `on_accent_ink_clears_aa_for_every_theme` test) rather
+/// than assuming a fixed light-on-dark that breaks on the yellow High-Contrast
+/// or teal Aurora accents. `pub(crate)` so the Home and Zones calibrate buttons
+/// share exactly one primary-CTA shape.
+pub(crate) fn primary_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> egui::Response {
+    let ink = c32(on_color(Color::rgb(pal.accent.r(), pal.accent.g(), pal.accent.b())));
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(ink).strong())
+            .fill(pal.accent)
+            .corner_radius(style::rounding(radius::SM))
+            .min_size(egui::vec2(0.0, 34.0)),
+    )
 }
 
 /// egui `Color32` versions of the semantic tokens, for painting this frame.
@@ -1017,6 +1091,23 @@ fn visuals_for(t: &Tokens) -> egui::Visuals {
     let a = t.accent;
     v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(a.r, a.g, a.b, 90);
     v.selection.stroke.color = c32(t.accent);
+
+    // Roundness (radius::SM) applied to every widget state in one place, so no
+    // control keeps egui's default corner radius; menus/popovers/windows take
+    // the softer card radius (radius::MD). This is the geometry half of the
+    // design system meeting egui, alongside the spacing set once at startup.
+    let control = style::rounding(radius::SM);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = control;
+    }
+    v.window_corner_radius = style::rounding(radius::MD);
+    v.menu_corner_radius = style::rounding(radius::MD);
 
     v
 }

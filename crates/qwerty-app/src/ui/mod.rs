@@ -9,5 +9,6 @@ pub mod diagnostics;
 pub mod evaluation;
 pub mod motion;
 pub mod shell;
+pub mod style;
 pub mod theme;
 pub mod wizard;

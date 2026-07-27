@@ -191,6 +191,23 @@ pub fn contrast_ratio(a: Color, b: Color) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+/// Black or white — whichever has the higher WCAG contrast against `bg` — for
+/// text/glyphs painted *on* a filled color (e.g. the accent fill of a primary
+/// button). This keeps on-accent labels legible across every theme without
+/// adding a per-theme `on_accent` token: the accents range from a light yellow
+/// (High Contrast) to a mid blue (Midnight), and no single fixed ink is legible
+/// on all of them. The `on_accent_ink_clears_aa_for_every_theme` test proves
+/// the chosen ink clears WCAG AA for every theme's accent.
+pub fn on_color(bg: Color) -> Color {
+    let black = Color::rgb(0, 0, 0);
+    let white = Color::rgb(255, 255, 255);
+    if contrast_ratio(white, bg) >= contrast_ratio(black, bg) {
+        white
+    } else {
+        black
+    }
+}
+
 /// Print each theme's key tokens and its text/background contrast + WCAG
 /// verdict — the terminal inspector for the theme system before the GUI exists.
 pub fn print_report() {
@@ -287,6 +304,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn on_accent_ink_clears_aa_for_every_theme() {
+        // A primary button fills with the accent and paints its label in
+        // `on_color(accent)`. That label must clear WCAG AA (4.5:1) on every
+        // theme's accent, or the app's single most prominent control would be
+        // hard to read in some theme — the same accessibility bar the other
+        // color tests hold, extended to on-accent ink.
+        for theme in CONCRETE_THEMES {
+            let t = tokens_for(theme, false);
+            let ink = on_color(t.accent);
+            let c = contrast_ratio(ink, t.accent);
+            assert!(
+                c >= 4.5,
+                "{theme:?} on-accent ink {} contrast {c:.2} < 4.5 (AA)",
+                ink.hex()
+            );
+        }
+    }
+
+    #[test]
+    fn on_color_picks_the_higher_contrast_ink() {
+        // Light fill → black ink; dark fill → white ink.
+        assert_eq!(on_color(Color::rgb(0xFF, 0xD6, 0x00)), Color::rgb(0, 0, 0));
+        assert_eq!(on_color(Color::rgb(0x0A, 0x0A, 0x0C)), Color::rgb(255, 255, 255));
     }
 
     #[test]
