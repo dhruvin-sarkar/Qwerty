@@ -735,6 +735,20 @@ impl QwertyApp {
                     .color(pal.secondary)
                     .size(text::CAPTION),
             );
+            // Importing activates someone else's action bindings, which can run
+            // apps, commands, and keystrokes on every accepted tap — the same
+            // unattended-execution risk DESIGN.md flags a safety note for when a
+            // shell/keystroke action is first configured. Warn with a glyph +
+            // colour + text (never colour alone), so importing a file from an
+            // untrusted source is a considered choice.
+            ui.label(
+                egui::RichText::new(
+                    "⚠ Imported profiles can run apps, commands, and keystrokes on every \
+                     tap — only import files you trust.",
+                )
+                .color(pal.warning)
+                .size(text::CAPTION),
+            );
             ui.add_space(space::XS);
             let mut to_import: Option<PathBuf> = None;
             ui.horizontal_wrapped(|ui| {
