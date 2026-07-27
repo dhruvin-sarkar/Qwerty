@@ -134,6 +134,10 @@ impl QwertyApp {
         // leaving this breathing room intact (`style::configure_spacing`).
         cc.egui_ctx
             .style_mut(|s| style::configure_spacing(&mut s.spacing));
+        // Re-skin every glyph in the app with the native Windows typeface
+        // (`DESIGN.md` → Typography: Segoe UI is the platform-native choice),
+        // replacing egui's bundled default. Best-effort — see `install_fonts`.
+        install_fonts(&cc.egui_ctx);
 
         // Single-reader event pump. `tray-icon` and `global-hotkey` each deliver
         // events on one process-global channel that hands each message to
@@ -1291,6 +1295,16 @@ pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui:
         .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .inner_margin(style::margin(space::LG))
         .corner_radius(style::rounding(radius::MD))
+        // A whisper of shadow lifts the card off the base. Kept very light so it
+        // reads as depth, not decoration; on dark themes the border still does
+        // most of the separating (a black shadow barely shows on a near-black
+        // base), which is why this stays subtle rather than theme-aware.
+        .shadow(egui::Shadow {
+            offset: [0, 1],
+            blur: 7,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(22),
+        })
         .show(ui, add);
 }
 
@@ -1376,6 +1390,38 @@ where
     });
 }
 
+/// Install the native Windows UI typeface (Segoe UI) as egui's proportional
+/// font, so the app uses the platform-native face `DESIGN.md` specifies instead
+/// of egui's bundled default. Best-effort: if no candidate file is present
+/// (a non-Windows host, or a stripped install) egui keeps its default — a
+/// missing *cosmetic* font is not a precondition worth failing launch over, so
+/// this is the one place a quiet fallback is correct rather than a hidden bug.
+/// The static `segoeui.ttf` is tried before the variable `SegoeUIVF.ttf`
+/// because `ab_glyph` (egui's rasterizer) renders static faces reliably.
+fn install_fonts(ctx: &egui::Context) {
+    let candidates = [
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\SegoeUIVF.ttf",
+    ];
+    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "segoe".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    // First in the Proportional family so it wins; egui's default stays as a
+    // fallback for any glyph Segoe UI lacks. Monospace is left untouched (the
+    // Diagnostics/confusion-matrix numerics rely on it).
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "segoe".to_owned());
+    ctx.set_fonts(fonts);
+}
+
 /// Read the OS dark-mode preference; default to dark when unknown (Midnight is
 /// the OLED-friendly default per `DESIGN.md`).
 fn read_system_dark(ctx: &egui::Context) -> bool {
@@ -1451,6 +1497,28 @@ fn visuals_for(t: &Tokens) -> egui::Visuals {
     }
     v.window_corner_radius = style::rounding(radius::MD);
     v.menu_corner_radius = style::rounding(radius::MD);
+
+    // Subtle elevation: menus, popovers, and windows lift off the surface with a
+    // soft shadow (DESIGN.md: "real depth from subtle elevation rather than
+    // gradients"). Dark themes need more alpha for a shadow to read against a
+    // near-black base than light themes do.
+    let shadow_color = if dark {
+        egui::Color32::from_black_alpha(130)
+    } else {
+        egui::Color32::from_black_alpha(48)
+    };
+    v.window_shadow = egui::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: shadow_color,
+    };
+    v.popup_shadow = egui::Shadow {
+        offset: [0, 4],
+        blur: 12,
+        spread: 0,
+        color: shadow_color,
+    };
 
     v
 }
