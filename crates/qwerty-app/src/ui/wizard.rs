@@ -105,6 +105,11 @@ pub struct Wizard {
     // Save.
     profile_name: String,
     save_error: Option<String>,
+
+    /// Whether the main window is visible. While hidden to the tray the wizard
+    /// stops its 33 fps repaint and mutes its capture worker (`PERFORMANCE.md`:
+    /// no frames behind an invisible window).
+    visible: bool,
 }
 
 impl Wizard {
@@ -132,7 +137,21 @@ impl Wizard {
             consistency: None,
             profile_name: "My desk".to_string(),
             save_error: None,
+            visible: true,
         }
+    }
+
+    /// Set whether the main window is visible; forwards to the capture worker so
+    /// a wizard hidden to the tray stops pumping frames and the mic meter.
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        self.capture.set_visible(visible);
+    }
+
+    /// Surface a disk-save failure (raised by the shell) on the Save step, so the
+    /// user can retry the save without redoing the calibration.
+    pub fn set_save_error(&mut self, msg: String) {
+        self.save_error = Some(msg);
     }
 
     /// Render one frame of the wizard. Returns `Some(..)` when it should close.
@@ -176,11 +195,14 @@ impl Wizard {
             Step::Save => self.save_step(ui, pal),
         };
 
-        // Keep the meter/level live while a mic step is on screen.
-        if matches!(
-            self.step,
-            Step::Environment | Step::Capture | Step::Negatives
-        ) {
+        // Keep the meter/level live while a mic step is on screen — but not while
+        // hidden to the tray (no frames behind an invisible window).
+        if self.visible
+            && matches!(
+                self.step,
+                Step::Environment | Step::Capture | Step::Negatives
+            )
+        {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(33));
         }

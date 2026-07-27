@@ -245,6 +245,9 @@ impl QwertyApp {
                         if let Some(c) = &self.capture {
                             c.set_visible(true);
                         }
+                        if let Some(w) = self.wizard.as_mut() {
+                            w.set_visible(true);
+                        }
                     }
                     TrayCommand::Quit => {
                         // Force a real exit. Without this, the close-to-tray
@@ -275,6 +278,9 @@ impl QwertyApp {
             self.window_visible = false;
             if let Some(c) = &self.capture {
                 c.set_visible(false);
+            }
+            if let Some(w) = self.wizard.as_mut() {
+                w.set_visible(false);
             }
         }
     }
@@ -328,18 +334,26 @@ impl eframe::App for QwertyApp {
                     outcome = self.wizard.as_mut().and_then(|w| w.ui(ui, &pal));
                 });
             if let Some(o) = outcome {
-                if let WizardOutcome::Saved(profile) = o {
-                    match self.state.save_profile(&profile) {
-                        Ok(()) => self.save_error = None,
+                match o {
+                    WizardOutcome::Saved(profile) => match self.state.save_profile(&profile) {
+                        Ok(()) => {
+                            self.state.screen = Screen::Home;
+                            self.wizard = None;
+                        }
                         Err(e) => {
                             eprintln!("warning: could not save profile: {e}");
-                            self.save_error =
-                                Some(format!("Could not save “{}”: {e}", profile.name));
+                            // Keep the wizard — its calibration session is intact —
+                            // and show the error on its Save step so the user can
+                            // retry without redoing the whole wizard. (The shell's
+                            // save-error banner can't show here: the wizard owns
+                            // the whole window.)
+                            if let Some(w) = self.wizard.as_mut() {
+                                w.set_save_error(format!("Could not save “{}”: {e}", profile.name));
+                            }
                         }
-                    }
-                    self.state.screen = Screen::Home;
+                    },
+                    WizardOutcome::Cancelled => self.wizard = None,
                 }
-                self.wizard = None;
             }
             return;
         }
