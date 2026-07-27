@@ -346,6 +346,31 @@ impl AppState {
         Ok(profile.id)
     }
 
+    /// Duplicate the active profile under `new_name`: a fresh `ProfileId` with
+    /// the same calibration, zones, and action bindings, saved and made active.
+    /// This is what makes one desk calibration reusable for a second context —
+    /// e.g. duplicate a "Work" profile into "Game", then rebind the copy's zones
+    /// — without calibrating the same desk twice. An empty/blank `new_name`
+    /// falls back to "<source> copy". Errors if there is no active profile.
+    pub fn duplicate_active_profile(&mut self, new_name: &str) -> Result<ProfileId, String> {
+        let mut copy = self
+            .active_profile
+            .clone()
+            .ok_or("no active profile to duplicate")?;
+        copy.id = ProfileId::new();
+        let name = new_name.trim();
+        copy.name = if name.is_empty() {
+            format!("{} copy", copy.name)
+        } else {
+            name.to_string()
+        };
+        let now = chrono::Utc::now();
+        copy.created_at = now;
+        copy.updated_at = now;
+        self.save_profile(&copy)?; // persists, sets active, reloads into memory
+        Ok(copy.id)
+    }
+
     /// Core constructor from an already-resolved config and (optional) path.
     /// Tests pass `None` for the path so no real user file is ever touched.
     pub fn with_config(config: Config, config_path: Option<PathBuf>, system_dark: bool) -> Self {
@@ -714,5 +739,11 @@ mod tests {
     #[test]
     fn list_importable_is_empty_without_an_exports_dir() {
         assert!(test_state().list_importable_profiles().is_empty());
+    }
+
+    #[test]
+    fn duplicating_without_an_active_profile_errors() {
+        // Nothing to copy → a clear error, never a silent empty profile.
+        assert!(test_state().duplicate_active_profile("Game").is_err());
     }
 }

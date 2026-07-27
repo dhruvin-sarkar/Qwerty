@@ -108,6 +108,9 @@ struct QwertyApp {
     /// exported to), shown inline under the Zones import/export controls.
     /// Failures use the shared save-error banner instead. Transient UI only.
     io_message: Option<String>,
+    /// The name typed for a "Duplicate profile" action, before it is applied.
+    /// Cleared after a successful duplicate. Transient UI only.
+    duplicate_name: String,
 }
 
 impl QwertyApp {
@@ -196,6 +199,7 @@ impl QwertyApp {
             profiles,
             importable,
             io_message: None,
+            duplicate_name: String::new(),
         }
     }
 
@@ -727,6 +731,46 @@ impl QwertyApp {
                 }
             }
         });
+
+        // Duplicate the active profile to reuse its calibration for another
+        // context (the Work→Game case): one calibration, a second set of zone
+        // bindings. Deferred-apply so the closure only sets a flag (it borrows
+        // `duplicate_name` for the field), keeping the mutation out of the
+        // closure's borrow.
+        if self.state.active_profile.is_some() {
+            ui.add_space(space::SM);
+            let mut do_duplicate = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Duplicate as")
+                        .color(pal.secondary)
+                        .size(text::CAPTION),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.duplicate_name)
+                        .hint_text("new profile name")
+                        .desired_width(180.0),
+                );
+                do_duplicate = ui.button("Duplicate").clicked();
+            });
+            if do_duplicate {
+                let name = self.duplicate_name.clone();
+                match self.state.duplicate_active_profile(&name) {
+                    Ok(_) => {
+                        self.duplicate_name.clear();
+                        self.selected_zone = None;
+                        self.io_message =
+                            Some("Duplicated — rebind this copy's zones to the new context.".into());
+                        self.save_error = None;
+                        self.refresh_profiles();
+                    }
+                    Err(e) => {
+                        self.io_message = None;
+                        self.save_error = Some(format!("Could not duplicate profile: {e}"));
+                    }
+                }
+            }
+        }
 
         if !self.importable.is_empty() {
             ui.add_space(space::SM);
