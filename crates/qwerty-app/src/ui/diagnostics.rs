@@ -24,15 +24,15 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use qwerty_core::classifier::FeatureSpaceView;
-use qwerty_core::features::{FeatureExtractor, FEATURE_WINDOW_SAMPLES};
+use qwerty_core::features::{FeatureExtractor, FEATURE_WINDOW_SAMPLES, SPECTRAL_BAND_COUNT};
 use qwerty_core::profile::{Profile, SensingMode};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::Palette;
+use crate::ui::shell::{mix, section, Palette};
 
-/// Spectrogram scrollback, in columns. At the worker's 30 fps frame rate this is
-/// about three seconds of history — enough to see a tap arrive and decay.
+/// Spectrogram scrollback, in columns. At the worker's ~33 fps frame rate this
+/// is a few seconds of history — enough to see a tap arrive and decay.
 const SPECTROGRAM_COLUMNS: usize = 90;
 
 /// The most recent tap, projected against the calibrated model.
@@ -52,14 +52,18 @@ pub struct DiagnosticsScreen {
     device_name: Option<String>,
     error: Option<String>,
     waveform: Vec<f32>,
-    spectrogram: VecDeque<Vec<f32>>,
+    spectrogram: VecDeque<[f32; SPECTRAL_BAND_COUNT]>,
     last_tap: Option<TapView>,
 }
 
 impl DiagnosticsScreen {
-    /// Whether the live capture is running.
-    pub fn is_active(&self) -> bool {
-        self.capture.is_some()
+    /// Whether the shell should (re)start capture: no live stream *and* no
+    /// recorded failure. A failure leaves `error` set and `capture` cleared, so
+    /// this returns `false` — the shell must not respawn a device that just
+    /// failed on a loop; the error stays on screen until the user navigates away
+    /// (which calls [`stop`](Self::stop) and resets it).
+    pub fn needs_start(&self) -> bool {
+        self.capture.is_none() && self.error.is_none()
     }
 
     /// Begin live capture. The shell calls this *after* closing the Home
@@ -208,17 +212,6 @@ impl DiagnosticsScreen {
     }
 }
 
-/// A titled section label (matches the other screens).
-fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
-    ui.label(
-        egui::RichText::new(title)
-            .color(pal.text)
-            .strong()
-            .size(16.0),
-    );
-    ui.add_space(6.0);
-}
-
 /// Draw the peak envelope symmetrically about a centre line, which reads as a
 /// conventional waveform. The envelope (rather than stride-sampled points) means
 /// a brief transient can never be skipped between pixels.
@@ -252,13 +245,17 @@ fn draw_waveform(ui: &mut egui::Ui, pal: &Palette, envelope: &[f32]) {
 
 /// Draw the band-energy history as a heat grid: one column per frame, oldest at
 /// the left, lowest band at the bottom.
-fn draw_spectrogram(ui: &mut egui::Ui, pal: &Palette, history: &VecDeque<Vec<f32>>) {
+fn draw_spectrogram(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    history: &VecDeque<[f32; SPECTRAL_BAND_COUNT]>,
+) {
     let size = egui::vec2(ui.available_width().min(560.0), 120.0);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
     let r = resp.rect;
     painter.rect_filled(r, egui::CornerRadius::same(4), pal.surface);
-    let bands = history.back().map(Vec::len).unwrap_or(0);
-    if history.is_empty() || bands == 0 {
+    let bands = SPECTRAL_BAND_COUNT;
+    if history.is_empty() {
         return;
     }
 
@@ -306,6 +303,22 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
             .color(pal.warning),
         );
         ui.add_space(8.0);
+    }
+
+    // A non-finite input yields infinite distances from `feature_space` (its
+    // documented defensive behaviour). Bail before the bar math, or `d / max_d`
+    // would be inf/inf = NaN and paint garbage-width rects.
+    if tap.space.zones.iter().any(|z| !z.centroid_distance.is_finite())
+        || !tap.space.nearest_example_distance.is_finite()
+    {
+        ui.label(
+            egui::RichText::new(
+                "The last tap's features were not finite (a glitchy audio frame); \
+                 nothing to compare.",
+            )
+            .color(pal.warning),
+        );
+        return;
     }
 
     // Scale every bar against the same reference so the threshold marker below
@@ -453,11 +466,4 @@ fn mode_name(mode: SensingMode) -> &'static str {
         SensingMode::Active => "Active",
         SensingMode::Hybrid => "Hybrid",
     }
-}
-
-/// Linear blend between two colors, `t` in `[0, 1]`.
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    egui::Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }

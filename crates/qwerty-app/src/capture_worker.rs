@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use qwerty_core::features::{FeatureExtractor, FEATURE_WINDOW_SAMPLES, SAMPLE_RATE_HZ};
+use qwerty_core::features::{
+    FeatureExtractor, FEATURE_WINDOW_SAMPLES, SAMPLE_RATE_HZ, SPECTRAL_BAND_COUNT,
+};
 use qwerty_core::onset::OnsetDetector;
 
 use crate::audio_thread::{AudioCapture, InputNormalizer};
@@ -27,9 +29,13 @@ use crate::audio_thread::{AudioCapture, InputNormalizer};
 const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
 /// Worker poll cadence when draining the capture ring.
 const POLL_INTERVAL: Duration = Duration::from_millis(15);
-/// Diagnostics frame cadence — 30 fps, the fixed rate `MOTION.md` prescribes for
-/// the live waveform/spectrogram ("30fps is sufficient for legibility, not 60+").
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Diagnostics frame cadence. `MOTION.md` prescribes a fixed ~30 fps for the
+/// live views ("30fps is sufficient for legibility, not 60+"). The worker polls
+/// every [`POLL_INTERVAL`] (15 ms), so a frame can only fire on a poll tick:
+/// 30 ms = two ticks ≈ 33 fps, the closest clean multiple to 30. (33 ms would
+/// round up to three ticks ≈ 22 fps, below the target — so this is deliberately
+/// a multiple of the poll interval, not the naive 1000/30.)
+const FRAME_INTERVAL: Duration = Duration::from_millis(30);
 /// How much recent audio the Diagnostics views keep (0.25 s). Bounded, and
 /// comfortably larger than one feature window so the spectrum always has input.
 const RECENT_SPAN: usize = SAMPLE_RATE_HZ as usize / 4;
@@ -84,8 +90,12 @@ pub enum CaptureEvent {
     /// points to draw a 300 px trace). `bands` is the classifier's own
     /// normalized spectral-band vector for the most recent feature window, so
     /// the spectrogram shows exactly what the model sees rather than a prettier
-    /// but unrelated STFT.
-    Frame { waveform: Vec<f32>, bands: Vec<f32> },
+    /// but unrelated STFT. It is the fixed-size array straight from the extractor
+    /// (`Copy`, no per-frame allocation).
+    Frame {
+        waveform: Vec<f32>,
+        bands: [f32; SPECTRAL_BAND_COUNT],
+    },
     /// The device failed to open, or the stream faulted mid-session (unplugged,
     /// permission revoked). Terminal — the worker exits after sending this.
     Failed(String),
@@ -244,7 +254,7 @@ fn run_worker(
             if last_frame.elapsed() >= FRAME_INTERVAL && recent.len() >= FEATURE_WINDOW_SAMPLES {
                 let waveform = envelope(&recent, WAVEFORM_POINTS);
                 let window = &recent[recent.len() - FEATURE_WINDOW_SAMPLES..];
-                let bands = ex.extract(window).spectral_bands.to_vec();
+                let bands = ex.extract(window).spectral_bands;
                 let _ = tx.send(CaptureEvent::Frame { waveform, bands });
                 ctx.request_repaint();
                 last_frame = Instant::now();

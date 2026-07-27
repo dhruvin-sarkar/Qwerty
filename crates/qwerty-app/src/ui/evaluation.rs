@@ -29,7 +29,7 @@ use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::Palette;
+use crate::ui::shell::{mix, section, Palette};
 
 /// Configurable held-out tap counts (`DESIGN.md`: "N taps per zone (default 15,
 /// configurable)"). 15 is [`DEFAULT_EVAL_TAPS_PER_ZONE`].
@@ -665,17 +665,6 @@ impl EvaluationScreen {
     }
 }
 
-/// A titled section label (matches the Settings screen's `section`).
-fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
-    ui.label(
-        egui::RichText::new(title)
-            .color(pal.text)
-            .strong()
-            .size(16.0),
-    );
-    ui.add_space(6.0);
-}
-
 /// A labeled horizontal accuracy bar in `[0, 1]`.
 fn bar_row(ui: &mut egui::Ui, pal: &Palette, label: &str, frac: f32) {
     let frac = frac.clamp(0.0, 1.0);
@@ -893,10 +882,3 @@ fn draw_trend(ui: &mut egui::Ui, pal: &Palette, history: &[EvaluationReport]) {
     );
 }
 
-/// Linear blend between two colors, `t` in `[0, 1]` (0 = `a`, 1 = `b`). Used to
-/// tint confusion-matrix cells from the surface color toward success/danger.
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    egui::Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
-}

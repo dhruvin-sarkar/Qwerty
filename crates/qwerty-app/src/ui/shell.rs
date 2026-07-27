@@ -284,7 +284,12 @@ impl eframe::App for QwertyApp {
                 self.state.listening = ListeningState::Paused;
             }
             self.capture = None; // Drop stops the Home worker + closes the device.
-            if diagnostics_open && !self.diagnostics.is_active() {
+            // Start the Diagnostics capture only when it has neither a live
+            // stream nor an already-recorded failure. Checking `needs_start`
+            // (not just "no live stream") is what stops a failed device from
+            // being respawned every frame in a silent retry loop — the failure
+            // stays visible on screen until the user leaves and returns.
+            if diagnostics_open && self.diagnostics.needs_start() {
                 self.diagnostics.start(ctx);
             }
         } else {
@@ -681,10 +686,20 @@ fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
     );
 }
 
-/// A titled section label.
-fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
+/// A titled section label. `pub(crate)` so every screen shares one definition
+/// (the Settings, Evaluation, and Diagnostics screens all use it).
+pub(crate) fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
     ui.label(egui::RichText::new(title).color(pal.text).strong().size(16.0));
     ui.add_space(6.0);
+}
+
+/// Linear blend between two colors, `t` in `[0, 1]` (0 = `a`, 1 = `b`).
+/// `pub(crate)` so the heat-grid views (confusion matrix, spectrogram) tint from
+/// one shared helper rather than each re-deriving it.
+pub(crate) fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 /// A simple elevated card frame. `pub(crate)` so the action editor reuses it.

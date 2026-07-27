@@ -50,10 +50,9 @@ const AUM_ID: &str = "Qwerty.TapZones";
 /// — sound here because every action is dispatched from the single UI thread
 /// (`ARCHITECTURE.md` → Threading model).
 pub struct WindowsPlatform {
-    /// The speech engine. It must be *kept alive*, not created per call:
-    /// dropping it releases the WinRT `MediaPlayer` that is still playing, which
-    /// cuts the utterance off mid-word.
-    tts: RefCell<Option<Tts>>,
+    /// The speech engine, on its own thread (see [`SpeechWorker`]). Lazily
+    /// started on first `speak` so an app that never speaks pays nothing.
+    speech: RefCell<Option<SpeechWorker>>,
     /// The toast notifier, created once the AUMID has been registered.
     toast: RefCell<Option<ToastManager>>,
 }
@@ -67,7 +66,7 @@ impl Default for WindowsPlatform {
 impl WindowsPlatform {
     pub fn new() -> Self {
         WindowsPlatform {
-            tts: RefCell::new(None),
+            speech: RefCell::new(None),
             toast: RefCell::new(None),
         }
     }
@@ -101,11 +100,19 @@ impl WindowsPlatform {
                         "could not register the notification identity ({AUM_ID}): {e}"
                     )))
                 }
-                Err(_) => {
+                Err(payload) => {
+                    // Keep the assertion text (e.g. "assertion failed:
+                    // !transaction.is_invalid()") — it names which KTM step
+                    // failed, the one detail worth having on a rare failure.
+                    let detail = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
                     return Err(ActionError::Notification(format!(
                         "registering the notification identity ({AUM_ID}) panicked \
-                         inside winrt-toast"
-                    )))
+                         inside winrt-toast: {detail}"
+                    )));
                 }
             }
             *slot = Some(ToastManager::new(AUM_ID));
@@ -361,15 +368,15 @@ impl PlatformActions for WindowsPlatform {
     }
 
     fn speak(&self, text: &str) -> Result<(), ActionError> {
-        let mut slot = self.tts.borrow_mut();
+        let mut slot = self.speech.borrow_mut();
         if slot.is_none() {
-            *slot = Some(Tts::default().map_err(speech_err)?);
+            *slot = Some(SpeechWorker::new());
         }
-        // `expect` on the line after the assignment above: genuinely unreachable.
-        let engine = slot.as_mut().expect("speech engine initialized above");
-        // interrupt = true: a newly tapped zone should speak now, not queue
-        // behind whatever the previous tap said.
-        engine.speak(text, true).map(|_utterance| ()).map_err(speech_err)
+        // Enqueue and return immediately — synthesis happens on the worker
+        // thread, so this never blocks the UI (the whole reason for the worker).
+        slot.as_ref()
+            .expect("speech worker initialized above")
+            .speak(text)
     }
 
     fn notify(&self, toast: &ToastSpec) -> Result<(), ActionError> {
@@ -397,10 +404,63 @@ impl PlatformActions for WindowsPlatform {
     }
 }
 
-/// Map a `tts` error into ours using `Debug`, not `Display`, deliberately:
-/// `tts::Error::WinRt`'s `Display` is the bare string "WinRT error" and drops
-/// the underlying HRESULT, which would leave the user (and the detective method)
-/// with an unactionable message.
-fn speech_err(e: tts::Error) -> ActionError {
-    ActionError::Speech(format!("{e:?}"))
+/// A dedicated thread that owns the speech engine and speaks text handed to it
+/// over a channel.
+///
+/// Two facts about `tts` force this shape. (1) `Tts::speak` blocks the calling
+/// thread until the *entire utterance has been synthesized* (it calls `.get()`
+/// on a WinRT async op; only playback is fire-and-forget), so doing it inline
+/// froze egui's event loop for the whole synthesis. (2) `Tts`'s handle is an
+/// `Rc` internally, so it must be created and used on one thread and never moved
+/// across threads. Both are satisfied by creating the engine *on this worker
+/// thread* and feeding it text over an `mpsc` channel — the same
+/// background-thread + channel idiom `capture_worker` uses.
+struct SpeechWorker {
+    tx: std::sync::mpsc::Sender<String>,
+    /// Joined implicitly: dropping `tx` ends the worker's `recv` loop, and the
+    /// handle is kept so the thread is owned for the platform's lifetime.
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl SpeechWorker {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            // Create the engine HERE; it lives for the thread's life and is
+            // never moved. If it can't initialize (no audio endpoint, WinRT
+            // failure), log once and exit — subsequent sends then fail at the
+            // channel, surfacing "unavailable" rather than silently doing
+            // nothing forever. `Debug`, not `Display`: `tts::Error::WinRt`'s
+            // `Display` is the bare "WinRT error" and drops the HRESULT.
+            let mut engine = match Tts::default() {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("warning: text-to-speech engine unavailable: {e:?}");
+                    return;
+                }
+            };
+            // interrupt = true: a newly tapped zone speaks now, not queued
+            // behind the previous utterance.
+            while let Ok(text) = rx.recv() {
+                if let Err(e) = engine.speak(text, true) {
+                    eprintln!("warning: text-to-speech failed: {e:?}");
+                }
+            }
+            // `recv` errored → the sender was dropped → the app is exiting →
+            // fall out and drop the engine, which stops any playback.
+        });
+        Self {
+            tx,
+            _handle: handle,
+        }
+    }
+
+    /// Enqueue text for the worker. Returns immediately. A disconnected channel
+    /// (the engine thread exited because it could not initialize) is surfaced as
+    /// a real error, never a silent drop.
+    fn speak(&self, text: &str) -> Result<(), ActionError> {
+        self.tx
+            .send(text.to_string())
+            .map_err(|_| ActionError::Speech("the speech engine is unavailable".into()))
+    }
 }
