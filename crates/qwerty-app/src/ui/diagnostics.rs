@@ -29,7 +29,8 @@ use qwerty_core::profile::{Profile, SensingMode};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::{mix, screen_header, section, Palette};
+use crate::ui::motion::{self, AnimState};
+use crate::ui::shell::{mix, screen_header, section, with_alpha, Palette};
 use crate::ui::style::space;
 
 /// Spectrogram scrollback, in columns. At the worker's ~33 fps frame rate this
@@ -55,6 +56,10 @@ pub struct DiagnosticsScreen {
     waveform: Vec<f32>,
     spectrogram: VecDeque<[f32; SPECTRAL_BAND_COUNT]>,
     last_tap: Option<TapView>,
+    /// One-shot marker fired when an accepted tap lands: a fading vertical bar
+    /// pinned to the waveform's right edge (newest input), so the moment a tap
+    /// was registered is visible against the scrolling trace.
+    tap_flash: Option<AnimState>,
 }
 
 impl DiagnosticsScreen {
@@ -88,6 +93,7 @@ impl DiagnosticsScreen {
         self.waveform.clear();
         self.spectrogram.clear();
         self.last_tap = None;
+        self.tap_flash = None;
         self.device_name = None;
         // Clear the recorded failure too, so a later visit gets a fresh retry
         // via `needs_start()`. Without this the screen is locked out for the rest
@@ -129,8 +135,14 @@ impl DiagnosticsScreen {
                         continue;
                     }
                     let fv = extractor.extract(&window);
+                    let space = profile.classifier.feature_space(&fv);
+                    // Flash the waveform only for a real accepted tap — the same
+                    // bar that the classifier would have acted on live.
+                    if is_transient && space.accepted {
+                        self.tap_flash = Some(AnimState::start(motion::STANDARD));
+                    }
                     self.last_tap = Some(TapView {
-                        space: profile.classifier.feature_space(&fv),
+                        space,
                         is_transient,
                     });
                 }
@@ -169,7 +181,7 @@ impl DiagnosticsScreen {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             section(ui, pal, "Waveform");
-            draw_waveform(ui, pal, &self.waveform);
+            draw_waveform(ui, pal, &self.waveform, self.tap_flash.as_ref());
             ui.add_space(space::LG);
 
             section(ui, pal, "Spectrogram");
@@ -216,13 +228,18 @@ impl DiagnosticsScreen {
         if self.capture.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(33));
         }
+        // Release the one-shot flash once it has faded out (the 33 fps loop
+        // above already drove it to completion).
+        if self.tap_flash.as_ref().is_some_and(AnimState::is_complete) {
+            self.tap_flash = None;
+        }
     }
 }
 
 /// Draw the peak envelope symmetrically about a centre line, which reads as a
 /// conventional waveform. The envelope (rather than stride-sampled points) means
 /// a brief transient can never be skipped between pixels.
-fn draw_waveform(ui: &mut egui::Ui, pal: &Palette, envelope: &[f32]) {
+fn draw_waveform(ui: &mut egui::Ui, pal: &Palette, envelope: &[f32], flash: Option<&AnimState>) {
     let size = egui::vec2(ui.available_width().min(560.0), 90.0);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
     let r = resp.rect;
@@ -232,6 +249,22 @@ fn draw_waveform(ui: &mut egui::Ui, pal: &Palette, envelope: &[f32]) {
         [egui::pos2(r.min.x, mid), egui::pos2(r.max.x, mid)],
         egui::Stroke::new(1.0_f32, pal.border),
     );
+
+    // Accepted-tap flash: a fading vertical bar at the right edge (newest
+    // input), painted behind the trace so it reads as a marker on the timeline
+    // rather than obscuring the waveform.
+    if let Some(flash) = flash {
+        let fade = 1.0 - flash.linear();
+        if fade > 0.01 {
+            let bar = egui::Rect::from_min_max(egui::pos2(r.max.x - 3.0, r.min.y), r.max);
+            painter.rect_filled(
+                bar,
+                egui::CornerRadius::ZERO,
+                with_alpha(pal.success, (fade * 220.0) as u8),
+            );
+        }
+    }
+
     if envelope.is_empty() {
         return;
     }
