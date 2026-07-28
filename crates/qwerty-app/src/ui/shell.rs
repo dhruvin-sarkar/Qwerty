@@ -56,7 +56,10 @@ pub fn run() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Qwerty")
             .with_inner_size([1040.0, 720.0])
-            .with_min_inner_size([840.0, 560.0]),
+            .with_min_inner_size([840.0, 560.0])
+            // Transparent-capable so the Translucent theme can paint see-through
+            // glass panels; every opaque theme fills alpha 255 and looks normal.
+            .with_transparent(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -407,6 +410,20 @@ impl QwertyApp {
 }
 
 impl eframe::App for QwertyApp {
+    /// The framebuffer clear color. Transparent under the Translucent theme so
+    /// its alpha-blended panels reveal the desktop (a plain see-through
+    /// "glass" — no blur, which would need the wgpu backend); every other theme
+    /// clears to an opaque `bg_base` so nothing shows through the solid look,
+    /// even though the window is created transparent-capable.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.state.config.theme == Theme::Translucent {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            let b = tokens_for(self.state.config.theme, self.state.system_dark).bg_base;
+            [b.r as f32 / 255.0, b.g as f32 / 255.0, b.b as f32 / 255.0, 1.0]
+        }
+    }
+
     /// Persist the active profile once on real shutdown.
     ///
     /// A free-text action field commits to disk on focus loss, but exiting
@@ -460,7 +477,7 @@ impl eframe::App for QwertyApp {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::default()
-                        .fill(pal.base)
+                        .fill(with_alpha(pal.base, panel_alpha(self.state.config.theme, 205)))
                         .inner_margin(style::margin(space::XXL)),
                 )
                 .show(ctx, |ui| {
@@ -566,7 +583,7 @@ impl eframe::App for QwertyApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(pal.base)
+                    .fill(with_alpha(pal.base, panel_alpha(self.state.config.theme, 205)))
                     .inner_margin(style::margin(space::XL)),
             )
             .show(ctx, |ui| {
@@ -752,7 +769,7 @@ impl QwertyApp {
             .exact_width(224.0)
             .frame(
                 egui::Frame::default()
-                    .fill(pal.surface)
+                    .fill(with_alpha(pal.surface, panel_alpha(self.state.config.theme, 224)))
                     .inner_margin(style::margin(space::LG)),
             )
             .show(ctx, |ui| {
@@ -1546,6 +1563,20 @@ pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui:
 /// tint from the same helper rather than re-deriving it.
 pub(crate) fn with_alpha(c: egui::Color32, a: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// Alpha for a panel background fill under the current theme. The Translucent
+/// theme paints its base/surface layers semi-transparent over the transparent
+/// window for a glass look (`translucent`); every other theme is fully opaque,
+/// so it renders identically to before on a transparent-capable window. Cards
+/// (`bg_elevated`) stay opaque regardless, so they read as solid panels
+/// floating on the glass.
+fn panel_alpha(theme: Theme, translucent: u8) -> u8 {
+    if theme == Theme::Translucent {
+        translucent
+    } else {
+        255
+    }
 }
 
 /// A custom-painted 1px horizontal rule with breathing room, replacing
