@@ -27,6 +27,7 @@ use crate::ui::diagnostics::DiagnosticsScreen;
 use crate::ui::evaluation::EvaluationScreen;
 use crate::ui::motion;
 use crate::ui::paint;
+use egui_phosphor::regular as icon;
 use crate::ui::style::{self, radius, space, text};
 use crate::ui::theme::{on_color, tokens_for, Color, Tokens};
 use crate::ui::wizard::{Wizard, WizardOutcome};
@@ -666,7 +667,7 @@ impl QwertyApp {
             .corner_radius(style::rounding(radius::MD))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⚠").color(pal.danger).strong());
+                    ui.label(egui::RichText::new(icon::WARNING).color(pal.danger).strong());
                     ui.label(
                         egui::RichText::new("Couldn’t save")
                             .color(pal.text)
@@ -675,7 +676,7 @@ impl QwertyApp {
                     ui.label(egui::RichText::new(&msg).color(pal.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .button(egui::RichText::new("✕").color(pal.secondary))
+                            .button(egui::RichText::new(icon::X).color(pal.secondary))
                             .on_hover_text("Dismiss")
                             .clicked()
                         {
@@ -718,7 +719,7 @@ impl QwertyApp {
             .corner_radius(style::rounding(radius::MD))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⚠").color(pal.danger).strong());
+                    ui.label(egui::RichText::new(icon::WARNING).color(pal.danger).strong());
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new("Your settings can’t be saved")
@@ -793,10 +794,10 @@ impl QwertyApp {
             if empty_state(
                 ui,
                 pal,
-                "🎯",
+                icon::CROSSHAIR,
                 "Nothing mapped yet",
                 "Calibrate your desk to map tap zones to actions.",
-                "Calibrate now →",
+                &format!("Calibrate now  {}", icon::ARROW_RIGHT),
             ) {
                 self.launch_wizard = true;
             }
@@ -847,7 +848,7 @@ impl QwertyApp {
                         mini_pill(
                             ui,
                             pal,
-                            "●",
+                            icon::CHECK_CIRCLE,
                             &format!("{} accepted", self.live.taps),
                             pal.success,
                         );
@@ -855,7 +856,7 @@ impl QwertyApp {
                         mini_pill(
                             ui,
                             pal,
-                            "○",
+                            icon::CIRCLE,
                             &format!("{} ignored", self.live.rejects),
                             pal.secondary,
                         );
@@ -1190,7 +1191,7 @@ impl QwertyApp {
             if empty_state(
                 ui,
                 pal,
-                "◻",
+                icon::SQUARES_FOUR,
                 "No zones defined",
                 "Run calibration to create tap zones and bind actions.",
                 "Open calibration",
