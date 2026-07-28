@@ -50,18 +50,6 @@ impl Screen {
         }
     }
 
-    /// A leading glyph for the rail. Text-based so it renders in the default
-    /// system font without bundling an icon font, and always paired with the
-    /// text label (no information by glyph alone, per `DESIGN.md`).
-    pub fn glyph(self) -> &'static str {
-        match self {
-            Screen::Home => "⌂",
-            Screen::Zones => "▦",
-            Screen::Diagnostics => "∿",
-            Screen::Evaluation => "✓",
-            Screen::Settings => "⚙",
-        }
-    }
 }
 
 /// Whether the app is currently acting on taps. In Phase 3 this is toggled

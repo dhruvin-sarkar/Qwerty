@@ -28,5 +28,12 @@ winrt-toast = { workspace = true }
 # Phase 3 — GUI shell, tray icon, global hotkey (ROADMAP.md).
 eframe = { workspace = true }
 egui = { workspace = true }
+# Phase 7 polish — Phosphor icon font (vector icons in place of unicode/emoji
+# glyphs). Pinned to 0.9, the release that targets egui 0.31 (0.10+ require
+# egui 0.32+, which is the deliberately-deferred layout redesign). Windows-only
+# like the rest of the GUI, so a future Linux build's dep graph is unaffected.
+# Regular variant only: `add_to_fonts` registers under one shared "phosphor"
+# font key, so a second variant would overwrite the first — one weight it is.
+egui-phosphor = { version = "0.9", default-features = false, features = ["regular"] }
 tray-icon = { workspace = true }
 global-hotkey = { workspace = true }

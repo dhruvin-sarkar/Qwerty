@@ -772,7 +772,7 @@ impl QwertyApp {
 
                 for screen in Screen::ALL {
                     let selected = self.state.screen == screen;
-                    if nav_item(ui, pal, screen.glyph(), screen.label(), selected) {
+                    if nav_item(ui, pal, nav_icon(screen), screen.label(), selected) {
                         self.state.screen = screen;
                     }
                     ui.add_space(space::XXS);
@@ -1369,6 +1369,20 @@ const THEME_CHOICES: [(Theme, &str); 5] = [
 /// keyboard-focusable with a visible accent focus ring and carries a
 /// `WidgetInfo` so the screen reader announces it as a selectable item with its
 /// label and selected state.
+/// Phosphor icon for a nav destination. Kept in the shell (the Windows-only
+/// GUI) rather than on `Screen` itself, so `app_state` stays free of the egui/
+/// phosphor deps and a future non-Windows build still compiles. Replaces the
+/// unicode glyphs `Screen::glyph()` used to return.
+fn nav_icon(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Home => egui_phosphor::regular::HOUSE,
+        Screen::Zones => egui_phosphor::regular::SQUARES_FOUR,
+        Screen::Diagnostics => egui_phosphor::regular::WAVEFORM,
+        Screen::Evaluation => egui_phosphor::regular::CHART_BAR,
+        Screen::Settings => egui_phosphor::regular::GEAR,
+    }
+}
+
 fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected: bool) -> bool {
     let height = 36.0;
     let (rect, resp) =
@@ -1445,9 +1459,9 @@ fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected
 /// (`DESIGN.md` → Accessibility).
 fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
     let (color, glyph) = match state {
-        ListeningState::Listening => (pal.success, "●"),
-        ListeningState::Paused => (pal.secondary, "❚❚"),
-        ListeningState::Error => (pal.danger, "▲"),
+        ListeningState::Listening => (pal.success, egui_phosphor::regular::BROADCAST),
+        ListeningState::Paused => (pal.secondary, egui_phosphor::regular::PAUSE),
+        ListeningState::Error => (pal.danger, egui_phosphor::regular::WARNING),
     };
     // A real rounded badge: a faint status-tinted fill and edge, the status
     // colour on the glyph, the label in primary text (so it stays legible on
@@ -1934,35 +1948,43 @@ where
     });
 }
 
-/// Install the native Windows UI typeface (Segoe UI) as egui's proportional
-/// font, so the app uses the platform-native face `DESIGN.md` specifies instead
-/// of egui's bundled default. Best-effort: if no candidate file is present
-/// (a non-Windows host, or a stripped install) egui keeps its default — a
-/// missing *cosmetic* font is not a precondition worth failing launch over, so
-/// this is the one place a quiet fallback is correct rather than a hidden bug.
-/// The static `segoeui.ttf` is tried before the variable `SegoeUIVF.ttf`
-/// because `ab_glyph` (egui's rasterizer) renders static faces reliably.
+/// Install the app's fonts: the Phosphor icon set (for vector UI icons) plus
+/// the native Windows UI typeface (Segoe UI) as the primary proportional face.
+///
+/// Phosphor is added *unconditionally* — the icons are structural UI (they name
+/// controls and states), not a cosmetic nicety, and it registers itself only as
+/// a Proportional *fallback*, so text still renders in Segoe/the default and
+/// only the icon codepoints resolve to Phosphor. Segoe is best-effort: if no
+/// candidate file is present (a non-Windows host, or a stripped install) egui
+/// keeps its bundled default — a missing *text* face is not worth failing launch
+/// over, the one place a quiet fallback is correct rather than a hidden bug. The
+/// static `segoeui.ttf` is tried before the variable `SegoeUIVF.ttf` because
+/// `ab_glyph` (egui's rasterizer) renders static faces reliably.
 fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Phosphor icon glyphs (Regular weight). Inserts itself into the
+    // Proportional family as a fallback after the text faces.
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+
     let candidates = [
         r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\SegoeUIVF.ttf",
     ];
-    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "segoe".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-    );
-    // First in the Proportional family so it wins; egui's default stays as a
-    // fallback for any glyph Segoe UI lacks. Monospace is left untouched (the
-    // Diagnostics/confusion-matrix numerics rely on it).
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "segoe".to_owned());
+    if let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts.font_data.insert(
+            "segoe".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        // First in the Proportional family so it wins for text; egui's default
+        // and Phosphor stay as fallbacks. Monospace is left untouched (the
+        // Diagnostics/confusion-matrix numerics rely on it).
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "segoe".to_owned());
+    }
     ctx.set_fonts(fonts);
 }
 
