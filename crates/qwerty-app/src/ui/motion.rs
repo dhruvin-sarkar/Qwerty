@@ -121,6 +121,52 @@ fn bezier_axis_derivative(s: f32, c1: f32, c2: f32) -> f32 {
     3.0 * u * u * c1 + 6.0 * u * s * (c2 - c1) + 3.0 * s * s * (1.0 - c2)
 }
 
+/// A one-shot, forward-only animation from 0.0 to 1.0, driven by wall-clock
+/// time. Used for choreographed sequences (the zone-accept pulse, wizard pip
+/// fill, save-banner slide-in) that `Context::animate_bool_with_time` doesn't
+/// cover because they are *fire-and-forget* rather than bool toggles: the caller
+/// holds an `Option<AnimState>`, replaces it with `Some(AnimState::start(dur))`
+/// to trigger, reads `t()`/`linear()` each frame, and the shell's repaint
+/// scheduler keeps requesting frames until `is_complete()`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct AnimState {
+    started_at: std::time::Instant,
+    duration: std::time::Duration,
+}
+
+// Consumed by the zone-accept pulse and wizard choreography (Parts 2+ of the
+// UI elevation); carries `#[allow(dead_code)]` until those call sites land, the
+// same way this module reserves the not-yet-used motion tokens.
+#[allow(dead_code)]
+impl AnimState {
+    pub fn start(duration: std::time::Duration) -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            duration,
+        }
+    }
+
+    /// Eased progress in `[0.0, 1.0]`, reaching 1.0 once complete.
+    pub fn t(&self, easing: Bezier) -> f32 {
+        easing.eval(self.linear())
+    }
+
+    /// Raw linear progress in `[0.0, 1.0]` — for deriving two differently-eased
+    /// values from one `AnimState` (e.g. the pulse's scale and glow alpha).
+    pub fn linear(&self) -> f32 {
+        let secs = self.duration.as_secs_f32();
+        if secs <= 0.0 {
+            return 1.0;
+        }
+        (self.started_at.elapsed().as_secs_f32() / secs).clamp(0.0, 1.0)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.started_at.elapsed() >= self.duration
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +190,24 @@ mod tests {
             assert!(y >= prev - 1e-4, "curve must not decrease at x={i}");
             prev = y;
         }
+    }
+
+    #[test]
+    fn anim_state_starts_near_zero_incomplete_and_bounded() {
+        // A long duration so the test's own runtime can't advance it past ~0.
+        let a = AnimState::start(std::time::Duration::from_secs(3600));
+        assert!(a.linear() < 0.01, "just-started progress should be ~0");
+        assert!(!a.is_complete());
+        let t = a.t(STANDARD_EASE);
+        assert!((0.0..=1.0).contains(&t), "eased t must stay in [0, 1]");
+    }
+
+    #[test]
+    fn anim_state_zero_duration_is_immediately_complete() {
+        // Guard: a zero duration returns 1.0 rather than NaN from a 0/0 divide.
+        let a = AnimState::start(std::time::Duration::ZERO);
+        assert_eq!(a.linear(), 1.0);
+        assert!(a.is_complete());
     }
 
     #[test]
