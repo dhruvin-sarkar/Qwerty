@@ -1574,7 +1574,7 @@ fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
         egui::Sense::hover(),
     );
     let r = resp.rect;
-    let round = style::rounding(2.0);
+    let round = style::rounding(radius::XS);
     painter.rect_filled(r, round, pal.surface);
 
     // RMS fill (sqrt-shaped so quiet input stays visible).

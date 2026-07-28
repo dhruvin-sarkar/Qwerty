@@ -32,7 +32,7 @@ use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::shell::{empty_state_note, mix, primary_button, screen_header, section, Palette};
-use crate::ui::style::{space, text};
+use crate::ui::style::{self, radius, space, text};
 
 /// Configurable held-out tap counts (`DESIGN.md`: "N taps per zone (default 15,
 /// configurable)"). 15 is [`DEFAULT_EVAL_TAPS_PER_ZONE`].
@@ -751,9 +751,9 @@ fn bar_row(ui: &mut egui::Ui, pal: &Palette, label: &str, frac: f32) {
     ui.horizontal(|ui| {
         let (resp, painter) = ui.allocate_painter(egui::vec2(220.0, 18.0), egui::Sense::hover());
         let r = resp.rect;
-        painter.rect_filled(r, egui::CornerRadius::same(4), pal.surface);
+        painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
         let filled = egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, r.height()));
-        painter.rect_filled(filled, egui::CornerRadius::same(4), color);
+        painter.rect_filled(filled, style::rounding(radius::XS), color);
         ui.label(egui::RichText::new(format!("{:.0}%  {label}", frac * 100.0)).color(pal.text));
     });
 }
@@ -816,7 +816,7 @@ fn draw_confusion_matrix(ui: &mut egui::Ui, pal: &Palette, matrix: &[Vec<u32>], 
                 egui::vec2(cell, cell),
             )
             .shrink(1.0);
-            painter.rect_filled(rect, egui::CornerRadius::same(3), fill);
+            painter.rect_filled(rect, style::rounding(radius::XS), fill);
             if count > 0 {
                 let text_color = if intensity > 0.5 { pal.base } else { pal.text };
                 painter.text(
@@ -881,7 +881,7 @@ fn draw_confidence_histogram(ui: &mut egui::Ui, pal: &Palette, report: &Evaluati
             egui::pos2(r.min.x + i as f32 * bw, r.max.y - bh),
             egui::vec2(bw - 2.0, bh),
         );
-        painter.rect_filled(bar, egui::CornerRadius::same(2), pal.accent);
+        painter.rect_filled(bar, style::rounding(radius::XS), pal.accent);
     }
     ui.label(
         egui::RichText::new("left = low confidence, right = high (accepted taps).")
@@ -914,7 +914,7 @@ fn draw_latency_histogram(ui: &mut egui::Ui, pal: &Palette, latencies_ms: &[f32]
             egui::pos2(r.min.x + i as f32 * bw, r.max.y - bh),
             egui::vec2(bw - 2.0, bh),
         );
-        painter.rect_filled(bar, egui::CornerRadius::same(2), pal.accent);
+        painter.rect_filled(bar, style::rounding(radius::XS), pal.accent);
     }
     ui.label(
         egui::RichText::new(format!("0 to {RANGE_MS:.0} ms per tap"))
@@ -932,7 +932,7 @@ fn draw_trend(ui: &mut egui::Ui, pal: &Palette, history: &[EvaluationReport]) {
     }
     let (resp, painter) = ui.allocate_painter(egui::vec2(360.0, 90.0), egui::Sense::hover());
     let r = resp.rect;
-    painter.rect_filled(r, egui::CornerRadius::same(4), pal.surface);
+    painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
 
     // Map accuracy in [0.5, 1.0] to the plot height (below 50% pins to the floor).
     let y_of = |acc: f32| {

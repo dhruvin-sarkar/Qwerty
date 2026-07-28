@@ -31,7 +31,7 @@ use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::motion::{self, AnimState};
 use crate::ui::shell::{mix, screen_header, section, with_alpha, Palette};
-use crate::ui::style::space;
+use crate::ui::style::{self, radius, space};
 
 /// Spectrogram scrollback, in columns. At the worker's ~33 fps frame rate this
 /// is a few seconds of history — enough to see a tap arrive and decay.
@@ -248,7 +248,7 @@ fn draw_waveform(ui: &mut egui::Ui, pal: &Palette, envelope: &[f32], flash: Opti
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "Live microphone input waveform")
     });
-    painter.rect_filled(r, egui::CornerRadius::same(4), pal.surface);
+    painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
     let mid = r.center().y;
     painter.line_segment(
         [egui::pos2(r.min.x, mid), egui::pos2(r.max.x, mid)],
@@ -305,7 +305,7 @@ fn draw_spectrogram(
             "Live spectrogram of the classifier's frequency bands",
         )
     });
-    painter.rect_filled(r, egui::CornerRadius::same(4), pal.surface);
+    painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
     let bands = SPECTRAL_BAND_COUNT;
     if history.is_empty() {
         return;
@@ -405,13 +405,13 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
             let (resp, painter) =
                 ui.allocate_painter(egui::vec2(220.0, 16.0), egui::Sense::hover());
             let r = resp.rect;
-            painter.rect_filled(r, egui::CornerRadius::same(3), pal.surface);
+            painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
             // Shorter distance = closer = more likely, so fill the *remaining*
             // space: a long bar means "close to this zone".
             let w = r.width() * (1.0 - frac);
             painter.rect_filled(
                 egui::Rect::from_min_size(r.min, egui::vec2(w, r.height())),
-                egui::CornerRadius::same(3),
+                style::rounding(radius::XS),
                 if is_winner {
                     pal.success
                 } else {

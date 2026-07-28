@@ -37,6 +37,12 @@ pub mod space {
 /// not gradients. Small for controls, medium for cards/menus, large for the
 /// full-window focus surfaces (the calibration wizard).
 pub mod radius {
+    /// Micro-marks: chart bars, heat-map cells, meter tracks, sparklines — the
+    /// small painted rectangles inside a card, kept a hair rounder than square
+    /// but below the control radius. One token so these read identically across
+    /// the Evaluation, Diagnostics, and Home level-meter views instead of
+    /// drifting between hand-picked 2/3/4 px literals.
+    pub const XS: f32 = 3.0;
     /// Buttons, inputs, combo boxes, nav pills.
     pub const SM: f32 = 6.0;
     /// Cards, banners, popovers, menus.
@@ -140,7 +146,7 @@ mod tests {
 
     #[test]
     fn radius_scale_is_strictly_increasing() {
-        let steps = [radius::SM, radius::MD, radius::LG];
+        let steps = [radius::XS, radius::SM, radius::MD, radius::LG];
         for w in steps.windows(2) {
             assert!(w[1] > w[0], "radius scale not increasing: {} !> {}", w[1], w[0]);
         }

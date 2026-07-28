@@ -23,7 +23,7 @@ use qwerty_core::profile::{
 
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::motion::{self, AnimState};
-use crate::ui::shell::{c32, divider, mix, with_alpha, Palette};
+use crate::ui::shell::{c32, divider, mix, primary_button, with_alpha, Palette};
 use crate::ui::style::{self, radius, space, text};
 use crate::ui::theme::{on_color, Color};
 
@@ -362,7 +362,8 @@ impl Wizard {
         // fail blocks; warn allows proceeding.
         let enabled = quality.passes() && self.env_rms_count > 0;
         if ui
-            .add_enabled(enabled, egui::Button::new("Next: lay out zones"))
+            .add_enabled_ui(enabled, |ui| primary_button(ui, pal, "Next: lay out zones"))
+            .inner
             .clicked()
         {
             self.noise_floor = floor;
@@ -408,7 +409,7 @@ impl Wizard {
             });
         ui.add_space(space::LG);
 
-        if ui.button("Next: capture taps").clicked() {
+        if primary_button(ui, pal, "Next: capture taps").clicked() {
             let zone_ids: Vec<ZoneId> = (0..self.zone_count).map(|_| ZoneId::new()).collect();
             self.session = Some(CalibrationSession::new(
                 zone_ids,
@@ -525,7 +526,8 @@ impl Wizard {
 
         if !is_last {
             if ui
-                .add_enabled(complete, egui::Button::new("Next zone"))
+                .add_enabled_ui(complete, |ui| primary_button(ui, pal, "Next zone"))
+                .inner
                 .clicked()
             {
                 if let Some(s) = &mut self.session {
@@ -535,7 +537,8 @@ impl Wizard {
                 }
             }
         } else if ui
-            .add_enabled(complete, egui::Button::new("Check consistency"))
+            .add_enabled_ui(complete, |ui| primary_button(ui, pal, "Check consistency"))
+            .inner
             .clicked()
         {
             self.armed = false;
@@ -592,7 +595,7 @@ impl Wizard {
                     );
                 }
                 ui.add_space(space::MD);
-                let cont = ui.button("Continue").clicked();
+                let cont = primary_button(ui, pal, "Continue").clicked();
 
                 if let Some(i) = redo {
                     if let Some(s) = &mut self.session {
@@ -641,7 +644,7 @@ impl Wizard {
             ui.label(egui::RichText::new(format!("{} captured", self.neg_count)).color(pal.text));
         });
         ui.add_space(space::LG);
-        if ui.button("Next: save").clicked() {
+        if primary_button(ui, pal, "Next: save").clicked() {
             self.neg_armed = false;
             self.goto(Step::Save);
         }
@@ -673,7 +676,8 @@ impl Wizard {
 
         let can_save = !self.profile_name.trim().is_empty() && self.session.is_some();
         if ui
-            .add_enabled(can_save, egui::Button::new("Save profile"))
+            .add_enabled_ui(can_save, |ui| primary_button(ui, pal, "Save profile"))
+            .inner
             .clicked()
         {
             match self.build() {
