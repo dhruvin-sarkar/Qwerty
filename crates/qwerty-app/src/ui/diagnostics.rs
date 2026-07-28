@@ -32,6 +32,7 @@ use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::motion::{self, AnimState};
 use crate::ui::shell::{mix, screen_header, section, with_alpha, Palette};
 use crate::ui::style::{self, radius, space};
+use egui_phosphor::regular as icon;
 
 /// Spectrogram scrollback, in columns. At the worker's ~33 fps frame rate this
 /// is a few seconds of history — enough to see a tap arrive and decay.
@@ -419,7 +420,7 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
                     pal.secondary
                 },
             );
-            let marker = if is_winner { "●" } else { "○" };
+            let marker = if is_winner { icon::CHECK_CIRCLE } else { icon::CIRCLE };
             ui.label(
                 egui::RichText::new(format!(
                     "{marker} {}  (distance {:.2})",
@@ -433,9 +434,9 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
     ui.add_space(space::MD);
     let s = &tap.space;
     let (glyph, color, verdict) = if s.accepted {
-        ("✓", pal.success, "accepted")
+        (icon::CHECK, pal.success, "accepted")
     } else {
-        ("▲", pal.warning, "rejected as not matching any zone")
+        (icon::WARNING, pal.warning, "rejected as not matching any zone")
     };
     ui.label(
         egui::RichText::new(format!(
@@ -497,9 +498,9 @@ fn draw_sensing_mode(ui: &mut egui::Ui, pal: &Palette, profile: Option<&Profile>
         ),
     ] {
         let (glyph, color, note) = if available {
-            ("●", pal.success, "available")
+            (icon::CHECK_CIRCLE, pal.success, "available")
         } else {
-            ("○", pal.secondary, "not available in this build")
+            (icon::CIRCLE, pal.secondary, "not available in this build")
         };
         ui.label(
             egui::RichText::new(format!("{glyph} {} — {blurb} ({note})", mode_name(mode)))

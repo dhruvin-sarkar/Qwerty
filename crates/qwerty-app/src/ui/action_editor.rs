@@ -13,6 +13,7 @@ use qwerty_core::profile::{ActionSpec, Modifier, ScreenshotMode, SystemSound, Zo
 use crate::platform::{dispatch, PlatformActions};
 use crate::ui::shell::{card, Palette};
 use crate::ui::style::{space, text};
+use egui_phosphor::regular as icon;
 
 /// Transient editor state: the last Test result, scoped to the zone + row it
 /// was run on so it never bleeds onto a different zone's row.
@@ -224,9 +225,15 @@ impl ActionEditor {
                                     // toast/speech only report success asynchronously — say
                                     // "sent", not "ran", and carry the caveat in the hover.
                                     if Kind::of(spec).success_is_confirmed() {
-                                        ui.label(RichText::new("✓ ran").color(pal.success));
+                                        ui.label(
+                                            RichText::new(format!("{} ran", icon::CHECK))
+                                                .color(pal.success),
+                                        );
                                     } else {
-                                        ui.label(RichText::new("✓ sent").color(pal.success))
+                                        ui.label(
+                                            RichText::new(format!("{} sent", icon::CHECK))
+                                                .color(pal.success),
+                                        )
                                             .on_hover_text(
                                                 "Handed off to Windows. This action reports \
                                                  success asynchronously, so the check means it \

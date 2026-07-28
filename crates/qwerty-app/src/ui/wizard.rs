@@ -25,6 +25,7 @@ use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::motion::{self, AnimState};
 use crate::ui::shell::{c32, divider, mix, primary_button, with_alpha, Palette};
 use crate::ui::style::{self, radius, space, text};
+use egui_phosphor::regular as icon;
 use crate::ui::theme::{on_color, Color};
 
 /// Supported zone counts (`DESIGN.md`: 2, 4, 6, 8).
@@ -573,7 +574,7 @@ impl Wizard {
                         ui.label(
                             egui::RichText::new(format!(
                                 "{}  {label}: {:.0}%",
-                                if flagged { "▲" } else { "✓" },
+                                if flagged { icon::WARNING } else { icon::CHECK },
                                 acc * 100.0
                             ))
                             .color(color),
@@ -810,7 +811,7 @@ fn draw_stepper(ui: &mut egui::Ui, pal: &Palette, current: Step, step_anim: &Ani
         if done || is_cur {
             painter.circle_filled(center, r, pal.accent);
             let glyph = if done {
-                "✓".to_string()
+                icon::CHECK.to_string()
             } else {
                 (i + 1).to_string()
             };

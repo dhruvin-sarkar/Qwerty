@@ -33,6 +33,7 @@ use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::shell::{empty_state_note, mix, primary_button, screen_header, section, Palette};
 use crate::ui::style::{self, radius, space, text};
+use egui_phosphor::regular as icon;
 
 /// Configurable held-out tap counts (`DESIGN.md`: "N taps per zone (default 15,
 /// configurable)"). 15 is [`DEFAULT_EVAL_TAPS_PER_ZONE`].
@@ -307,7 +308,7 @@ impl EvaluationScreen {
             empty_state_note(
                 ui,
                 pal,
-                "📊",
+                icon::CHART_BAR,
                 "Nothing to evaluate yet",
                 "Calibrate a profile first — evaluation measures how accurately this \
                  desk and mic recognize each zone.",
@@ -405,9 +406,9 @@ impl EvaluationScreen {
                 for r in self.history.iter().rev() {
                     let pass = r.overall_accuracy >= TARGET_ACCURACY;
                     let (glyph, color) = if pass {
-                        ("✓", pal.success)
+                        (icon::CHECK, pal.success)
                     } else {
-                        ("▲", pal.warning)
+                        (icon::WARNING, pal.warning)
                     };
                     ui.label(
                         egui::RichText::new(format!(
@@ -460,9 +461,9 @@ impl EvaluationScreen {
             ui.horizontal_wrapped(|ui| {
                 for i in 0..target {
                     let (glyph, color) = if i < count {
-                        ("●", pal.success)
+                        (icon::CHECK_CIRCLE, pal.success)
                     } else {
-                        ("○", pal.secondary)
+                        (icon::CIRCLE, pal.secondary)
                     };
                     ui.label(egui::RichText::new(glyph).color(color).size(18.0));
                 }
@@ -480,12 +481,14 @@ impl EvaluationScreen {
                     );
                 }
                 Some(t) if t.correct => {
-                    ui.label(egui::RichText::new("✓ correct").color(pal.success));
+                    ui.label(
+                        egui::RichText::new(format!("{} correct", icon::CHECK)).color(pal.success),
+                    );
                 }
                 Some(t) => {
                     let got = t.predicted_label.as_deref().unwrap_or("another zone");
                     ui.label(
-                        egui::RichText::new(format!("✗ misclassified as “{got}”"))
+                        egui::RichText::new(format!("{} misclassified as “{got}”", icon::X_CIRCLE))
                             .color(pal.danger),
                     );
                 }
@@ -569,9 +572,9 @@ impl EvaluationScreen {
         // Headline accuracy + honest pass/needs-work verdict.
         let pass = report.overall_accuracy >= TARGET_ACCURACY;
         let (glyph, color, verdict) = if pass {
-            ("✓", pal.success, "meets the ≥92% target")
+            (icon::CHECK, pal.success, "meets the ≥92% target")
         } else {
-            ("▲", pal.warning, "below the 92% target")
+            (icon::WARNING, pal.warning, "below the 92% target")
         };
         ui.horizontal(|ui| {
             ui.label(
