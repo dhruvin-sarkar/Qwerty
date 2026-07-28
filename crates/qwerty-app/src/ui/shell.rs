@@ -1103,14 +1103,14 @@ impl QwertyApp {
         } = self;
 
         let Some(profile) = state.active_profile.as_mut() else {
-            ui.label(
-                egui::RichText::new(
-                    "No profile yet. Calibrate one to define zones and bind actions.",
-                )
-                .color(pal.secondary),
-            );
-            ui.add_space(space::MD);
-            if primary_button(ui, pal, "Calibrate a new profile").clicked() {
+            if empty_state(
+                ui,
+                pal,
+                "◻",
+                "No zones defined",
+                "Run calibration to create tap zones and bind actions.",
+                "Open calibration",
+            ) {
                 *launch_wizard = true;
             }
             return;
@@ -1473,6 +1473,30 @@ fn empty_state(
         primary_button(ui, pal, cta).clicked()
     })
     .inner
+}
+
+/// An empty-state column with no call-to-action, for screens rendered from a
+/// read-only `&AppState` that can't route a fix from where they sit. Same calm,
+/// centered layout as [`empty_state`] minus the button (Part 6). `pub(crate)`
+/// so the Evaluation/Diagnostics screens share it.
+pub(crate) fn empty_state_note(ui: &mut egui::Ui, pal: &Palette, glyph: &str, title: &str, body: &str) {
+    ui.add_space(space::XXL);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(glyph).size(64.0).color(pal.border));
+        ui.add_space(space::MD);
+        ui.label(
+            egui::RichText::new(title)
+                .size(text::HEADING)
+                .color(pal.text)
+                .strong(),
+        );
+        ui.add_space(space::XS);
+        ui.label(
+            egui::RichText::new(body)
+                .size(text::BODY)
+                .color(pal.secondary),
+        );
+    });
 }
 
 /// A custom input-level meter (Part 3): a background track, an RMS fill, a soft

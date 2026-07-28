@@ -31,7 +31,7 @@ use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::{mix, primary_button, screen_header, section, Palette};
+use crate::ui::shell::{empty_state_note, mix, primary_button, screen_header, section, Palette};
 use crate::ui::style::{space, text};
 
 /// Configurable held-out tap counts (`DESIGN.md`: "N taps per zone (default 15,
@@ -304,12 +304,13 @@ impl EvaluationScreen {
         );
 
         let Some(profile) = state.active_profile.as_ref() else {
-            ui.label(
-                egui::RichText::new(
-                    "Calibrate a profile first. Evaluation measures how accurately \
-                     this exact desk and mic recognize each zone.",
-                )
-                .color(pal.secondary),
+            empty_state_note(
+                ui,
+                pal,
+                "📊",
+                "Nothing to evaluate yet",
+                "Calibrate a profile first — evaluation measures how accurately this \
+                 desk and mic recognize each zone.",
             );
             return;
         };
