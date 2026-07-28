@@ -228,8 +228,8 @@ impl DiagnosticsScreen {
         if self.capture.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(33));
         }
-        // Release the one-shot flash once it has faded out (the 33 fps loop
-        // above already drove it to completion).
+        // Release the one-shot flash once it has faded out (the 33 ms repaint
+        // loop above already drove it to completion).
         if self.tap_flash.as_ref().is_some_and(AnimState::is_complete) {
             self.tap_flash = None;
         }
@@ -377,15 +377,16 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
         return;
     }
 
-    // Scale every bar against the same reference so the threshold marker below
-    // is directly comparable with the per-zone distances.
+    // Scale every zone bar against the largest per-zone centroid distance, so
+    // the bars are directly comparable with one another. (The novelty threshold
+    // is a nearest-example metric shown as text below, not a marker on these
+    // centroid-distance bars, so it must not drive their scaling.)
     let max_d = tap
         .space
         .zones
         .iter()
         .map(|z| z.centroid_distance)
         .fold(0.0f32, f32::max)
-        .max(tap.space.novelty_threshold)
         .max(1e-6);
 
     let winner = tap
