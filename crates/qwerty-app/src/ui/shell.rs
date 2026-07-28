@@ -294,21 +294,32 @@ impl QwertyApp {
                         // tap tally above still updates on every screen, so the
                         // Home counters remain correct when the user returns.
                         if self.state.screen == Screen::Home {
-                            // Classify the tap read-only to light the zone it
-                            // landed on (accept pulse) or shake the nearest one
-                            // (reject). Visual only — no action is dispatched here.
+                            // Light the zone the tap landed on (accept pulse) or
+                            // shake the nearest one (reject). Visual only — no
+                            // action is dispatched here. Use `feature_space`, not
+                            // `classify`: `classify` returns zone_id=None whenever
+                            // the novelty gate rejects, which discards the nearest
+                            // centroid and left the reject-shake branch in
+                            // `zone_tiles` unreachable. `feature_space` always
+                            // reports every zone's distance plus `accepted`, so the
+                            // nearest zone is known even on a reject ("heard a tap
+                            // near here, but rejected it").
                             if let Some(profile) = self.state.active_profile.as_ref() {
                                 if window.len() == FEATURE_WINDOW_SAMPLES {
                                     let fv = self.home_extractor.extract(&window);
-                                    let c = profile.classifier.classify(&fv);
-                                    if let Some(zone_id) = c.zone_id {
-                                        let dur = if c.accepted {
+                                    let space = profile.classifier.feature_space(&fv);
+                                    if let Some(nearest) = space.zones.iter().min_by(|a, b| {
+                                        a.centroid_distance.total_cmp(&b.centroid_distance)
+                                    }) {
+                                        let dur = if space.accepted {
                                             motion::QUICK
                                         } else {
                                             motion::INSTANT
                                         };
-                                        self.zone_anim
-                                            .insert(zone_id, (AnimState::start(dur), c.accepted));
+                                        self.zone_anim.insert(
+                                            nearest.zone_id,
+                                            (AnimState::start(dur), space.accepted),
+                                        );
                                     }
                                 }
                             }
