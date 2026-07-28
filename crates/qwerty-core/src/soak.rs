@@ -171,7 +171,9 @@ pub struct BatchTally {
     pub taps: u32,
     /// Taps accepted and assigned to the correct zone.
     pub correct: u32,
-    /// Real taps rejected by the novelty gate (misses).
+    /// Real taps not credited as correct: no onset detected, the onset rejected
+    /// as non-transient by the sustain gate, or an accepted onset rejected by
+    /// the classifier's novelty gate.
     pub rejected_taps: u32,
     /// Sustained (non-tap) clips presented.
     pub sustained: u32,

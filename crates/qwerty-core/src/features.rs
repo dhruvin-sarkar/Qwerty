@@ -3,14 +3,18 @@
 //!
 //! The vector has three groups (see `DATA_MODEL.md` → Runtime-only types):
 //! temporal shape, spectral-band distribution, and cepstral coefficients.
-//! Every group is deliberately built to be *robust to how hard the desk was
-//! tapped* — the discriminative signal between zones is the acoustic
-//! signature of the location, not the loudness of the hit:
+//! The spectral and cepstral groups are deliberately built to be *robust to
+//! how hard the desk was tapped* — their discriminative signal between zones is
+//! the acoustic signature of the location, not the loudness of the hit:
 //!
 //! - spectral bands are normalized into a distribution that sums to 1, so
 //!   only the *shape* of the spectrum survives, not its magnitude;
 //! - cepstral coefficients start at c1 (c0, the overall log-energy term, is
 //!   dropped) for the same reason.
+//!
+//! The temporal group intentionally keeps loudness-dependent terms (log-energy,
+//! peak) alongside the loudness-invariant ones (zero-crossing rate, crest
+//! factor, attack position, temporal centroid), so it is *not* loudness-robust.
 //!
 //! Extraction is deterministic: the same input window always yields the same
 //! [`FeatureVector`], bit for bit (required by `TESTING.md`). There is no RNG

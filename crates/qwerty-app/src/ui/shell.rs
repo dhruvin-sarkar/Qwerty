@@ -1617,8 +1617,9 @@ fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
     painter.vline(x, r.y_range(), egui::Stroke::new(2.0_f32, with_alpha(pal.text, 200)));
 
     // Announce the meter to screen readers with a *stable* label — a live
-    // percentage here would make Narrator chatter every frame (the value
-    // changes ~33×/s). The ProgressIndicator role conveys it is a level readout.
+    // percentage here would make Narrator chatter (the value changes ~20×/s, as
+    // Level events arrive every 50 ms). The ProgressIndicator role conveys it is
+    // a level readout.
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::ProgressIndicator,
@@ -1873,9 +1874,6 @@ pub(crate) fn c32(c: Color) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
-/// Spawn one background thread per external event source (tray, menu, hotkey).
-/// Each blocks on its process-global receiver and requests a repaint when an
-/// event arrives — parking (zero CPU) while idle. The receivers are `'static`
 /// Spawn the single reader for one process-global event channel.
 ///
 /// `tray-icon` and `global-hotkey` each deliver events through one

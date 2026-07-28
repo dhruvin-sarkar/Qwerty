@@ -49,8 +49,8 @@ enum Step {
 }
 
 /// The steps in flow order — the single source of truth the stepper indicator
-/// and the `index()`/`position()` accessors both derive from, so a step can
-/// never be numbered inconsistently between the two.
+/// and the `index()` accessor both derive from, so a step can never be numbered
+/// inconsistently between them.
 const STEP_ORDER: [Step; 6] = [
     Step::Environment,
     Step::Layout,

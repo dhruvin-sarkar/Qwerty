@@ -45,9 +45,8 @@ pub enum ActionError {
     Notification(String),
     /// Playing a system sound failed.
     Sound(String),
-    /// This action type is not yet wired on this build. A loud, honest state
-    /// (not a silent no-op) for the OS-integration actions — keystroke,
-    /// screenshot, toast, TTS — that land with on-hardware iteration.
+    /// An action variant the current build cannot perform (today: region-select
+    /// screenshot). A loud, honest state, not a silent no-op.
     Unsupported(&'static str),
 }
 

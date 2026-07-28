@@ -102,9 +102,10 @@ pub fn tokens_for(theme: Theme, system_prefers_dark: bool) -> Tokens {
     }
 }
 
-// The concrete palettes. Daylight and Midnight share one accent (DESIGN.md);
-// Aurora reserves its accent for visualizations; High Contrast is validated to
-// WCAG AAA.
+// The concrete palettes. Daylight and Midnight share the accent hue but at
+// theme-specific lightness (Daylight darker for AA on its near-white base,
+// Midnight lighter for the dark base); Aurora reserves its accent for
+// visualizations; High Contrast is validated to WCAG AAA.
 
 const DAYLIGHT: Tokens = Tokens {
     // Three distinct near-white layers (base < surface < elevated) instead of a

@@ -1,10 +1,12 @@
 //! Shared UI-thread state (`ARCHITECTURE.md` → Threading model).
 //!
 //! There is exactly one place app state is mutated: the UI thread. This struct
-//! is that state. In Phase 3 it holds the active screen, the (still manually
-//! toggled) listening state, the loaded [`Config`], and the theme cross-fade
-//! animation. Later phases add the processing-thread `ZoneEvent` receiver and
-//! the `PlatformActions` handle here — this is the single owner they attach to.
+//! is that state. It holds the active screen, the (still manually toggled)
+//! listening state, the loaded [`Config`] and where it persists, the active
+//! profile loaded from disk, a guard flag set when an existing config could not
+//! be read, and the theme cross-fade animation. Later phases add the
+//! processing-thread `ZoneEvent` receiver and the `PlatformActions` handle here
+//! — this is the single owner they attach to.
 //!
 //! State transitions here are pure (no disk I/O): persistence is the shell's
 //! concern, so these stay unit-testable without touching the real user config.

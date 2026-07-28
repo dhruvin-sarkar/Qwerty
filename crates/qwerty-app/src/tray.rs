@@ -5,11 +5,13 @@
 //! The icon image swaps instantly on state change (no animation — `MOTION.md`
 //! → Tray icon state change). Icons are generated in memory as colored discs,
 //! so no image assets are committed to the repo (`CLAUDE.md`: no committed
-//! binaries). Tray/menu events arrive on one process-global channel that hands
-//! each message to exactly one consumer, so a single event-pump thread (see
-//! `ui::shell`) is its sole reader: it forwards every event into the app-owned
-//! channels this type drains, and wakes the UI. The tray must never read the
-//! global channel directly, or it would race that pump thread and lose events.
+//! binaries). Menu clicks and tray-icon clicks each arrive on their own
+//! process-global channel (one per `tray-icon` event source), each handing a
+//! message to exactly one consumer — so each has its own sole-reader event-pump
+//! thread (see `ui::shell`) that forwards every event into the matching
+//! app-owned channel this type drains, and wakes the UI. The tray must never
+//! read those global channels directly, or it would race the pump threads and
+//! lose events.
 
 use std::sync::mpsc::Receiver;
 

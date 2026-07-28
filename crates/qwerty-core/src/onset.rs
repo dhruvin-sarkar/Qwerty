@@ -34,7 +34,9 @@ const ATTACK_RATIO: f32 = 2.0;
 /// are heard; measured room silence sat near -147 dB, well below this.
 const ABS_FLOOR: f32 = 1e-6;
 
-/// Noise-floor EMA rate (only updated on quiet hops so taps don't raise it).
+/// Noise-floor EMA rate. Applied on every hop that neither fires an onset nor
+/// sits in the post-onset refractory window, so a detected tap's own energy is
+/// never folded into the floor (a sustained tone still can, by design).
 const NOISE_EMA_ALPHA: f32 = 0.05;
 
 /// Sustained-sound gate: if the window's tail energy is at least this fraction
@@ -142,7 +144,8 @@ impl OnsetDetector {
                 // Refractory: don't re-trigger within one window.
                 self.cooldown_hops = FEATURE_WINDOW_SAMPLES / HOP;
             } else {
-                // Quiet hop: let the noise floor track the background.
+                // Non-firing hop: let the noise floor track the (possibly
+                // sustained) background.
                 self.noise_floor =
                     NOISE_EMA_ALPHA * rms + (1.0 - NOISE_EMA_ALPHA) * self.noise_floor;
             }

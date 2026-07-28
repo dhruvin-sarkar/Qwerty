@@ -423,8 +423,9 @@ impl EvaluationScreen {
     }
 
     /// A running guided test: prompt the current zone, show progress + per-tap
-    /// feedback, and arm/advance/finish controls. Repaints at a bounded 30 fps
-    /// while active (live meter) and stops the instant the run ends.
+    /// feedback, and arm/advance/finish controls. Repaints at a bounded ~30 fps
+    /// while active so the capture-event poll and per-tap feedback stay current,
+    /// and stops the instant the run ends.
     fn running_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let mut finish = false;
         let mut cancel = false;
@@ -544,8 +545,10 @@ impl EvaluationScreen {
             // Render the result/idle view on the very next frame.
             ui.ctx().request_repaint();
         } else if self.run.is_some() {
-            // Bounded-rate repaint only while the run is live (MOTION.md: 30 fps
-            // is enough for a live meter; PERFORMANCE.md: no free-running loop).
+            // Bounded-rate repaint only while the run is live, so run.drain()
+            // keeps polling capture events and the per-tap feedback stays
+            // current (MOTION.md: ~30 fps cadence; PERFORMANCE.md: no
+            // free-running loop).
             ui.ctx().request_repaint_after(Duration::from_millis(33));
         }
     }
