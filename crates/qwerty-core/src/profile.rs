@@ -81,6 +81,14 @@ pub enum Theme {
     Midnight,
     Aurora,
     HighContrast,
+    /// Warm near-black with an amber accent.
+    Ember,
+    /// Cool near-black with a violet accent.
+    Grape,
+    /// A see-through "glass" theme: the shell paints its backgrounds with alpha
+    /// over a transparent window (`ui::theme`, `ui::shell`). Its tokens are
+    /// still opaque sRGB so the same WCAG checks apply to the worst case.
+    Translucent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1350,13 +1350,16 @@ impl QwertyApp {
     }
 }
 
-/// The 5 selectable themes and their display names (`DESIGN.md` → Themes).
-const THEME_CHOICES: [(Theme, &str); 5] = [
+/// The selectable themes and their display names (`DESIGN.md` → Themes).
+const THEME_CHOICES: [(Theme, &str); 8] = [
     (Theme::System, "System"),
     (Theme::Daylight, "Daylight"),
     (Theme::Midnight, "Midnight"),
     (Theme::Aurora, "Aurora"),
     (Theme::HighContrast, "High contrast"),
+    (Theme::Ember, "Ember"),
+    (Theme::Grape, "Grape"),
+    (Theme::Translucent, "Translucent"),
 ];
 
 /// One navigation row: a full-width, left-aligned pill. The selected row fills

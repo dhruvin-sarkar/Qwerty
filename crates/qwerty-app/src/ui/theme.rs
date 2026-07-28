@@ -1,4 +1,4 @@
-//! The 5-theme token system (`DESIGN.md` → Visual design system).
+//! The theme token system (`DESIGN.md` → Visual design system).
 //!
 //! Each theme is one [`Tokens`] set. UI code reads a *semantic token*
 //! (`accent`, `bg_surface`, `danger`, …), never a literal color, so adding a
@@ -99,6 +99,9 @@ pub fn tokens_for(theme: Theme, system_prefers_dark: bool) -> Tokens {
         Theme::Midnight => MIDNIGHT,
         Theme::Aurora => AURORA,
         Theme::HighContrast => HIGH_CONTRAST,
+        Theme::Ember => EMBER,
+        Theme::Grape => GRAPE,
+        Theme::Translucent => TRANSLUCENT,
     }
 }
 
@@ -168,12 +171,60 @@ const HIGH_CONTRAST: Tokens = Tokens {
     danger: Color::rgb(0xFF, 0x52, 0x52),
 };
 
-/// The four concrete (non-`System`) themes, for iteration.
-pub const CONCRETE_THEMES: [Theme; 4] = [
+// Ember / Grape / Translucent keep Midnight's near-black elevation structure and
+// its proven status colors (so they clear the same WCAG bar) and vary only the
+// hue: a warm-black + amber, a cool-black + violet, and a dark blue "glass" the
+// shell renders see-through. Status colors stay Midnight's on purpose — they are
+// validated as *text* against every background layer.
+
+const EMBER: Tokens = Tokens {
+    bg_base: Color::rgb(0x10, 0x0C, 0x0A),
+    bg_surface: Color::rgb(0x19, 0x13, 0x10),
+    bg_elevated: Color::rgb(0x22, 0x1A, 0x15),
+    text_primary: Color::rgb(0xF1, 0xEC, 0xE6),
+    text_secondary: Color::rgb(0xB0, 0xA4, 0x98),
+    border: Color::rgb(0x3A, 0x2E, 0x26),
+    accent: Color::rgb(0xFF, 0x9E, 0x57),
+    success: Color::rgb(0x35, 0xC4, 0x6B),
+    warning: Color::rgb(0xE0, 0xA9, 0x3B),
+    danger: Color::rgb(0xF0, 0x6A, 0x6A),
+};
+
+const GRAPE: Tokens = Tokens {
+    bg_base: Color::rgb(0x0D, 0x0B, 0x12),
+    bg_surface: Color::rgb(0x15, 0x12, 0x21),
+    bg_elevated: Color::rgb(0x1E, 0x19, 0x30),
+    text_primary: Color::rgb(0xEC, 0xE8, 0xF2),
+    text_secondary: Color::rgb(0xA6, 0x9F, 0xB4),
+    border: Color::rgb(0x32, 0x2A, 0x44),
+    accent: Color::rgb(0xB9, 0x8C, 0xFF),
+    success: Color::rgb(0x35, 0xC4, 0x6B),
+    warning: Color::rgb(0xE0, 0xA9, 0x3B),
+    danger: Color::rgb(0xF0, 0x6A, 0x6A),
+};
+
+const TRANSLUCENT: Tokens = Tokens {
+    bg_base: Color::rgb(0x0C, 0x0E, 0x14),
+    bg_surface: Color::rgb(0x14, 0x18, 0x26),
+    bg_elevated: Color::rgb(0x1C, 0x22, 0x33),
+    text_primary: Color::rgb(0xEC, 0xEF, 0xF4),
+    text_secondary: Color::rgb(0x9B, 0xA4, 0xB4),
+    border: Color::rgb(0x2A, 0x33, 0x46),
+    accent: Color::rgb(0x6E, 0xA8, 0xFF),
+    success: Color::rgb(0x35, 0xC4, 0x6B),
+    warning: Color::rgb(0xE0, 0xA9, 0x3B),
+    danger: Color::rgb(0xF0, 0x6A, 0x6A),
+};
+
+/// The concrete (non-`System`) themes, for iteration.
+pub const CONCRETE_THEMES: [Theme; 7] = [
     Theme::Daylight,
     Theme::Midnight,
     Theme::Aurora,
     Theme::HighContrast,
+    Theme::Ember,
+    Theme::Grape,
+    Theme::Translucent,
 ];
 
 // --- WCAG contrast ---------------------------------------------------------
