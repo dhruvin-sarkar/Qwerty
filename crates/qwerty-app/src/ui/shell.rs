@@ -637,9 +637,9 @@ impl QwertyApp {
         // they clear WCAG AA. Danger *text* on a danger-tinted fill did not
         // (4.05:1 in Daylight); every color used here is a pairing the theme
         // contrast tests already cover (text on a layer; danger on bg_elevated).
-        egui::Frame::default()
+        let inner = egui::Frame::default()
             .fill(pal.elevated)
-            .stroke(egui::Stroke::new(1.5_f32, pal.danger))
+            .stroke(egui::Stroke::new(1.0_f32, pal.danger))
             .inner_margin(style::margin(space::MD))
             .corner_radius(style::rounding(radius::MD))
             .show(ui, |ui| {
@@ -652,12 +652,24 @@ impl QwertyApp {
                     );
                     ui.label(egui::RichText::new(&msg).color(pal.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Dismiss").clicked() {
+                        if ui
+                            .button(egui::RichText::new("✕").color(pal.secondary))
+                            .on_hover_text("Dismiss")
+                            .clicked()
+                        {
                             self.save_error = None;
                         }
                     });
                 });
             });
+        // A 4px danger accent bar down the banner's left edge (Part 8) — a
+        // stronger "this is an error" cue than the thin all-round border alone.
+        let r = inner.response.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 4.0, r.max.y)),
+            style::rounding(radius::MD),
+            pal.danger,
+        );
         ui.add_space(space::MD);
     }
 
