@@ -286,21 +286,30 @@ impl QwertyApp {
                 } => {
                     if is_transient {
                         self.live.taps += 1;
-                        // Classify the tap read-only to light the zone it landed
-                        // on (accept pulse) or shake the nearest one (reject).
-                        // Visual only — no action is dispatched from here.
-                        if let Some(profile) = self.state.active_profile.as_ref() {
-                            if window.len() == FEATURE_WINDOW_SAMPLES {
-                                let fv = self.home_extractor.extract(&window);
-                                let c = profile.classifier.classify(&fv);
-                                if let Some(zone_id) = c.zone_id {
-                                    let dur = if c.accepted {
-                                        motion::QUICK
-                                    } else {
-                                        motion::INSTANT
-                                    };
-                                    self.zone_anim
-                                        .insert(zone_id, (AnimState::start(dur), c.accepted));
+                        // Drive the zone-tile pulse only while Home is the active
+                        // screen: the tiles (and their pulse) are painted nowhere
+                        // else, so classifying a tap and scheduling a 16 ms repaint
+                        // off-Home would animate something invisible — burning
+                        // frames against PERFORMANCE.md's redraw discipline. The
+                        // tap tally above still updates on every screen, so the
+                        // Home counters remain correct when the user returns.
+                        if self.state.screen == Screen::Home {
+                            // Classify the tap read-only to light the zone it
+                            // landed on (accept pulse) or shake the nearest one
+                            // (reject). Visual only — no action is dispatched here.
+                            if let Some(profile) = self.state.active_profile.as_ref() {
+                                if window.len() == FEATURE_WINDOW_SAMPLES {
+                                    let fv = self.home_extractor.extract(&window);
+                                    let c = profile.classifier.classify(&fv);
+                                    if let Some(zone_id) = c.zone_id {
+                                        let dur = if c.accepted {
+                                            motion::QUICK
+                                        } else {
+                                            motion::INSTANT
+                                        };
+                                        self.zone_anim
+                                            .insert(zone_id, (AnimState::start(dur), c.accepted));
+                                    }
                                 }
                             }
                         }
