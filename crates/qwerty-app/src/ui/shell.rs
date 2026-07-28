@@ -1179,15 +1179,15 @@ impl QwertyApp {
             ui.horizontal_wrapped(|ui| {
                 for (theme, name) in THEME_CHOICES {
                     let selected = self.state.config.theme == theme;
-                    let text = egui::RichText::new(name)
-                        .color(if selected { pal.accent } else { pal.text });
-                    if ui.selectable_label(selected, text).clicked()
+                    let tokens = tokens_for(theme, self.state.system_dark);
+                    if theme_swatch(ui, pal, name, &tokens, selected)
                         && self.state.begin_theme_switch(theme, now)
                     {
                         if let Err(e) = self.state.save_config() {
                             self.save_error = Some(e);
                         }
                     }
+                    ui.add_space(space::SM);
                 }
             });
             ui.add_space(space::SM);
@@ -1529,6 +1529,57 @@ fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
     // Peak needle.
     let x = r.min.x + r.width() * peak_frac;
     painter.vline(x, r.y_range(), egui::Stroke::new(2.0_f32, with_alpha(pal.text, 200)));
+}
+
+/// A theme picker swatch (Part 7): the theme's own surface as the fill, an
+/// accent stripe along the bottom, a text-contrast dot, and its name beneath —
+/// a design-tool color chip rather than a dropdown row. Selected gets an accent
+/// border; hover adds a faint accent tint; keyboard focus draws a ring. Returns
+/// whether it was clicked.
+fn theme_swatch(ui: &mut egui::Ui, pal: &Palette, name: &str, tokens: &Tokens, selected: bool) -> bool {
+    ui.vertical(|ui| {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(80.0, 56.0), egui::Sense::click());
+        let hover = ui
+            .ctx()
+            .animate_bool_with_time(resp.id, resp.hovered(), motion::INSTANT.as_secs_f32());
+        let round = style::rounding(radius::SM);
+        let painter = ui.painter();
+        painter.rect_filled(rect, round, c32(tokens.bg_surface));
+        if hover > 0.01 {
+            painter.rect_filled(rect, round, with_alpha(c32(tokens.accent), (hover * 32.0) as u8));
+        }
+        // Accent stripe across the bottom.
+        let stripe = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 8.0), rect.max);
+        painter.rect_filled(stripe, round, c32(tokens.accent));
+        // Text-contrast dot, center-top.
+        painter.circle_filled(
+            egui::pos2(rect.center().x, rect.min.y + 14.0),
+            4.0,
+            c32(tokens.text_primary),
+        );
+        let (bw, bc) = if selected {
+            (2.0_f32, pal.accent)
+        } else {
+            (1.0_f32, pal.border)
+        };
+        painter.rect_stroke(rect, round, egui::Stroke::new(bw, bc), egui::StrokeKind::Inside);
+        if resp.has_focus() {
+            painter.rect_stroke(
+                rect.expand(2.0),
+                round,
+                egui::Stroke::new(2.0_f32, pal.accent),
+                egui::StrokeKind::Outside,
+            );
+        }
+        ui.add_space(space::XXS);
+        ui.label(
+            egui::RichText::new(name)
+                .size(text::CAPTION)
+                .color(if selected { pal.text } else { pal.secondary }),
+        );
+        resp.clicked()
+    })
+    .inner
 }
 
 /// A compact counter pill (the small sibling of `status_pill`) for the
