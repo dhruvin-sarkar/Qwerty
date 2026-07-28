@@ -128,17 +128,12 @@ fn bezier_axis_derivative(s: f32, c1: f32, c2: f32) -> f32 {
 /// holds an `Option<AnimState>`, replaces it with `Some(AnimState::start(dur))`
 /// to trigger, reads `t()`/`linear()` each frame, and the shell's repaint
 /// scheduler keeps requesting frames until `is_complete()`.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct AnimState {
     started_at: std::time::Instant,
     duration: std::time::Duration,
 }
 
-// Consumed by the zone-accept pulse and wizard choreography (Parts 2+ of the
-// UI elevation); carries `#[allow(dead_code)]` until those call sites land, the
-// same way this module reserves the not-yet-used motion tokens.
-#[allow(dead_code)]
 impl AnimState {
     pub fn start(duration: std::time::Duration) -> Self {
         Self {

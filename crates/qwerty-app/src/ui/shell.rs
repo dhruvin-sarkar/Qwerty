@@ -8,10 +8,14 @@
 //! scheduled only while an animation (currently the theme cross-fade) is
 //! in flight, so a static screen costs no frames.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use qwerty_core::profile::{DeviceFingerprint, Theme, ZoneId};
+use qwerty_core::features::{FeatureExtractor, FEATURE_WINDOW_SAMPLES};
+use qwerty_core::profile::{DeviceFingerprint, Theme, Zone, ZoneId};
+
+use crate::ui::motion::AnimState;
 
 use crate::app_state::{AppState, ListeningState, ProfileSummary, Screen};
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
@@ -35,6 +39,10 @@ struct LiveStatus {
     sample_rate: Option<u32>,
     rms: f32,
     peak: f32,
+    /// A slowly-decaying peak, so the level meter's peak needle holds briefly at
+    /// a transient's crest and eases down rather than snapping — the behaviour of
+    /// a real audio input meter.
+    peak_hold: f32,
     taps: u32,
     rejects: u32,
     error: Option<String>,
@@ -123,6 +131,15 @@ struct QwertyApp {
     last_screen: Screen,
     /// When the current screen-transition fade began; `None` once it has settled.
     screen_fade_start: Option<Instant>,
+    /// Per-zone accept/reject pulse animations, keyed by `ZoneId`. Inserted (or
+    /// replaced) each time a Home tap classifies to a zone; the value is the
+    /// animation plus whether the tap was accepted (drives accept-glow vs.
+    /// reject-shake). Completed entries are pruned by the repaint scheduler.
+    zone_anim: HashMap<ZoneId, (AnimState, bool)>,
+    /// A feature extractor for classifying Home taps *read-only*, purely to
+    /// drive the zone-accept pulse — no action is dispatched here (that stays in
+    /// the platform layer). Mirrors how Diagnostics/Evaluation classify.
+    home_extractor: FeatureExtractor,
 }
 
 impl QwertyApp {
@@ -219,6 +236,8 @@ impl QwertyApp {
             confirm_delete: false,
             last_screen: Screen::Home,
             screen_fade_start: None,
+            zone_anim: HashMap::new(),
+            home_extractor: FeatureExtractor::new(),
         }
     }
 
@@ -256,10 +275,35 @@ impl QwertyApp {
                 CaptureEvent::Level { rms, peak } => {
                     self.live.rms = rms;
                     self.live.peak = peak;
+                    // Peak-hold: snap up to the crest, otherwise ease down at
+                    // ~0.5/sec (Level arrives ~20 Hz → ~0.025 per sample).
+                    self.live.peak_hold = (self.live.peak_hold - 0.025).max(peak);
                 }
-                CaptureEvent::Onset { is_transient, .. } => {
+                CaptureEvent::Onset {
+                    window,
+                    is_transient,
+                    ..
+                } => {
                     if is_transient {
                         self.live.taps += 1;
+                        // Classify the tap read-only to light the zone it landed
+                        // on (accept pulse) or shake the nearest one (reject).
+                        // Visual only — no action is dispatched from here.
+                        if let Some(profile) = self.state.active_profile.as_ref() {
+                            if window.len() == FEATURE_WINDOW_SAMPLES {
+                                let fv = self.home_extractor.extract(&window);
+                                let c = profile.classifier.classify(&fv);
+                                if let Some(zone_id) = c.zone_id {
+                                    let dur = if c.accepted {
+                                        motion::QUICK
+                                    } else {
+                                        motion::INSTANT
+                                    };
+                                    self.zone_anim
+                                        .insert(zone_id, (AnimState::start(dur), c.accepted));
+                                }
+                            }
+                        }
                     } else {
                         self.live.rejects += 1;
                     }
@@ -517,6 +561,15 @@ impl eframe::App for QwertyApp {
                 }
             });
 
+        // Keep frames coming while any zone pulse is mid-flight, then drop the
+        // completed ones so an idle Home schedules no repaints (`PERFORMANCE.md`
+        // redraw discipline). Each pulse was already painted this frame at its
+        // current `t`; pruning here means the next frame paints it settled.
+        self.zone_anim.retain(|_, (anim, _)| !anim.is_complete());
+        if !self.zone_anim.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         // Launch the wizard at end of frame (set by a Calibrate button), after
         // the render borrow of `self` is released.
         if self.launch_wizard {
@@ -650,32 +703,21 @@ impl QwertyApp {
 
     fn home(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         screen_header(ui, pal, "Home", "Listening status and quick controls");
-        if let Some(profile) = &self.state.active_profile {
-            ui.label(
-                egui::RichText::new(format!(
-                    "Active profile: {}  ·  {} zone{}",
-                    profile.name,
-                    profile.zones.len(),
-                    if profile.zones.len() == 1 { "" } else { "s" },
-                ))
-                .color(pal.text),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new("Calibrate a profile to map taps on your desk to actions.")
-                    .color(pal.secondary),
-            );
+
+        // Empty state when there's no calibrated profile yet (Part 6).
+        if self.state.active_profile.is_none() {
+            if empty_state(
+                ui,
+                pal,
+                "🎯",
+                "Nothing mapped yet",
+                "Calibrate your desk to map tap zones to actions.",
+                "Calibrate now →",
+            ) {
+                self.launch_wizard = true;
+            }
+            return;
         }
-        ui.add_space(space::MD);
-        let calibrate_label = if self.state.active_profile.is_some() {
-            "Recalibrate / new profile"
-        } else {
-            "Calibrate a new profile"
-        };
-        if primary_button(ui, pal, calibrate_label).clicked() {
-            self.launch_wizard = true;
-        }
-        ui.add_space(space::XL);
 
         // Status card.
         card(ui, pal, |ui| {
@@ -706,31 +748,34 @@ impl QwertyApp {
 
             match self.state.listening {
                 ListeningState::Listening => {
-                    ui.add_space(space::MD);
-                    ui.separator();
-                    ui.add_space(space::SM);
+                    ui.add_space(space::XS);
+                    divider(ui, pal);
                     let mic = self.live.device.as_deref().unwrap_or("opening microphone…");
                     ui.label(
                         egui::RichText::new(format!("Mic: {mic}"))
                             .color(pal.secondary)
                             .size(text::CAPTION),
                     );
-                    ui.add_space(space::XS);
-                    // Peak level, sqrt-shaped so quiet signals are still visible.
-                    let frac = self.live.peak.clamp(0.0, 1.0).sqrt();
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .desired_width(260.0)
-                            .text(format!("input {:.0}%", frac * 100.0)),
-                    );
-                    ui.add_space(space::XS);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "taps {}   ·   rejected {}",
-                            self.live.taps, self.live.rejects
-                        ))
-                        .color(pal.text),
-                    );
+                    ui.add_space(space::SM);
+                    level_meter(ui, pal, &self.live);
+                    ui.add_space(space::SM);
+                    ui.horizontal(|ui| {
+                        mini_pill(
+                            ui,
+                            pal,
+                            "●",
+                            &format!("{} accepted", self.live.taps),
+                            pal.success,
+                        );
+                        ui.add_space(space::SM);
+                        mini_pill(
+                            ui,
+                            pal,
+                            "○",
+                            &format!("{} ignored", self.live.rejects),
+                            pal.secondary,
+                        );
+                    });
 
                     // Device-change check: a tap's acoustic signature is
                     // mic-specific, so a classifier fitted on one device is not
@@ -763,9 +808,26 @@ impl QwertyApp {
                     let msg = self.live.error.as_deref().unwrap_or("audio device error");
                     ui.label(egui::RichText::new(format!("⚠ {msg}")).color(pal.danger));
                 }
-                ListeningState::Paused => {}
+                ListeningState::Paused => {
+                    ui.add_space(space::SM);
+                    ui.label(
+                        egui::RichText::new("Paused — start listening to light up a tap.")
+                            .color(pal.secondary)
+                            .size(text::CAPTION),
+                    );
+                }
             }
         });
+
+        // The desk: calibrated zones as a tile grid that pulses on each tap.
+        ui.add_space(space::LG);
+        if let Some(profile) = self.state.active_profile.as_ref() {
+            zone_tiles(ui, pal, &profile.zones, &self.zone_anim);
+        }
+        ui.add_space(space::MD);
+        if primary_button(ui, pal, "Recalibrate / new profile").clicked() {
+            self.launch_wizard = true;
+        }
 
         // Nudge toward binding actions: a freshly calibrated profile has zones
         // but no actions, so those zones detect taps yet do nothing until bound.
@@ -1362,6 +1424,203 @@ pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui:
             color: egui::Color32::from_black_alpha(22),
         })
         .show(ui, add);
+}
+
+/// `color` with an explicit alpha byte, for painted glows/needles/tints.
+fn with_alpha(c: egui::Color32, a: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// A custom-painted 1px horizontal rule with breathing room, replacing
+/// `ui.separator()` (Part 8) — a calm divider rather than egui's default line.
+fn divider(ui: &mut egui::Ui, pal: &Palette) {
+    ui.add_space(space::SM);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0_f32, pal.border));
+    ui.add_space(space::SM);
+}
+
+/// A centered empty-state column: a large quiet glyph, a title, one line of
+/// context, and a primary call-to-action (Part 6). Returns whether the CTA was
+/// clicked so the caller can route the fix.
+fn empty_state(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    glyph: &str,
+    title: &str,
+    body: &str,
+    cta: &str,
+) -> bool {
+    ui.add_space(space::XXL);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(glyph).size(64.0).color(pal.border));
+        ui.add_space(space::MD);
+        ui.label(
+            egui::RichText::new(title)
+                .size(text::HEADING)
+                .color(pal.text)
+                .strong(),
+        );
+        ui.add_space(space::XS);
+        ui.label(
+            egui::RichText::new(body)
+                .size(text::BODY)
+                .color(pal.secondary),
+        );
+        ui.add_space(space::LG);
+        primary_button(ui, pal, cta).clicked()
+    })
+    .inner
+}
+
+/// A custom input-level meter (Part 3): a background track, an RMS fill, a soft
+/// clip-warning zone when hot, and a decaying peak needle. Reads like an audio
+/// app's input meter, not a loading bar — no text is overlaid on it.
+fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
+    let (resp, painter) = ui.allocate_painter(
+        egui::vec2(ui.available_width().min(420.0), 20.0),
+        egui::Sense::hover(),
+    );
+    let r = resp.rect;
+    let round = style::rounding(2.0);
+    painter.rect_filled(r, round, pal.surface);
+
+    // RMS fill (sqrt-shaped so quiet input stays visible).
+    let rms_frac = live.rms.clamp(0.0, 1.0).sqrt();
+    if rms_frac > 0.0 {
+        let fill =
+            egui::Rect::from_min_size(r.min, egui::vec2(r.width() * rms_frac, r.height()));
+        painter.rect_filled(fill, round, mix(pal.accent, pal.base, 0.15));
+    }
+
+    let peak_frac = live.peak_hold.clamp(0.0, 1.0).sqrt();
+    // Soft clip-warning zone (rightmost 7%) — a warning, not a hard color flip.
+    if peak_frac > 0.93 {
+        let warn =
+            egui::Rect::from_min_max(egui::pos2(r.min.x + r.width() * 0.93, r.min.y), r.max);
+        painter.rect_filled(warn, round, with_alpha(pal.danger, 60));
+    }
+    // Peak needle.
+    let x = r.min.x + r.width() * peak_frac;
+    painter.vline(x, r.y_range(), egui::Stroke::new(2.0_f32, with_alpha(pal.text, 200)));
+}
+
+/// A compact counter pill (the small sibling of `status_pill`) for the
+/// accepted/ignored tap tallies (Part 3).
+fn mini_pill(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, color: egui::Color32) {
+    egui::Frame::default()
+        .fill(mix(pal.surface, color, 0.14))
+        .stroke(egui::Stroke::new(1.0_f32, mix(pal.surface, color, 0.4)))
+        .corner_radius(style::rounding(radius::MD))
+        .inner_margin(egui::Margin::symmetric(space::SM as i8, space::XXS as i8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                ui.label(egui::RichText::new(glyph).color(color).size(text::CAPTION));
+                ui.label(egui::RichText::new(label).color(pal.text).size(text::CAPTION));
+            });
+        });
+}
+
+/// The calibrated zones as a grid of tiles (Parts 2 + 3). Each tile shows its
+/// label + action count; on a classified tap it pulses — an accepted tap scales
+/// up 6% with a fading accent glow ring and a fill flash (`EMPHASIZED_EASE`), a
+/// rejected tap shakes horizontally with a danger-tint flash. Only the *painted*
+/// rect animates; the allocated layout is fixed, so the grid never reflows.
+fn zone_tiles(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    zones: &[Zone],
+    zone_anim: &HashMap<ZoneId, (AnimState, bool)>,
+) {
+    if zones.is_empty() {
+        return;
+    }
+    let cols = match zones.len() {
+        0..=4 => 2,
+        5..=6 => 3,
+        _ => 4,
+    };
+    let rows = zones.len().div_ceil(cols);
+    let gap = space::MD;
+    let avail_w = ui.available_width().min(560.0);
+    let tile_w = (avail_w - gap * (cols as f32 - 1.0)) / cols as f32;
+    let tile_h = tile_w * 0.6;
+    let total_h = tile_h * rows as f32 + gap * (rows as f32 - 1.0).max(0.0);
+    let (resp, painter) =
+        ui.allocate_painter(egui::vec2(avail_w, total_h), egui::Sense::hover());
+    let origin = resp.rect.min;
+    let round = style::rounding(radius::MD);
+
+    for (i, zone) in zones.iter().enumerate() {
+        let (c, row) = (i % cols, i / cols);
+        let base = egui::Rect::from_min_size(
+            egui::pos2(
+                origin.x + c as f32 * (tile_w + gap),
+                origin.y + row as f32 * (tile_h + gap),
+            ),
+            egui::vec2(tile_w, tile_h),
+        );
+
+        // Derive the animated properties from this zone's pulse, if any.
+        let (scale, glow, flash, shake, accept) = match zone_anim.get(&zone.id) {
+            Some((anim, true)) => {
+                // Accept: a 0→1→0 arc so scale/flash rise then settle.
+                let arc = (anim.t(motion::EMPHASIZED_EASE) * std::f32::consts::PI).sin();
+                (1.0 + 0.06 * arc, (1.0 - anim.linear()) * 0.7, 0.10 * arc, 0.0, true)
+            }
+            Some((anim, false)) => {
+                // Reject: quick decaying horizontal shake + danger flash.
+                let lin = anim.linear();
+                let shake = 3.0 * (lin * 4.0 * std::f32::consts::PI).sin() * (1.0 - lin);
+                (1.0, 0.0, 0.10 * (1.0 - lin), shake, false)
+            }
+            None => (1.0, 0.0, 0.0, 0.0, true),
+        };
+
+        let rect = egui::Rect::from_center_size(
+            base.center() + egui::vec2(shake, 0.0),
+            base.size() * scale,
+        );
+        let flash_color = if accept { pal.accent } else { pal.danger };
+        painter.rect_filled(rect, round, mix(pal.elevated, flash_color, flash));
+        painter.rect_stroke(
+            rect,
+            round,
+            egui::Stroke::new(1.0_f32, pal.border),
+            egui::StrokeKind::Inside,
+        );
+        if glow > 0.001 {
+            painter.rect_stroke(
+                rect.expand(3.0),
+                round,
+                egui::Stroke::new(2.0_f32, with_alpha(pal.accent, (glow * 255.0) as u8)),
+                egui::StrokeKind::Outside,
+            );
+        }
+        painter.text(
+            egui::pos2(rect.center().x, rect.center().y - 9.0),
+            egui::Align2::CENTER_CENTER,
+            &zone.label,
+            egui::FontId::proportional(text::BODY),
+            pal.text,
+        );
+        let n = zone.actions.len();
+        let sub = if n == 0 {
+            "no action".to_string()
+        } else {
+            format!("{n} action{}", if n == 1 { "" } else { "s" })
+        };
+        painter.text(
+            egui::pos2(rect.center().x, rect.center().y + 11.0),
+            egui::Align2::CENTER_CENTER,
+            sub,
+            egui::FontId::proportional(text::CAPTION),
+            pal.secondary,
+        );
+    }
 }
 
 /// A filled-accent primary button — the one unmistakable call to action on a
