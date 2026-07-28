@@ -1439,13 +1439,16 @@ pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui:
 }
 
 /// `color` with an explicit alpha byte, for painted glows/needles/tints.
-fn with_alpha(c: egui::Color32, a: u8) -> egui::Color32 {
+/// `pub(crate)` so the calibration wizard's painted stepper/pips/desk diagram
+/// tint from the same helper rather than re-deriving it.
+pub(crate) fn with_alpha(c: egui::Color32, a: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
 /// A custom-painted 1px horizontal rule with breathing room, replacing
 /// `ui.separator()` (Part 8) — a calm divider rather than egui's default line.
-fn divider(ui: &mut egui::Ui, pal: &Palette) {
+/// `pub(crate)` so the calibration wizard's header rule matches every screen's.
+pub(crate) fn divider(ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(space::SM);
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());

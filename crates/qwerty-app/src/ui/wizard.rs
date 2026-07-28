@@ -22,8 +22,10 @@ use qwerty_core::profile::{
 };
 
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::Palette;
-use crate::ui::style::{space, text};
+use crate::ui::motion::{self, AnimState};
+use crate::ui::shell::{c32, divider, mix, with_alpha, Palette};
+use crate::ui::style::{self, radius, space, text};
+use crate::ui::theme::{on_color, Color};
 
 /// Supported zone counts (`DESIGN.md`: 2, 4, 6, 8).
 const ZONE_COUNTS: [usize; 4] = [2, 4, 6, 8];
@@ -46,21 +48,35 @@ enum Step {
     Save,
 }
 
+/// The steps in flow order — the single source of truth the stepper indicator
+/// and the `index()`/`position()` accessors both derive from, so a step can
+/// never be numbered inconsistently between the two.
+const STEP_ORDER: [Step; 6] = [
+    Step::Environment,
+    Step::Layout,
+    Step::Capture,
+    Step::Consistency,
+    Step::Negatives,
+    Step::Save,
+];
+
 impl Step {
-    /// (index, total) for the step indicator.
-    fn position(self) -> (usize, usize) {
-        let order = [
-            Step::Environment,
-            Step::Layout,
-            Step::Capture,
-            Step::Consistency,
-            Step::Negatives,
-            Step::Save,
-        ];
-        (
-            order.iter().position(|s| *s == self).unwrap() + 1,
-            order.len(),
-        )
+    /// 0-based position in [`STEP_ORDER`], for the painted stepper.
+    fn index(self) -> usize {
+        STEP_ORDER.iter().position(|s| *s == self).unwrap()
+    }
+
+    /// A one- or two-word label for the stepper circle, distinct from the
+    /// step's full sentence `title()` (which is too long under a 32 px circle).
+    fn short_label(self) -> &'static str {
+        match self {
+            Step::Environment => "Room",
+            Step::Layout => "Layout",
+            Step::Capture => "Capture",
+            Step::Consistency => "Check",
+            Step::Negatives => "Ignore",
+            Step::Save => "Save",
+        }
     }
 
     fn title(self) -> &'static str {
@@ -107,6 +123,16 @@ pub struct Wizard {
     profile_name: String,
     save_error: Option<String>,
 
+    // --- Presentation animation (Part 4; visual only, never gates logic) ---
+    /// Fires on every step change: drives the per-step fade-and-rise arrival
+    /// and the current-step ring pulse in the painted stepper.
+    step_anim: AnimState,
+    /// Taps recorded for the current zone as of last frame, so a fresh tap is
+    /// detected (count increased) and its pip's ink-drop fill can be triggered.
+    pip_count: usize,
+    /// The just-landed pip: `(pip index, its fill animation)`. One-shot.
+    pip_fill: Option<(usize, AnimState)>,
+
     /// Whether the main window is visible. While hidden to the tray the wizard
     /// stops its 33 fps repaint and mutes its capture worker (`PERFORMANCE.md`:
     /// no frames behind an invisible window).
@@ -138,8 +164,21 @@ impl Wizard {
             consistency: None,
             profile_name: "My desk".to_string(),
             save_error: None,
+            step_anim: AnimState::start(motion::DELIBERATE),
+            pip_count: 0,
+            pip_fill: None,
             visible: true,
         }
+    }
+
+    /// Move to `step`, restarting the arrival transition and clearing the
+    /// per-tap pip tracking so it re-primes for the new step. The single choke
+    /// point for step changes, so no transition can be forgotten at a call site.
+    fn goto(&mut self, step: Step) {
+        self.step = step;
+        self.step_anim = AnimState::start(motion::DELIBERATE);
+        self.pip_count = 0;
+        self.pip_fill = None;
     }
 
     /// Set whether the main window is visible; forwards to the capture worker so
@@ -159,8 +198,9 @@ impl Wizard {
     pub fn ui(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<WizardOutcome> {
         self.drain_capture();
 
-        // Header: title + step indicator + cancel.
-        let (idx, total) = self.step.position();
+        // Header: the painted stepper carries the position now, so the title
+        // drops the redundant "Step N of M" text and just names the step, with
+        // Cancel parked top-right.
         ui.horizontal(|ui| {
             ui.heading(
                 egui::RichText::new(self.step.title())
@@ -171,41 +211,61 @@ impl Wizard {
                 if ui.button("Cancel").clicked() {
                     self.cancelled = true;
                 }
-                ui.label(
-                    egui::RichText::new(format!("Step {idx} of {total}")).color(pal.secondary),
-                );
             });
         });
+        ui.add_space(space::SM);
+        draw_stepper(ui, pal, self.step, &self.step_anim);
         ui.add_space(space::XS);
         if let Some(err) = &self.capture_error {
             ui.label(egui::RichText::new(format!("⚠ Microphone: {err}")).color(pal.danger));
         }
-        ui.separator();
-        ui.add_space(space::MD);
+        divider(ui, pal);
+        ui.add_space(space::SM);
 
         if self.cancelled {
             return Some(WizardOutcome::Cancelled);
         }
 
-        let outcome = match self.step {
-            Step::Environment => self.environment_step(ui, pal),
-            Step::Layout => self.layout_step(ui, pal),
-            Step::Capture => self.capture_step(ui, pal),
-            Step::Consistency => self.consistency_step(ui, pal),
-            Step::Negatives => self.negatives_step(ui, pal),
-            Step::Save => self.save_step(ui, pal),
-        };
+        // Per-step arrival transition: the body fades up from 25% opacity while
+        // rising a few pixels into place (STANDARD_EASE over DELIBERATE). Only
+        // the *painted* content moves — the allocated layout is unchanged once
+        // settled, so nothing below reflows. Fire-and-forget via `step_anim`.
+        let tp = self.step_anim.t(motion::STANDARD_EASE);
+        let outcome = ui
+            .scope(|ui| {
+                ui.multiply_opacity(0.25 + 0.75 * tp);
+                ui.add_space((1.0 - tp) * 10.0);
+                match self.step {
+                    Step::Environment => self.environment_step(ui, pal),
+                    Step::Layout => self.layout_step(ui, pal),
+                    Step::Capture => self.capture_step(ui, pal),
+                    Step::Consistency => self.consistency_step(ui, pal),
+                    Step::Negatives => self.negatives_step(ui, pal),
+                    Step::Save => self.save_step(ui, pal),
+                }
+            })
+            .inner;
 
-        // Keep the meter/level live while a mic step is on screen — but not while
-        // hidden to the tray (no frames behind an invisible window).
-        if self.visible
-            && matches!(
+        // Repaint discipline (PERFORMANCE.md): pump frames only while something
+        // is actually live, and never behind a window hidden to the tray.
+        //  - a mic step needs the meter/level refreshed at ~33 fps;
+        //  - the step-arrival transition and the pip ink-drop are one-shots that
+        //    must animate to completion, after which repaints stop and idle CPU
+        //    returns to zero.
+        if self.visible {
+            let mic_live = matches!(
                 self.step,
                 Step::Environment | Step::Capture | Step::Negatives
-            )
-        {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(33));
+            );
+            let anim_live = !self.step_anim.is_complete()
+                || self.pip_fill.as_ref().is_some_and(|(_, a)| !a.is_complete());
+            if mic_live {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(33));
+            } else if anim_live {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
         }
         outcome
     }
@@ -306,7 +366,7 @@ impl Wizard {
             .clicked()
         {
             self.noise_floor = floor;
-            self.step = Step::Layout;
+            self.goto(Step::Layout);
         }
         None
     }
@@ -357,20 +417,40 @@ impl Wizard {
             ));
             self.armed = false;
             self.last_feedback = None;
-            self.step = Step::Capture;
+            self.goto(Step::Capture);
         }
         None
     }
 
     fn capture_step(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<WizardOutcome> {
-        let Some(session) = &self.session else {
-            return None;
+        // Pull everything this frame needs out of the session in one borrow, so
+        // the immutable borrow ends before the pip-tracking self-mutation below
+        // (and before the Arm/Undo/Redo handlers re-borrow `&mut self.session`).
+        let (zone, count, target, total_zones, complete) = {
+            let Some(session) = &self.session else {
+                return None;
+            };
+            let zone = session.current_zone();
+            (
+                zone,
+                session.zone_sample_count(zone),
+                session.taps_per_zone(),
+                session.zone_ids().len(),
+                session.current_zone_complete(),
+            )
         };
-        let zone = session.current_zone();
-        let count = session.zone_sample_count(zone);
-        let target = session.taps_per_zone();
-        let total_zones = session.zone_ids().len();
+        let is_last = zone + 1 >= total_zones;
         let label = self.labels.get(zone).cloned().unwrap_or_default();
+
+        // A freshly-recorded tap (count grew since last frame) triggers that
+        // pip's ink-drop fill; an undo (count shrank) or a zone change just
+        // re-syncs the counter without animating.
+        if count > self.pip_count {
+            self.pip_fill = Some((count - 1, AnimState::start(motion::QUICK)));
+        } else if count < self.pip_count {
+            self.pip_fill = None;
+        }
+        self.pip_count = count;
 
         ui.label(
             egui::RichText::new(format!(
@@ -381,19 +461,23 @@ impl Wizard {
         );
         ui.add_space(space::MD);
 
-        // Progress pips (color + shape, never color alone).
-        ui.horizontal(|ui| {
-            for i in 0..target {
-                let (glyph, color) = if i < count {
-                    ("●", pal.success)
-                } else {
-                    ("○", pal.secondary)
-                };
-                ui.label(egui::RichText::new(glyph).color(color).size(20.0));
-            }
-            ui.add_space(space::SM);
-            ui.label(egui::RichText::new(format!("{count}/{target}")).color(pal.secondary));
-        });
+        // Progress pips: custom-painted circles (Part 4). Filled for recorded
+        // taps, the just-landed one blooming an ink-drop ring, the next one
+        // ringed in accent, the rest hollow — shape + fill carry state, never
+        // colour alone (DESIGN.md accessibility rule).
+        draw_tap_pips(
+            ui,
+            pal,
+            count,
+            target,
+            self.pip_fill.as_ref().map(|(i, a)| (*i, a)),
+        );
+        ui.add_space(space::XS);
+        ui.label(
+            egui::RichText::new(format!("{count} of {target} taps"))
+                .color(pal.secondary)
+                .size(text::CAPTION),
+        );
         ui.add_space(space::SM);
 
         // Last-tap feedback: specific reason, never generic.
@@ -413,8 +497,6 @@ impl Wizard {
         }
         ui.add_space(space::MD);
 
-        let complete = session.current_zone_complete();
-        let is_last = zone + 1 >= total_zones;
         ui.horizontal(|ui| {
             let arm_label = if self.armed { "Stop" } else { "Arm zone" };
             if ui
@@ -464,7 +546,7 @@ impl Wizard {
                     .consistency()
                     .map_err(|e| e.to_string()),
             );
-            self.step = Step::Consistency;
+            self.goto(Step::Consistency);
         }
         None
     }
@@ -518,9 +600,9 @@ impl Wizard {
                     }
                     self.armed = false;
                     self.last_feedback = None;
-                    self.step = Step::Capture;
+                    self.goto(Step::Capture);
                 } else if cont {
-                    self.step = Step::Negatives;
+                    self.goto(Step::Negatives);
                 }
             }
             Some(Err(e)) => {
@@ -528,7 +610,7 @@ impl Wizard {
                     egui::RichText::new(format!("Consistency check failed: {e}")).color(pal.danger),
                 );
                 if ui.button("Back to capture").clicked() {
-                    self.step = Step::Capture;
+                    self.goto(Step::Capture);
                 }
             }
             None => {
@@ -561,7 +643,7 @@ impl Wizard {
         ui.add_space(space::LG);
         if ui.button("Next: save").clicked() {
             self.neg_armed = false;
-            self.step = Step::Save;
+            self.goto(Step::Save);
         }
         None
     }
@@ -676,14 +758,166 @@ fn auto_layouts(n: usize) -> Vec<ZoneLayout> {
         .collect()
 }
 
-/// Draw a simple top-down desk diagram: the normalized zone rectangles filled
-/// in the elevated color with their labels, and a laptop marker in the center.
-fn draw_desk_diagram(ui: &mut egui::Ui, pal: &Palette, layouts: &[ZoneLayout], labels: &[String]) {
-    let size = egui::vec2(ui.available_width().min(460.0), 200.0);
-    let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
-    let area = resp.rect;
-    painter.rect_filled(area, egui::CornerRadius::same(8), pal.surface);
+/// A WCAG-picked contrasting ink for text drawn on the accent fill — the same
+/// helper the primary button uses, so the laptop/stepper labels stay legible on
+/// every theme's accent (yellow High-Contrast, teal Aurora) rather than
+/// assuming a fixed light-on-dark.
+fn ink_on_accent(pal: &Palette) -> egui::Color32 {
+    c32(on_color(Color::rgb(pal.accent.r(), pal.accent.g(), pal.accent.b())))
+}
 
+/// The step-progress indicator (Part 4): a horizontal row of circles joined by
+/// connector segments. Completed steps are filled with a check; the current
+/// step is filled with its number and, on arrival, a one-shot ring that pulses
+/// outward then rests (driven by `step_anim`, so it plays on entry and stops —
+/// no perpetual repaint, honouring PERFORMANCE.md); upcoming steps are hollow.
+/// Each circle is labelled beneath. Replaces the old "Step N of M" text.
+fn draw_stepper(ui: &mut egui::Ui, pal: &Palette, current: Step, step_anim: &AnimState) {
+    let n = STEP_ORDER.len();
+    let cur = current.index();
+    let r = 13.0_f32;
+    let height = r * 2.0 + 22.0;
+    let (resp, painter) = ui.allocate_painter(
+        egui::vec2(ui.available_width().min(560.0), height),
+        egui::Sense::hover(),
+    );
+    let area = resp.rect;
+    let cy = area.min.y + r + 2.0;
+    let x0 = area.min.x + r;
+    let x1 = area.max.x - r;
+    let step_x = if n > 1 { (x1 - x0) / (n - 1) as f32 } else { 0.0 };
+    let cx = |i: usize| x0 + step_x * i as f32;
+
+    // Connector segments behind the circles: accent up to the current step,
+    // border beyond it.
+    for i in 0..n.saturating_sub(1) {
+        let col = if i < cur { pal.accent } else { pal.border };
+        painter.line_segment(
+            [egui::pos2(cx(i) + r, cy), egui::pos2(cx(i + 1) - r, cy)],
+            egui::Stroke::new(2.0_f32, col),
+        );
+    }
+
+    let pulse = 1.0 - step_anim.linear(); // 1 → 0 over the arrival transition
+    for (i, step) in STEP_ORDER.iter().enumerate() {
+        let center = egui::pos2(cx(i), cy);
+        let done = i < cur;
+        let is_cur = i == cur;
+        if done || is_cur {
+            painter.circle_filled(center, r, pal.accent);
+            let glyph = if done {
+                "✓".to_string()
+            } else {
+                (i + 1).to_string()
+            };
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(14.0),
+                ink_on_accent(pal),
+            );
+            if is_cur && pulse > 0.01 {
+                painter.circle_stroke(
+                    center,
+                    r + pulse * 8.0,
+                    egui::Stroke::new(2.0_f32, with_alpha(pal.accent, (pulse * 180.0) as u8)),
+                );
+            }
+        } else {
+            painter.circle_filled(center, r, pal.surface);
+            painter.circle_stroke(center, r, egui::Stroke::new(1.5_f32, pal.border));
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                egui::FontId::proportional(13.0),
+                pal.secondary,
+            );
+        }
+        painter.text(
+            egui::pos2(cx(i), cy + r + 10.0),
+            egui::Align2::CENTER_CENTER,
+            step.short_label(),
+            egui::FontId::proportional(text::CAPTION),
+            if is_cur { pal.text } else { pal.secondary },
+        );
+    }
+}
+
+/// The per-zone tap pips (Part 4): one custom-painted circle per expected tap.
+/// Recorded taps are filled `success`; the just-landed pip (`fill`) blooms an
+/// expanding, fading ink-drop ring while its fill scales in (one-shot); the
+/// next expected pip is ringed in accent ("here next"); the rest are hollow.
+fn draw_tap_pips(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    count: usize,
+    target: usize,
+    fill: Option<(usize, &AnimState)>,
+) {
+    let r = 9.0_f32;
+    let gap = 14.0_f32;
+    let w = target as f32 * (r * 2.0) + target.saturating_sub(1) as f32 * gap;
+    let (resp, painter) = ui.allocate_painter(
+        egui::vec2(w.max(1.0), r * 2.0 + 12.0),
+        egui::Sense::hover(),
+    );
+    let area = resp.rect;
+    let cy = area.center().y;
+    let cx = |i: usize| area.min.x + r + i as f32 * (r * 2.0 + gap);
+
+    for i in 0..target {
+        let center = egui::pos2(cx(i), cy);
+        let dropping = matches!(fill, Some((idx, _)) if idx == i).then(|| fill.unwrap().1);
+        if i < count {
+            // Filled. During its drop the fill scales in and a ring expands out.
+            let scale = dropping.map_or(1.0, |a| 0.4 + 0.6 * a.t(motion::EMPHASIZED_EASE));
+            painter.circle_filled(center, r * scale, pal.success);
+            if let Some(a) = dropping {
+                let lin = a.linear();
+                painter.circle_stroke(
+                    center,
+                    r + 2.0 + lin * 10.0,
+                    egui::Stroke::new(2.0_f32, with_alpha(pal.success, ((1.0 - lin) * 200.0) as u8)),
+                );
+            }
+        } else if i == count {
+            painter.circle_filled(center, r, mix(pal.surface, pal.accent, 0.12));
+            painter.circle_stroke(center, r, egui::Stroke::new(2.0_f32, pal.accent));
+        } else {
+            painter.circle_filled(center, r, pal.surface);
+            painter.circle_stroke(center, r, egui::Stroke::new(1.5_f32, pal.border));
+        }
+    }
+}
+
+/// A top-down desk diagram (Part 4): a raised desk surface (soft drop shadow +
+/// border) carrying the normalized zone rectangles — each highlighting toward
+/// accent on hover (`animate_bool_with_time`) — with a small two-part laptop
+/// (base slab + raised screen) marking the centre.
+fn draw_desk_diagram(ui: &mut egui::Ui, pal: &Palette, layouts: &[ZoneLayout], labels: &[String]) {
+    let size = egui::vec2(ui.available_width().min(460.0), 210.0);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+    let area = resp.rect.shrink(4.0);
+    let round = style::rounding(radius::MD);
+    let hover_pos = resp.hover_pos();
+
+    // Depth: a soft shadow slab under the surface, then the surface + border.
+    painter.rect_filled(
+        area.translate(egui::vec2(0.0, 3.0)),
+        round,
+        with_alpha(egui::Color32::BLACK, 40),
+    );
+    painter.rect_filled(area, round, pal.surface);
+    painter.rect_stroke(
+        area,
+        round,
+        egui::Stroke::new(1.0_f32, pal.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let tile_round = style::rounding(radius::SM);
     for (i, layout) in layouts.iter().enumerate() {
         let rect = egui::Rect::from_min_size(
             egui::pos2(
@@ -692,26 +926,47 @@ fn draw_desk_diagram(ui: &mut egui::Ui, pal: &Palette, layouts: &[ZoneLayout], l
             ),
             egui::vec2(layout.width * area.width(), layout.height * area.height()),
         )
-        .shrink(4.0);
-        painter.rect_filled(rect, egui::CornerRadius::same(6), pal.elevated);
-        let label = labels.get(i).cloned().unwrap_or_default();
+        .shrink(5.0);
+        let hovered = hover_pos.is_some_and(|p| rect.contains(p));
+        let hl =
+            ui.ctx()
+                .animate_bool_with_time(resp.id.with(i), hovered, motion::INSTANT.as_secs_f32());
+        painter.rect_filled(rect, tile_round, mix(pal.elevated, pal.accent, hl * 0.18));
+        painter.rect_stroke(
+            rect,
+            tile_round,
+            egui::Stroke::new(1.0 + hl, mix(pal.border, pal.accent, hl)),
+            egui::StrokeKind::Inside,
+        );
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            label,
+            labels.get(i).cloned().unwrap_or_default(),
             egui::FontId::proportional(13.0),
             pal.text,
         );
     }
 
-    // Laptop marker across the middle.
-    let laptop = egui::Rect::from_center_size(area.center(), egui::vec2(area.width() * 0.34, 26.0));
-    painter.rect_filled(laptop, egui::CornerRadius::same(4), pal.accent);
+    // Laptop across the middle: a base slab plus a raised screen.
+    let lw = area.width() * 0.34;
+    let base = egui::Rect::from_center_size(area.center() + egui::vec2(0.0, 7.0), egui::vec2(lw, 13.0));
+    let screen = egui::Rect::from_center_size(
+        area.center() - egui::vec2(0.0, 9.0),
+        egui::vec2(lw * 0.9, 17.0),
+    );
+    painter.rect_filled(screen, style::rounding(3.0), mix(pal.accent, pal.base, 0.2));
+    painter.rect_stroke(
+        screen,
+        style::rounding(3.0),
+        egui::Stroke::new(1.0_f32, pal.accent),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(base, style::rounding(3.0), pal.accent);
     painter.text(
-        laptop.center(),
+        base.center(),
         egui::Align2::CENTER_CENTER,
         "laptop",
-        egui::FontId::proportional(12.0),
-        pal.base,
+        egui::FontId::proportional(11.0),
+        ink_on_accent(pal),
     );
 }

@@ -16,11 +16,9 @@ use std::time::Duration;
 //
 // MOTION.md requires the *complete* token set to exist as one vocabulary, up
 // front (ROADMAP.md Phase 3: establish the motion foundation before animated
-// screens). `STANDARD` (theme cross-fade) and `INSTANT`/`QUICK` (navigation
-// hover + selection glide, MOTION.md → Navigation selection) are consumed;
-// `DELIBERATE` remains for the Phase 4 wizard step transition, so it alone
-// still carries `#[allow(dead_code)]` rather than being omitted and re-derived
-// per component.
+// screens). Every token is now consumed: `STANDARD` (theme cross-fade),
+// `INSTANT`/`QUICK` (navigation hover + selection glide, zone-accept pulse),
+// and `DELIBERATE` (the calibration wizard's per-step arrival transition).
 
 /// Tiny state flips: hover, toggle, checkbox.
 pub const INSTANT: Duration = Duration::from_millis(100);
@@ -29,7 +27,6 @@ pub const QUICK: Duration = Duration::from_millis(180);
 /// Screen/step transitions, panel expand/collapse, theme cross-fade.
 pub const STANDARD: Duration = Duration::from_millis(250);
 /// Calibration wizard step transitions — slower on purpose (Phase 4).
-#[allow(dead_code)]
 pub const DELIBERATE: Duration = Duration::from_millis(400);
 
 // --- Easing curves (MOTION.md → easing.*) ----------------------------------
