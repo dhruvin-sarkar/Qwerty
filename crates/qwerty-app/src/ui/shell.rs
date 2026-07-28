@@ -26,6 +26,7 @@ use crate::ui::action_editor::ActionEditor;
 use crate::ui::diagnostics::DiagnosticsScreen;
 use crate::ui::evaluation::EvaluationScreen;
 use crate::ui::motion;
+use crate::ui::paint;
 use crate::ui::style::{self, radius, space, text};
 use crate::ui::theme::{on_color, tokens_for, Color, Tokens};
 use crate::ui::wizard::{Wizard, WizardOutcome};
@@ -1398,13 +1399,25 @@ fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected
         );
     }
     // Leading accent bar grows from the vertical center as the row is selected.
+    // A vertical gradient — full accent at the centre, fading to transparent at
+    // both ends — reads as a soft glowing indicator rather than a hard rect.
     if sel_t > 0.001 {
         let bar_h = height * sel_t;
-        let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x, rect.center().y - bar_h * 0.5),
-            egui::vec2(3.0, bar_h),
+        let (x, w) = (rect.min.x, 3.0);
+        let (mid, half) = (rect.center().y, bar_h * 0.5);
+        let faded = with_alpha(pal.accent, 0);
+        paint::vertical_gradient(
+            painter,
+            egui::Rect::from_min_max(egui::pos2(x, mid - half), egui::pos2(x + w, mid)),
+            faded,
+            pal.accent,
         );
-        painter.rect_filled(bar, style::rounding(radius::SM), pal.accent);
+        paint::vertical_gradient(
+            painter,
+            egui::Rect::from_min_max(egui::pos2(x, mid), egui::pos2(x + w, mid + half)),
+            pal.accent,
+            faded,
+        );
     }
     if resp.has_focus() {
         painter.rect_stroke(
@@ -1496,15 +1509,16 @@ pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui:
         .stroke(egui::Stroke::new(1.0_f32, pal.border))
         .inner_margin(style::margin(space::LG))
         .corner_radius(style::rounding(radius::MD))
-        // A whisper of shadow lifts the card off the base. Kept very light so it
-        // reads as depth, not decoration; on dark themes the border still does
-        // most of the separating (a black shadow barely shows on a near-black
-        // base), which is why this stays subtle rather than theme-aware.
+        // A soft drop shadow lifts the card off the base for real depth (a
+        // larger blur + downward offset than a hairline, so cards read as
+        // stacked planes). On dark themes the border still does most of the
+        // separating — a black shadow barely shows on a near-black base — so
+        // this stays a moderate lift rather than a heavy, theme-aware drop.
         .shadow(egui::Shadow {
-            offset: [0, 1],
-            blur: 7,
+            offset: [0, 4],
+            blur: 16,
             spread: 0,
-            color: egui::Color32::from_black_alpha(22),
+            color: egui::Color32::from_black_alpha(40),
         })
         .show(ui, add);
 }
@@ -1597,12 +1611,24 @@ fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
     let round = style::rounding(radius::XS);
     painter.rect_filled(r, round, pal.surface);
 
-    // RMS fill (sqrt-shaped so quiet input stays visible).
+    // RMS fill: a horizontal gradient the GPU blends across the level — healthy
+    // accent → brighter accent → warning (hot) → danger (clipping). The fill
+    // width is the RMS fraction (sqrt-shaped so quiet input stays visible), but
+    // the gradient is laid out in full-track space and *clipped* to that width,
+    // so the fill's right-edge colour reflects how hot the signal actually is.
+    // Reads like an audio app's meter, not a one-colour loading bar.
     let rms_frac = live.rms.clamp(0.0, 1.0).sqrt();
     if rms_frac > 0.0 {
-        let fill =
-            egui::Rect::from_min_size(r.min, egui::vec2(r.width() * rms_frac, r.height()));
-        painter.rect_filled(fill, round, mix(pal.accent, pal.base, 0.15));
+        let fill = egui::Rect::from_min_size(r.min, egui::vec2(r.width() * rms_frac, r.height()));
+        let bright = mix(pal.accent, egui::Color32::WHITE, 0.28);
+        let stops = [
+            (0.0, pal.accent),
+            (0.6, bright),
+            (0.75, pal.warning),
+            (0.9, pal.warning),
+            (1.0, pal.danger),
+        ];
+        paint::horizontal_gradient(&painter.with_clip_rect(fill), r, &stops);
     }
 
     let peak_frac = live.peak_hold.clamp(0.0, 1.0).sqrt();
@@ -1745,25 +1771,33 @@ fn zone_tiles(
         );
 
         // Derive the animated properties from this zone's pulse, if any.
-        let (scale, glow, flash, shake, accept) = match zone_anim.get(&zone.id) {
+        // `bloom` (0→1→0 arc) drives a soft radial halo behind an accepted tile.
+        let (scale, glow, flash, shake, accept, bloom) = match zone_anim.get(&zone.id) {
             Some((anim, true)) => {
-                // Accept: a 0→1→0 arc so scale/flash rise then settle.
+                // Accept: a 0→1→0 arc so scale/flash/bloom rise then settle.
                 let arc = (anim.t(motion::EMPHASIZED_EASE) * std::f32::consts::PI).sin();
-                (1.0 + 0.06 * arc, (1.0 - anim.linear()) * 0.7, 0.10 * arc, 0.0, true)
+                (1.0 + 0.06 * arc, (1.0 - anim.linear()) * 0.7, 0.10 * arc, 0.0, true, arc)
             }
             Some((anim, false)) => {
                 // Reject: quick decaying horizontal shake + danger flash.
                 let lin = anim.linear();
                 let shake = 3.0 * (lin * 4.0 * std::f32::consts::PI).sin() * (1.0 - lin);
-                (1.0, 0.0, 0.10 * (1.0 - lin), shake, false)
+                (1.0, 0.0, 0.10 * (1.0 - lin), shake, false, 0.0)
             }
-            None => (1.0, 0.0, 0.0, 0.0, true),
+            None => (1.0, 0.0, 0.0, 0.0, true, 0.0),
         };
 
         let rect = egui::Rect::from_center_size(
             base.center() + egui::vec2(shake, 0.0),
             base.size() * scale,
         );
+        // Soft radial halo behind an accepting tile (painted first so the
+        // opaque tile fill masks the core and only the surrounding bloom shows
+        // in the gap between tiles). Layered 3-pass mesh bloom, no shader.
+        if bloom > 0.001 {
+            let radius = rect.size().length() * 0.5 * 1.8;
+            paint::radial_bloom(&painter, rect.center(), radius, pal.accent, bloom * 0.8);
+        }
         let flash_color = if accept { pal.accent } else { pal.danger };
         painter.rect_filled(rect, round, mix(pal.elevated, flash_color, flash));
         painter.rect_stroke(
