@@ -551,6 +551,7 @@ impl eframe::App for QwertyApp {
                 if content_opacity < 1.0 {
                     ui.multiply_opacity(content_opacity);
                 }
+                self.config_error_banner(ui, &pal);
                 self.save_error_banner(ui, &pal);
                 match self.state.screen {
                     Screen::Home => self.home(ui, &pal),
@@ -664,6 +665,56 @@ impl QwertyApp {
             });
         // A 4px danger accent bar down the banner's left edge (Part 8) — a
         // stronger "this is an error" cue than the thin all-round border alone.
+        let r = inner.response.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 4.0, r.max.y)),
+            style::rounding(radius::MD),
+            pal.danger,
+        );
+        ui.add_space(space::MD);
+    }
+
+    /// A persistent banner shown when `config.json` existed but could not be
+    /// loaded (`AppState::config_load_error`). Unlike the save-error banner this
+    /// is *not* dismissible: the app is running on in-memory defaults and is
+    /// deliberately refusing to overwrite the on-disk file, so hiding the notice
+    /// would leave the user believing their settings persist when a save would
+    /// be refused. It surfaces the underlying reason and tells the user how to
+    /// resolve it — the loud half of the fail-fast fix (the silent overwrite is
+    /// prevented in `AppState::save_config`). No timer, no continuous repaint.
+    fn config_error_banner(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let Some(reason) = self.state.config_load_error.clone() else {
+            return;
+        };
+        // Same neutral-raised-fill + danger-border + glyph language as the
+        // save-error banner, so the two read as one error vocabulary; text stays
+        // in text_primary for WCAG AA on every theme (danger is carried by the
+        // glyph and border, never text alone).
+        let inner = egui::Frame::default()
+            .fill(pal.elevated)
+            .stroke(egui::Stroke::new(1.0_f32, pal.danger))
+            .inner_margin(style::margin(space::MD))
+            .corner_radius(style::rounding(radius::MD))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠").color(pal.danger).strong());
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Your settings can’t be saved")
+                                .color(pal.text)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Qwerty couldn’t load your config — {reason}. It’s running on \
+                                 defaults and will not overwrite the file. Fix or remove it, then \
+                                 restart."
+                            ))
+                            .color(pal.text),
+                        );
+                    });
+                });
+            });
         let r = inner.response.rect;
         ui.painter().rect_filled(
             egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 4.0, r.max.y)),

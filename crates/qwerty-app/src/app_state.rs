@@ -121,28 +121,46 @@ pub struct AppState {
     /// The currently-active profile, loaded from disk (`None` until one is
     /// calibrated/selected, or if its file is missing/corrupt).
     pub active_profile: Option<Profile>,
+    /// Set when an *existing* `config.json` could not be loaded (schema too new,
+    /// or a transient read error). While set, the app runs on in-memory defaults
+    /// but [`save_config`](Self::save_config) refuses to overwrite the on-disk
+    /// file, and the shell shows a loud banner — so a config we could not
+    /// understand is never silently clobbered with defaults. `None` on the
+    /// ordinary first-run / successfully-loaded paths.
+    pub config_load_error: Option<String>,
 }
 
 impl AppState {
     /// Build initial state, loading `config.json` from `%APPDATA%` if present.
-    /// A *corrupt* config is logged and falls back to defaults rather than
-    /// stopping launch — the user can then reach Settings to fix it.
+    ///
+    /// "No config yet" (first run) is the ordinary default-config path. But an
+    /// *existing* config that fails to load — a `schema_version` newer than this
+    /// build understands, or a transient read error — must NOT be silently
+    /// coerced to defaults: doing so would reset the active-profile pointer and
+    /// settings in memory, then overwrite the still-intact file on the next
+    /// settings change (see [`save_config`](Self::save_config)). Instead we run
+    /// on in-memory defaults for the session, record a loud
+    /// [`config_load_error`](Self::config_load_error) the shell surfaces, and
+    /// refuse to overwrite the file until the user resolves it. This honours
+    /// qwerty-core's "named refusal, never silent coercion" contract
+    /// (`PersistenceError`) and CLAUDE.md's fail-fast principle.
     pub fn load(system_dark: bool) -> Self {
         let config_path = config_file_path();
-        let config = match &config_path {
+        let (config, config_load_error) = match &config_path {
             Some(path) if path.exists() => match Config::load(path) {
-                Ok(c) => c,
+                Ok(c) => (c, None),
                 Err(e) => {
+                    let msg = format!("could not load {}: {e}", path.display());
                     eprintln!(
-                        "warning: could not load {}: {e}; using defaults",
-                        path.display()
+                        "error: {msg}; running on defaults and refusing to overwrite the file"
                     );
-                    Config::default()
+                    (Config::default(), Some(msg))
                 }
             },
-            _ => Config::default(),
+            _ => (Config::default(), None),
         };
         let mut state = Self::with_config(config, config_path, system_dark);
+        state.config_load_error = config_load_error;
         state.reload_active_profile();
         state
     }
@@ -412,6 +430,7 @@ impl AppState {
             theme_transition: None,
             system_dark,
             active_profile: None,
+            config_load_error: None,
         }
     }
 
@@ -421,6 +440,16 @@ impl AppState {
     /// setting still applies for the session. `Ok(())` no-op when there is no
     /// path (tests, or `%APPDATA%` unavailable).
     pub fn save_config(&self) -> Result<(), String> {
+        // Never overwrite a config.json we could not load in the first place
+        // (schema too new, or a transient read error): writing defaults over it
+        // is exactly the silent data-loss this guard prevents. The shell shows
+        // `config_load_error` as a loud banner and the user resolves it first.
+        if let Some(reason) = &self.config_load_error {
+            return Err(format!(
+                "refusing to overwrite config.json — it could not be loaded ({reason}); \
+                 resolve or remove the file, then restart"
+            ));
+        }
         let Some(path) = &self.config_path else {
             return Ok(());
         };
@@ -803,6 +832,28 @@ mod tests {
         assert!(s.delete_profile(other).is_ok());
         assert!(!other_path.exists());
         assert_eq!(s.config.active_profile_id, Some(active));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_config_refuses_to_overwrite_an_unloadable_config() {
+        let (mut s, dir) = temp_state("config_load_error");
+        let path = s.config_path.clone().unwrap();
+        // Simulate "an existing config we could not load" (e.g. a newer schema):
+        // running on in-memory defaults, but the on-disk file must be preserved.
+        s.config_load_error = Some("schema_version 999 does not match expected 1".to_string());
+        assert!(
+            s.save_config().is_err(),
+            "must refuse to overwrite a config it could not load"
+        );
+        assert!(
+            !path.exists(),
+            "config.json must NOT be written while in the load-error state"
+        );
+        // Once the error is resolved, normal saving resumes.
+        s.config_load_error = None;
+        assert!(s.save_config().is_ok());
+        assert!(path.exists(), "config.json is written after the error clears");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

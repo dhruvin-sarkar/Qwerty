@@ -437,7 +437,20 @@ impl std::error::Error for PersistenceError {
 /// one way to do things).
 pub(crate) fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, contents)?;
+    // Flush the temp file's data all the way to disk *before* the rename. Plain
+    // `fs::write` only pushes bytes into the OS page cache; on NTFS (the target)
+    // directory metadata is journaled while file data is not, with no ordering
+    // guarantee, so a power loss after the rename's metadata is durable but
+    // before the data pages are flushed could leave the rename pointing at a
+    // still-zero-length file — making the rename the *only* copy while it is
+    // empty, exactly the torn write this function exists to prevent. `sync_all`
+    // closes that window so the docstring's durability promise actually holds.
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
     // `rename` replaces an existing destination on Windows and is atomic within
     // a volume; tmp is a sibling so it is always the same volume.
     std::fs::rename(&tmp, path)
