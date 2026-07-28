@@ -327,7 +327,6 @@ pub fn build_profile(
         sensing_mode,
         zones,
         classifier,
-        negative_examples_trained: !negatives.is_empty(),
     })
 }
 

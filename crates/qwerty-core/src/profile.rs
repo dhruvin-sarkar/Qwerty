@@ -286,9 +286,10 @@ pub struct Profile {
     pub device_fingerprint: DeviceFingerprint,
     pub sensing_mode: SensingMode,
     pub zones: Vec<Zone>,
-    /// Opaque to everything except `qwerty-core::classifier`.
+    /// Opaque to everything except `qwerty-core::classifier`. Whether negative
+    /// examples were trained lives inside it (`classifier.negative_examples_trained()`),
+    /// the single authority — the Profile does not duplicate that flag.
     pub classifier: ClassifierParams,
-    pub negative_examples_trained: bool,
 }
 
 impl Profile {
@@ -611,7 +612,6 @@ mod tests {
                 calibration_sample_count: 10,
             }],
             classifier: tiny_classifier(),
-            negative_examples_trained: false,
         }
     }
 
