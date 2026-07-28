@@ -843,6 +843,16 @@ fn draw_stepper(ui: &mut egui::Ui, pal: &Palette, current: Step, step_anim: &Ani
             if is_cur { pal.text } else { pal.secondary },
         );
     }
+    // The position ("Step N of M") now lives only in this painted stepper, so
+    // announce it to screen readers — otherwise a Narrator user loses the wizard
+    // progress the old text label used to convey. Changes only on step change.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            format!("Step {} of {}: {}", cur + 1, n, current.title()),
+        )
+    });
 }
 
 /// The per-zone tap pips (Part 4): one custom-painted circle per expected tap.

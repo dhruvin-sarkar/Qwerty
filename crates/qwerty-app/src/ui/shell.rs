@@ -1595,6 +1595,17 @@ fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
     // Peak needle.
     let x = r.min.x + r.width() * peak_frac;
     painter.vline(x, r.y_range(), egui::Stroke::new(2.0_f32, with_alpha(pal.text, 200)));
+
+    // Announce the meter to screen readers with a *stable* label — a live
+    // percentage here would make Narrator chatter every frame (the value
+    // changes ~33×/s). The ProgressIndicator role conveys it is a level readout.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::ProgressIndicator,
+            true,
+            "Microphone input level",
+        )
+    });
 }
 
 /// A theme picker swatch (Part 7): the theme's own surface as the fill, an
@@ -1643,6 +1654,13 @@ fn theme_swatch(ui: &mut egui::Ui, pal: &Palette, name: &str, tokens: &Tokens, s
                 .size(text::CAPTION)
                 .color(if selected { pal.text } else { pal.secondary }),
         );
+        // Announce the swatch to screen readers: it is a focusable radio-style
+        // choice, so Narrator must read its name and selected state (the painted
+        // `name` label below is a separate non-focusable node, not tied to the
+        // focusable swatch response). Mirrors nav_item's WidgetInfo::selected.
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, name)
+        });
         resp.clicked()
     })
     .inner
@@ -1762,6 +1780,24 @@ fn zone_tiles(
             pal.secondary,
         );
     }
+    // Screen-reader summary: the tiles are painted pixels, invisible to AT, so
+    // announce each zone's name and action count on the grid's response. This
+    // single node changes only when the profile changes (not per animation
+    // frame), so it does not churn Narrator.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            zones
+                .iter()
+                .map(|z| {
+                    let n = z.actions.len();
+                    format!("{}: {} action{}", z.label, n, if n == 1 { "" } else { "s" })
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    });
 }
 
 /// A filled-accent primary button — the one unmistakable call to action on a

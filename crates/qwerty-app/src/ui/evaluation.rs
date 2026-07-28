@@ -830,6 +830,29 @@ fn draw_confusion_matrix(ui: &mut egui::Ui, pal: &Palette, matrix: &[Vec<u32>], 
         }
     }
 
+    // Screen-reader summary: the grid's cells are painted-only, so announce the
+    // diagonal (how often each actual zone was classified correctly) on the
+    // painter's response. The numbered legend below is already accessible text;
+    // this adds the correctness the cells otherwise convey by colour/number.
+    resp.widget_info(|| {
+        let summary = matrix
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let total: u32 = row.iter().sum();
+                let correct = row.get(i).copied().unwrap_or(0);
+                let label = labels.get(i).map(String::as_str).unwrap_or("zone");
+                format!("{label} {correct} of {total} correct")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            format!("Confusion matrix; {summary}"),
+        )
+    });
+
     // Numbered legend mapping the header numbers to zone labels.
     ui.add_space(space::XS);
     for (i, label) in labels.iter().enumerate() {

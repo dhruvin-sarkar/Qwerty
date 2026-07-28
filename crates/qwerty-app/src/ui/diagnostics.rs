@@ -243,6 +243,11 @@ fn draw_waveform(ui: &mut egui::Ui, pal: &Palette, envelope: &[f32], flash: Opti
     let size = egui::vec2(ui.available_width().min(560.0), 90.0);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
     let r = resp.rect;
+    // Announce the view's presence with a stable label (its contents change
+    // ~30×/s; a live-valued label would make Narrator chatter every frame).
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "Live microphone input waveform")
+    });
     painter.rect_filled(r, egui::CornerRadius::same(4), pal.surface);
     let mid = r.center().y;
     painter.line_segment(
@@ -293,6 +298,13 @@ fn draw_spectrogram(
     let size = egui::vec2(ui.available_width().min(560.0), 120.0);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
     let r = resp.rect;
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            "Live spectrogram of the classifier's frequency bands",
+        )
+    });
     painter.rect_filled(r, egui::CornerRadius::same(4), pal.surface);
     let bands = SPECTRAL_BAND_COUNT;
     if history.is_empty() {
