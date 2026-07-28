@@ -883,6 +883,26 @@ fn draw_confidence_histogram(ui: &mut egui::Ui, pal: &Palette, report: &Evaluati
         );
         painter.rect_filled(bar, style::rounding(radius::XS), pal.accent);
     }
+    // Screen-reader data summary — the bars are painted-only and the caption
+    // below gives just the axis. Static per report, so no Narrator churn.
+    resp.widget_info(|| {
+        let total: u32 = h.bins.iter().sum();
+        if total == 0 {
+            return egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                true,
+                "Confidence distribution: no accepted taps",
+            );
+        }
+        let hi_start = ((n as f32) * 0.7).round() as usize;
+        let high: u32 = h.bins.iter().skip(hi_start).sum();
+        let pct = (high as f32 * 100.0 / total as f32).round() as u32;
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            format!("Confidence of {total} accepted taps; {pct}% at 0.7 or above"),
+        )
+    });
     ui.label(
         egui::RichText::new("left = low confidence, right = high (accepted taps).")
             .color(pal.secondary)
@@ -916,6 +936,15 @@ fn draw_latency_histogram(ui: &mut egui::Ui, pal: &Palette, latencies_ms: &[f32]
         );
         painter.rect_filled(bar, style::rounding(radius::XS), pal.accent);
     }
+    // Stable label (no live count) — this view updates per tap during a run, so
+    // a value-bearing label would make Narrator re-announce on every tap.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            "Per-tap latency distribution, 0 to 250 ms",
+        )
+    });
     ui.label(
         egui::RichText::new(format!("0 to {RANGE_MS:.0} ms per tap"))
             .color(pal.secondary)
@@ -974,6 +1003,22 @@ fn draw_trend(ui: &mut egui::Ui, pal: &Palette, history: &[EvaluationReport]) {
         };
         painter.circle_filled(egui::pos2(x_of(i), y_of(rep.overall_accuracy)), 3.0, color);
     }
+    // Screen-reader data summary of the plotted line (static per loaded
+    // history). The accuracy values are otherwise painted-only.
+    resp.widget_info(|| {
+        let vals: Vec<String> = history
+            .iter()
+            .map(|rp| format!("{:.0}%", rp.overall_accuracy * 100.0))
+            .collect();
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            format!(
+                "Overall accuracy across {n} evaluations, oldest to newest: {}",
+                vals.join(", ")
+            ),
+        )
+    });
     ui.label(
         egui::RichText::new("Overall accuracy over time (line at 92% target).")
             .color(pal.secondary)
