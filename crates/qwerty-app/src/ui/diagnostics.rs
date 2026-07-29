@@ -53,6 +53,15 @@ pub struct DiagnosticsScreen {
     /// Built alongside the capture so an unopened screen never plans an FFT.
     extractor: Option<FeatureExtractor>,
     device_name: Option<String>,
+    /// Live input health, shown as a readout so this introspection screen can
+    /// explain a detection problem numerically: the negotiated sample rate (a
+    /// non-44.1 kHz device shifts the window), the normalizer's applied gain (a
+    /// high value means a faint mic), and the cumulative ring-overflow count (a
+    /// stalled consumer dropping samples). All drained from the same worker
+    /// events Home uses; here they are numbers, not warnings.
+    sample_rate: Option<u32>,
+    gain: f32,
+    dropped: usize,
     error: Option<String>,
     waveform: Vec<f32>,
     spectrogram: VecDeque<[f32; SPECTRAL_BAND_COUNT]>,
@@ -96,6 +105,9 @@ impl DiagnosticsScreen {
         self.last_tap = None;
         self.tap_flash = None;
         self.device_name = None;
+        self.sample_rate = None;
+        self.gain = 0.0;
+        self.dropped = 0;
         // Clear the recorded failure too, so a later visit gets a fresh retry
         // via `needs_start()`. Without this the screen is locked out for the rest
         // of the session after one mic failure — even once the device recovers —
@@ -112,8 +124,14 @@ impl DiagnosticsScreen {
         };
         for ev in capture.poll() {
             match ev {
-                CaptureEvent::Started { device_name, .. } => self.device_name = Some(device_name),
-                CaptureEvent::Level { .. } => {}
+                CaptureEvent::Started {
+                    device_name,
+                    sample_rate,
+                } => {
+                    self.device_name = Some(device_name);
+                    self.sample_rate = Some(sample_rate);
+                }
+                CaptureEvent::Level { gain, .. } => self.gain = gain,
                 CaptureEvent::Frame { waveform, bands } => {
                     self.waveform = waveform;
                     self.spectrogram.push_back(bands);
@@ -147,9 +165,9 @@ impl DiagnosticsScreen {
                         is_transient,
                     });
                 }
-                // Ring overflow is surfaced on Home (the always-on listening
-                // path); the Diagnostics live views don't add a second warning.
-                CaptureEvent::Overrun { .. } => {}
+                // Home shows overflow as a warning; here it is one number in the
+                // health readout so a power user can watch drops accumulate.
+                CaptureEvent::Overrun { dropped } => self.dropped = dropped,
                 CaptureEvent::Failed(msg) => {
                     self.error = Some(msg);
                     self.capture = None;
@@ -159,6 +177,49 @@ impl DiagnosticsScreen {
     }
 
     /// Render the screen.
+    /// A one-line live input-health readout: negotiated sample rate, applied
+    /// normalizer gain, and cumulative dropped samples. Numbers, not warnings —
+    /// Home owns the warnings; this screen is where a power user reads the raw
+    /// values behind a detection problem. Each value is tinted with the warning
+    /// colour when it is out of spec (rate ≠ the DSP's tuned rate, a straining
+    /// gain, any drops) so it stands out without a separate banner.
+    fn health_readout(&self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.add_space(space::XS);
+        ui.horizontal_wrapped(|ui| {
+            let dot = |ui: &mut egui::Ui| {
+                ui.label(egui::RichText::new("·").color(pal.secondary).small());
+            };
+            if let Some(sr) = self.sample_rate {
+                let tuned = sr == qwerty_core::features::SAMPLE_RATE_HZ;
+                let color = if tuned { pal.secondary } else { pal.warning };
+                let suffix = if tuned { "" } else { " (DSP tuned for 44.1 kHz)" };
+                ui.label(
+                    egui::RichText::new(format!("{:.1} kHz{suffix}", sr as f32 / 1000.0))
+                        .color(color)
+                        .small(),
+                );
+                dot(ui);
+            }
+            let gain_color = if crate::audio_thread::gain_indicates_low_signal(self.gain) {
+                pal.warning
+            } else {
+                pal.secondary
+            };
+            ui.label(
+                egui::RichText::new(format!("gain ×{:.0}", self.gain.max(1.0)))
+                    .color(gain_color)
+                    .small(),
+            );
+            dot(ui);
+            let drop_color = if self.dropped > 0 { pal.warning } else { pal.secondary };
+            ui.label(
+                egui::RichText::new(format!("{} dropped", self.dropped))
+                    .color(drop_color)
+                    .small(),
+            );
+        });
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, pal: &Palette, state: &AppState) {
         screen_header(
             ui,
@@ -180,6 +241,7 @@ impl DiagnosticsScreen {
                     .color(pal.secondary)
                     .small(),
             );
+            self.health_readout(ui, pal);
         }
         ui.add_space(space::MD);
 
