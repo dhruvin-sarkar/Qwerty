@@ -20,7 +20,7 @@ use crate::ui::motion::AnimState;
 use crate::app_state::{AppState, ListeningState, ProfileSummary, Screen};
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::hotkeys::Hotkeys;
-use crate::platform::{dispatch_chain, platform_for_this_os, PlatformActions};
+use crate::platform::{platform_for_this_os, PlatformActions};
 use crate::tray::{Tray, TrayCommand};
 use crate::ui::action_editor::ActionEditor;
 use crate::ui::diagnostics::DiagnosticsScreen;
@@ -121,6 +121,13 @@ struct QwertyApp {
     /// is never silent (`CLAUDE.md`: fail loudly). Holds the zone name and the
     /// failing step. Transient UI state only — never persisted.
     action_error: Option<String>,
+    /// Live-tap actions run on a short-lived worker thread so a blocking action
+    /// (e.g. launching an app) never freezes the UI. A failure is sent back over
+    /// this channel and drained each frame into `action_error`. Sender is cloned
+    /// into each dispatch worker; the receiver is drained in
+    /// `handle_external_events`.
+    action_error_tx: std::sync::mpsc::Sender<String>,
+    action_error_rx: std::sync::mpsc::Receiver<String>,
     /// Set by the tray "Quit" item so the close-to-tray guard lets the close
     /// proceed to a real exit instead of hiding the window. One-shot: once the
     /// user has chosen to quit there is no path back, so it is never reset.
@@ -262,6 +269,7 @@ impl QwertyApp {
 
         let profiles = state.list_profiles();
         let importable = state.list_importable_profiles();
+        let (action_error_tx, action_error_rx) = std::sync::mpsc::channel();
         Self {
             state,
             tray,
@@ -277,6 +285,8 @@ impl QwertyApp {
             diagnostics: DiagnosticsScreen::default(),
             save_error: None,
             action_error: None,
+            action_error_tx,
+            action_error_rx,
             force_quit: false,
             window_visible: true,
             profiles,
@@ -373,7 +383,6 @@ impl QwertyApp {
                         // whether to act.
                         if window.len() == FEATURE_WINDOW_SAMPLES {
                             let fv = self.home_extractor.extract(&window);
-                            let mut action_error = None;
                             if let Some(profile) = self.state.active_profile.as_ref() {
                                 let space = profile.classifier.feature_space(&fv);
                                 if let Some(nearest) = space.zones.iter().min_by(|a, b| {
@@ -413,24 +422,35 @@ impl QwertyApp {
                                             profile.zones.iter().find(|z| z.id == zone_id)
                                         {
                                             if !zone.actions.is_empty() {
-                                                if let Err((step, e)) = dispatch_chain(
-                                                    &zone.actions,
-                                                    self.platform.as_ref(),
-                                                ) {
-                                                    action_error = Some(format!(
-                                                        "“{}” — action {} failed: {e}",
-                                                        zone.label,
-                                                        step + 1
-                                                    ));
-                                                }
+                                                // Fire the chain OFF the UI thread. A
+                                                // blocking action — most visibly
+                                                // launching an app, where ShellExecuteW
+                                                // does not return until the shell has
+                                                // started the target — would otherwise
+                                                // freeze the window for its whole
+                                                // duration. A short-lived worker runs it
+                                                // and reports any failure back over
+                                                // `action_error_tx`, drained each frame
+                                                // in `handle_external_events`.
+                                                let actions = zone.actions.clone();
+                                                let label = zone.label.clone();
+                                                let errors = self.action_error_tx.clone();
+                                                let wake = ctx.clone();
+                                                std::thread::spawn(move || {
+                                                    if let Err((step, e)) =
+                                                        crate::platform::run_action_chain(&actions)
+                                                    {
+                                                        let _ = errors.send(format!(
+                                                            "“{label}” — action {} failed: {e}",
+                                                            step + 1
+                                                        ));
+                                                        wake.request_repaint();
+                                                    }
+                                                });
                                             }
                                         }
                                     }
                                 }
-                            }
-                            // Set outside the profile borrow above.
-                            if action_error.is_some() {
-                                self.action_error = action_error;
                             }
                         }
                     } else {
@@ -466,6 +486,12 @@ impl QwertyApp {
     /// Apply tray/hotkey events and the close-to-tray policy. Returns after
     /// mutating `self.state` and issuing any viewport commands.
     fn handle_external_events(&mut self, ctx: &egui::Context) {
+        // Surface any failure reported by an off-thread action worker (a chain
+        // that failed after being fired from a tap). Drained here so it runs
+        // every frame regardless of screen; the worker also woke the UI.
+        while let Ok(msg) = self.action_error_rx.try_recv() {
+            self.action_error = Some(msg);
+        }
         if let Some(hk) = &self.hotkeys {
             if hk.poll_toggle() {
                 self.state.toggle_listening();

@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY,
 };
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -47,6 +48,27 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// will display its toasts. Windows only shows a notification for a *registered*
 /// AUMID; see [`WindowsPlatform::notifier`].
 const AUM_ID: &str = "Qwerty.TapZones";
+
+/// Run `f` inside a COM apartment on the current thread, then release it.
+///
+/// Actions launched off the UI thread (`platform::run_action_chain`) run on a
+/// fresh worker thread that has no COM apartment, but the shell open verb
+/// (`ShellExecuteW`) and WinRT toast both need one initialized on the calling
+/// thread. Initialize single-threaded-apartment (the right model for shell/UI
+/// calls), run the work, and uninitialize — but only balance a `CoUninitialize`
+/// against an init we actually performed: `CoInitializeEx` returns `S_OK`/
+/// `S_FALSE` (both `is_ok()`, both increment this thread's ref count) when it
+/// initializes, and an error such as `RPC_E_CHANGED_MODE` when a different
+/// apartment already exists — in which case we must not uninitialize a count we
+/// did not add. `f` still runs either way (COM is usable regardless).
+pub(crate) fn with_com_apartment<T>(f: impl FnOnce() -> T) -> T {
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let out = f();
+    if hr.is_ok() {
+        unsafe { CoUninitialize() };
+    }
+    out
+}
 
 /// Whether the OS accessibility setting asks for reduced motion.
 ///

@@ -135,6 +135,34 @@ pub fn platform_for_this_os() -> Box<dyn PlatformActions> {
     Box::new(windows::WindowsPlatform::new())
 }
 
+/// Run an action chain to completion **on the calling thread**, constructing a
+/// fresh OS backend for it. Intended to be called from a short-lived worker
+/// thread spawned per accepted tap (`shell.rs`): several actions block until the
+/// OS finishes them — most visibly launching an app via the shell open verb,
+/// which does not return until the shell has started the target — and running
+/// that on the egui UI thread freezes the window for its whole duration
+/// (`PERFORMANCE.md`: the UI thread never blocks on an OS action). Off the UI
+/// thread, tapping is seamless: the window keeps painting while the action runs.
+///
+/// On Windows the backend needs a COM apartment on this thread (the shell open
+/// verb and WinRT toast require it; the UI thread gets one from winit, a fresh
+/// worker thread does not), so the work runs inside [`windows::with_com_apartment`].
+/// The backend's own `!Send` state (the speech engine, the toast handle) is why
+/// a fresh one is built here rather than moving the UI thread's backend across.
+pub fn run_action_chain(actions: &[ActionSpec]) -> Result<(), (usize, ActionError)> {
+    #[cfg(windows)]
+    {
+        windows::with_com_apartment(|| dispatch_chain(actions, &windows::WindowsPlatform::new()))
+    }
+    #[cfg(not(windows))]
+    {
+        // No action backend on non-Windows yet; a chain simply does nothing
+        // rather than pretending success on a specific action.
+        let _ = actions;
+        Ok(())
+    }
+}
+
 /// Whether the OS asks for reduced motion (`DESIGN.md`/`ACCEPTANCE.md`:
 /// accessibility). Read once at startup and cached in `AppState`. On Windows
 /// this consults the "show animations" accessibility setting; other platforms

@@ -51,6 +51,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Registry",
     "Win32_System_LibraryLoader",
+    # COM apartment init for off-UI-thread action dispatch (ShellExecuteW / WinRT
+    # toast need a COM apartment on the worker thread — see platform::windows).
+    "Win32_System_Com",
 ] }
 arboard = "3"
 # Speech + toast, the last two ActionSpec variants. These were stubbed as
