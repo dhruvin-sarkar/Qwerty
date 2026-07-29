@@ -326,7 +326,7 @@ fn action_fields(ui: &mut egui::Ui, pal: &Palette, spec: &mut ActionSpec) -> boo
                 args.remove(j);
                 changed = true;
             }
-            if ui.button("+ arg").clicked() {
+            if ui.button("+ Add argument").clicked() {
                 args.push(String::new());
                 changed = true;
             }

@@ -893,7 +893,7 @@ fn draw_stepper(ui: &mut egui::Ui, pal: &Palette, current: Step, step_anim: &Ani
             }
         } else {
             painter.circle_filled(center, r, pal.surface);
-            painter.circle_stroke(center, r, egui::Stroke::new(1.5_f32, pal.border));
+            painter.circle_stroke(center, r, egui::Stroke::new(1.0_f32, pal.border));
             painter.text(
                 center,
                 egui::Align2::CENTER_CENTER,
@@ -964,7 +964,7 @@ fn draw_tap_pips(
             painter.circle_stroke(center, r, egui::Stroke::new(2.0_f32, pal.accent));
         } else {
             painter.circle_filled(center, r, pal.surface);
-            painter.circle_stroke(center, r, egui::Stroke::new(1.5_f32, pal.border));
+            painter.circle_stroke(center, r, egui::Stroke::new(1.0_f32, pal.border));
         }
     }
 }
@@ -1031,14 +1031,14 @@ fn draw_desk_diagram(ui: &mut egui::Ui, pal: &Palette, layouts: &[ZoneLayout], l
         area.center() - egui::vec2(0.0, 9.0),
         egui::vec2(lw * 0.9, 17.0),
     );
-    painter.rect_filled(screen, style::rounding(3.0), mix(pal.accent, pal.base, 0.2));
+    painter.rect_filled(screen, style::rounding(radius::XS), mix(pal.accent, pal.base, 0.2));
     painter.rect_stroke(
         screen,
-        style::rounding(3.0),
+        style::rounding(radius::XS),
         egui::Stroke::new(1.0_f32, pal.accent),
         egui::StrokeKind::Inside,
     );
-    painter.rect_filled(base, style::rounding(3.0), pal.accent);
+    painter.rect_filled(base, style::rounding(radius::XS), pal.accent);
     painter.text(
         base.center(),
         egui::Align2::CENTER_CENTER,
