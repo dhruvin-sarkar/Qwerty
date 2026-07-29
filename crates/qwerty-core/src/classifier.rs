@@ -28,6 +28,14 @@ const NOVELTY_SIGMA: f32 = 4.0;
 /// Softmax temperature for turning centroid distances into a confidence.
 const CONFIDENCE_BETA: f32 = 1.0;
 
+/// Shrinkage of the LDA within-class variance toward the total variance when
+/// building the feature scaling (`train`). `0.0` = pure within-class (maximum
+/// discriminative sharpening but noisy with few taps); `1.0` = the previous
+/// total-variance scaling. A conservative even blend regularizes the few-sample
+/// within-class estimate; it is a fixed, principled default, not swept against
+/// the synthetic fixture.
+const WITHIN_CLASS_SHRINKAGE: f32 = 0.5;
+
 /// Errors that can arise while fitting or loading a classifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassifierError {
@@ -172,16 +180,65 @@ impl ClassifierParams {
         for m in &mut mean {
             *m /= n;
         }
-        let mut std = vec![0.0f32; FEATURE_DIM];
+        // Total (across-zone) variance — the previous scaling.
+        let mut total_var = vec![0.0f32; FEATURE_DIM];
         for r in &raw {
-            for (s, (&x, &m)) in std.iter_mut().zip(r.iter().zip(&mean)) {
+            for (v, (&x, &m)) in total_var.iter_mut().zip(r.iter().zip(&mean)) {
                 let d = x - m;
-                *s += d * d;
+                *v += d * d;
             }
         }
-        for s in &mut std {
-            *s = (*s / n).sqrt().max(STD_FLOOR);
+        for v in &mut total_var {
+            *v /= n;
         }
+
+        // Pooled WITHIN-zone variance: how much each feature scatters around its
+        // own zone's mean, pooled over all zones. This is the LDA/Fisher scaling:
+        // dividing by it *upweights* features that are tight within a zone but
+        // differ between zones (the discriminative ones), where the plain total
+        // variance above would downweight exactly those. It sharpens zone-vs-zone
+        // separation without any per-zone parameter (the standardization stays a
+        // single shared vector, and the novelty gate stays pooled as designed).
+        let mut zone_means = vec![vec![0.0f32; FEATURE_DIM]; zone_ids.len()];
+        let mut zone_counts = vec![0u32; zone_ids.len()];
+        for ((zid, _), r) in samples.iter().zip(&raw) {
+            let zi = zone_index(zid);
+            zone_counts[zi] += 1;
+            for (zm, &x) in zone_means[zi].iter_mut().zip(r) {
+                *zm += x;
+            }
+        }
+        for (zm, &c) in zone_means.iter_mut().zip(&zone_counts) {
+            if c > 0 {
+                for m in zm.iter_mut() {
+                    *m /= c as f32;
+                }
+            }
+        }
+        let mut within_var = vec![0.0f32; FEATURE_DIM];
+        for ((zid, _), r) in samples.iter().zip(&raw) {
+            let zm = &zone_means[zone_index(zid)];
+            for (v, (&x, &m)) in within_var.iter_mut().zip(r.iter().zip(zm)) {
+                let d = x - m;
+                *v += d * d;
+            }
+        }
+        for v in &mut within_var {
+            *v /= n;
+        }
+
+        // Shrink the within-zone estimate toward the total variance. With only a
+        // handful of taps per zone the within-zone estimate is noisy; blending
+        // regularizes it and guarantees this can never be much worse than the
+        // previous total-variance scaling (at shrinkage 1.0 it *is* that scaling).
+        let std: Vec<f32> = within_var
+            .iter()
+            .zip(&total_var)
+            .map(|(&w, &t)| {
+                let v = (1.0 - WITHIN_CLASS_SHRINKAGE) * w + WITHIN_CLASS_SHRINKAGE * t;
+                v.sqrt().max(STD_FLOOR)
+            })
+            .collect();
 
         let standardize = |r: &[f32; FEATURE_DIM]| -> Vec<f32> {
             r.iter()
@@ -541,6 +598,45 @@ mod tests {
             assert_eq!(out.zone_id, Some(expected));
             assert!(out.confidence > 0.5);
         }
+    }
+
+    #[test]
+    fn within_class_scaling_upweights_a_discriminative_feature() {
+        // A feature that is constant WITHIN each zone but differs BETWEEN zones
+        // is maximally discriminative. The LDA-style within-class scaling must
+        // give it a *smaller* std (hence more weight in the distance) than the
+        // plain total-variance scaling would — this is the whole point of the
+        // change, pinned so a future refactor can't silently drop it.
+        let (za, zb) = (zone(1), zone(2));
+        let mut samples = Vec::new();
+        for j in 0..5 {
+            let jit = j as f32 * 1e-3;
+            // Same seed for both zones → every dim is identical between zones
+            // EXCEPT temporal[0], which we pin to 0.0 (zone A) vs 5.0 (zone B)
+            // with zero within-zone spread: the ideal discriminator.
+            let mut a = fv_from(1.0, jit);
+            a.temporal[0] = 0.0;
+            samples.push((za, a));
+            let mut b = fv_from(1.0, jit);
+            b.temporal[0] = 5.0;
+            samples.push((zb, b));
+        }
+        let clf = ClassifierParams::train(&samples, &[]).unwrap();
+
+        // Grand mean of dim 0 is 2.5, so total variance is 6.25 → the old
+        // pure-total scaling would use std = 2.5. Within-class variance is 0, so
+        // with shrinkage 0.5 the new std is sqrt(0.5 * 6.25) ≈ 1.768 — strictly
+        // smaller, i.e. the discriminative feature is upweighted.
+        let std0 = clf.feature_std[0];
+        let pure_total = 6.25f32.sqrt();
+        assert!(
+            std0 < pure_total,
+            "discriminative dim should get a smaller std (more weight): {std0} !< {pure_total}",
+        );
+        assert!(
+            (std0 - (0.5 * 6.25f32).sqrt()).abs() < 1e-3,
+            "std0 {std0} should equal sqrt(shrink * total_var)",
+        );
     }
 
     #[test]
