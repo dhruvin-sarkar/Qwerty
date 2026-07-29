@@ -1464,13 +1464,25 @@ impl QwertyApp {
             );
             ui.add_space(space::SM);
             // This one *is* wired — the close-to-tray guard reads it.
-            if ui
-                .checkbox(
-                    &mut self.state.config.minimize_to_tray_on_close,
-                    "Minimize to the tray when the window is closed",
-                )
-                .changed()
-            {
+            let reduced = self.state.reduced_motion;
+            let changed = ui
+                .horizontal(|ui| {
+                    let r = toggle(
+                        ui,
+                        pal,
+                        &mut self.state.config.minimize_to_tray_on_close,
+                        reduced,
+                    )
+                    .changed();
+                    ui.add_space(space::SM);
+                    ui.label(
+                        egui::RichText::new("Minimize to the tray when the window is closed")
+                            .color(pal.text),
+                    );
+                    r
+                })
+                .inner;
+            if changed {
                 if let Err(e) = self.state.save_config() {
                     self.save_error = Some(e);
                 }
@@ -1830,6 +1842,50 @@ pub(crate) fn count_to(ctx: &egui::Context, id: egui::Id, target: f32, reduced: 
         ctx.request_repaint();
     }
     spring.value
+}
+
+/// A custom pill toggle replacing egui's default checkbox for boolean settings
+/// (Part 2): the track cross-fades `border → accent` as it turns on and the knob
+/// glides on a `Bouncy` spring — a real switch overshoots its stop a hair, which
+/// is exactly that physical feeling. Keyboard-focusable with an accent ring and
+/// announced to screen readers as a checkbox with its on/off state. Returns the
+/// click [`Response`](egui::Response) with `changed()` set on toggle. Under
+/// reduced motion the knob jumps (no travel, no overshoot) — Part 7.
+fn toggle(ui: &mut egui::Ui, pal: &Palette, on: &mut bool, reduced: bool) -> egui::Response {
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(40.0, 22.0), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = spring_to(
+        ui.ctx(),
+        resp.id.with("toggle_knob"),
+        if *on { 1.0 } else { 0.0 },
+        motion::SpringPreset::Bouncy,
+        reduced,
+    );
+    let radius = rect.height() * 0.5;
+    let pill = style::rounding(radius);
+    let track = mix(pal.border, pal.accent, t.clamp(0.0, 1.0));
+    let painter = ui.painter();
+    painter.rect_filled(rect, pill, track);
+    // Knob: let the Bouncy overshoot carry it a hair past its stop (a few px),
+    // clamped so it never leaves the track entirely.
+    let travel = t.clamp(-0.12, 1.12);
+    let kx = egui::lerp((rect.left() + radius)..=(rect.right() - radius), travel);
+    let knob = c32(on_color(Color::rgb(track.r(), track.g(), track.b())));
+    painter.circle_filled(egui::pos2(kx, rect.center().y), radius - 3.0, knob);
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.expand(2.0),
+            pill,
+            egui::Stroke::new(2.0_f32, pal.accent),
+            egui::StrokeKind::Outside,
+        );
+    }
+    let is_on = *on;
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, is_on, ""));
+    resp
 }
 
 /// A simple elevated card frame. `pub(crate)` so the action editor reuses it.
