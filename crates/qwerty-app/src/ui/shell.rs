@@ -148,6 +148,10 @@ struct QwertyApp {
     /// When the next heartbeat pulse is due. Reset whenever the app leaves the
     /// heartbeat context (paused, off-Home, hidden, reduced motion).
     heartbeat_next_at: Option<Instant>,
+    /// When the current screen was entered — drives the staggered-reveal cascade
+    /// (Part 5). Updated on every nav change; the cascade is computed statelessly
+    /// from this timestamp plus each item's index, so no per-item state persists.
+    screen_entered_at: Instant,
     /// Per-zone accept/reject pulse animations, keyed by `ZoneId`. Inserted (or
     /// replaced) each time a Home tap classifies to a zone; the value is the
     /// animation plus whether the tap was accepted (drives accept-glow vs.
@@ -259,6 +263,7 @@ impl QwertyApp {
             screen_fade_start: None,
             heartbeat: None,
             heartbeat_next_at: None,
+            screen_entered_at: Instant::now(),
             zone_anim: HashMap::new(),
             home_extractor: FeatureExtractor::new(),
         }
@@ -633,6 +638,7 @@ impl eframe::App for QwertyApp {
         // the content Ui's opacity ramps. Repaints only while the fade is live.
         if self.state.screen != self.last_screen {
             self.last_screen = self.state.screen;
+            self.screen_entered_at = now; // drives the Part 5 stagger
             // Reduced motion: no screen fade-in — the incoming screen appears at
             // once (Part 7). Leaving screen_fade_start None yields opacity 1.0.
             if !self.state.reduced_motion {
@@ -686,7 +692,7 @@ impl eframe::App for QwertyApp {
                 // screens opt out: their waveform/spectrogram/matrix want the
                 // full width, and they manage their own scrolling.
                 match self.state.screen {
-                    Screen::Home => screen_body(ui, |ui| self.home(ui, &pal)),
+                    Screen::Home => screen_body(ui, |ui| self.home(ui, &pal, now)),
                     Screen::Zones => screen_body(ui, |ui| self.zones(ui, &pal)),
                     Screen::Settings => screen_body(ui, |ui| self.settings(ui, &pal, now)),
                     Screen::Diagnostics => self.diagnostics.ui(ui, &pal, &self.state),
@@ -741,6 +747,12 @@ impl eframe::App for QwertyApp {
         } else {
             self.heartbeat = None;
             self.heartbeat_next_at = None;
+        }
+
+        // Keep frames coming through a staggered screen-entry cascade (Part 5),
+        // then stop — bounded by STAGGER_TOTAL, so it never becomes a loop.
+        if !self.state.reduced_motion && now < self.screen_entered_at + motion::STAGGER_TOTAL {
+            ctx.request_repaint_after(motion::AMBIENT_FRAME);
         }
 
         // Launch the wizard at end of frame (set by a Calibrate button), after
@@ -917,7 +929,7 @@ impl QwertyApp {
             });
     }
 
-    fn home(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+    fn home(&mut self, ui: &mut egui::Ui, pal: &Palette, now: Instant) {
         screen_header(ui, pal, "Home", "Listening status and quick controls");
 
         // Empty state when there's no calibrated profile yet (Part 6).
@@ -1037,11 +1049,23 @@ impl QwertyApp {
 
         // The desk: calibrated zones as a tile grid that pulses on each tap.
         ui.add_space(space::LG);
-        // Copy the heartbeat out (Copy) before the immutable profile borrow, so
-        // zone_tiles can paint the ambient ring without reading self mid-borrow.
+        // Copy the ambient/stagger inputs out (Copy) before the immutable
+        // profile borrow, so zone_tiles can animate without reading self
+        // mid-borrow (the map's borrow-hazard guidance).
         let heartbeat = self.heartbeat;
+        let entered_at = self.screen_entered_at;
+        let reduced = self.state.reduced_motion;
         if let Some(profile) = self.state.active_profile.as_ref() {
-            zone_tiles(ui, pal, &profile.zones, &self.zone_anim, heartbeat);
+            zone_tiles(
+                ui,
+                pal,
+                &profile.zones,
+                &self.zone_anim,
+                heartbeat,
+                entered_at,
+                now,
+                reduced,
+            );
         }
         ui.add_space(space::MD);
         if primary_button(ui, pal, "Recalibrate / new profile").clicked() {
@@ -1767,6 +1791,21 @@ fn spring_to(
     spring.value
 }
 
+/// Reveal fraction in `[0,1]` for a staggered screen-entry cascade (Part 5):
+/// item `index` begins easing `index * STAGGER_STEP` after `entered_at` (capped
+/// at `STAGGER_MAX_ITEMS`, so a long list does not feel slow to finish) and eases
+/// over `QUICK`. Stateless — computed from the entry timestamp plus the index,
+/// so no per-item animation is stored. Returns 1.0 (fully shown) under reduced
+/// motion. The caller fades and/or lifts the item by the returned fraction.
+fn stagger_reveal(entered_at: Instant, now: Instant, index: usize, reduced: bool) -> f32 {
+    if reduced {
+        return 1.0;
+    }
+    let steps = (index as u32).min(motion::STAGGER_MAX_ITEMS);
+    let starts = entered_at + motion::STAGGER_STEP * steps;
+    AnimState::start_delayed(motion::QUICK, starts).t_at(now, motion::STANDARD_EASE)
+}
+
 /// A number that counts toward `target` instead of snapping (Part 2): a
 /// per-id [`Spring`](motion::Spring) kept in egui temp memory, initialised at
 /// `0.0` so a value counts *in* on its first render (an evaluation report that
@@ -2039,12 +2078,16 @@ fn mini_pill(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, color: 
 /// up 6% with a fading accent glow ring and a fill flash (`EMPHASIZED_EASE`), a
 /// rejected tap shakes horizontally with a danger-tint flash. Only the *painted*
 /// rect animates; the allocated layout is fixed, so the grid never reflows.
+#[allow(clippy::too_many_arguments)]
 fn zone_tiles(
     ui: &mut egui::Ui,
     pal: &Palette,
     zones: &[Zone],
     zone_anim: &HashMap<ZoneId, (AnimState, bool)>,
     heartbeat: Option<AnimState>,
+    entered_at: Instant,
+    now: Instant,
+    reduced: bool,
 ) {
     if zones.is_empty() {
         return;
@@ -2104,8 +2147,13 @@ fn zone_tiles(
             None => (1.0, 0.0, 0.0, 0.0, true, 0.0),
         };
 
+        // Staggered screen-entry reveal (Part 5): each tile fades and lifts into
+        // place a little after the previous. Stateless — derived from the entry
+        // timestamp + index; 1.0 (fully shown) under reduced motion.
+        let reveal = stagger_reveal(entered_at, now, i, reduced);
+        let fade = |c: egui::Color32| with_alpha(c, (c.a() as f32 * reveal) as u8);
         let rect = egui::Rect::from_center_size(
-            base.center() + egui::vec2(shake, 0.0),
+            base.center() + egui::vec2(shake, -(1.0 - reveal) * 8.0),
             base.size() * scale,
         );
         // Soft radial halo behind an accepting tile (painted first so the
@@ -2113,21 +2161,21 @@ fn zone_tiles(
         // in the gap between tiles). Layered 3-pass mesh bloom, no shader.
         if bloom > 0.001 {
             let radius = rect.size().length() * 0.5 * 1.8;
-            paint::radial_bloom(&painter, rect.center(), radius, pal.accent, bloom * 0.8);
+            paint::radial_bloom(&painter, rect.center(), radius, pal.accent, bloom * 0.8 * reveal);
         }
         let flash_color = if accept { pal.accent } else { pal.danger };
-        painter.rect_filled(rect, round, mix(pal.elevated, flash_color, flash));
+        painter.rect_filled(rect, round, fade(mix(pal.elevated, flash_color, flash)));
         painter.rect_stroke(
             rect,
             round,
-            egui::Stroke::new(1.0_f32, pal.border),
+            egui::Stroke::new(1.0_f32, fade(pal.border)),
             egui::StrokeKind::Inside,
         );
         if glow > 0.001 {
             painter.rect_stroke(
                 rect.expand(3.0),
                 round,
-                egui::Stroke::new(2.0_f32, with_alpha(pal.accent, (glow * 255.0) as u8)),
+                egui::Stroke::new(2.0_f32, with_alpha(pal.accent, (glow * 255.0 * reveal) as u8)),
                 egui::StrokeKind::Outside,
             );
         }
@@ -2136,7 +2184,7 @@ fn zone_tiles(
             egui::Align2::CENTER_CENTER,
             &zone.label,
             egui::FontId::proportional(text::BODY),
-            pal.text,
+            fade(pal.text),
         );
         let n = zone.actions.len();
         let sub = if n == 0 {
@@ -2149,7 +2197,7 @@ fn zone_tiles(
             egui::Align2::CENTER_CENTER,
             sub,
             egui::FontId::proportional(text::CAPTION),
-            pal.secondary,
+            fade(pal.secondary),
         );
     }
     // Screen-reader summary: the tiles are painted pixels, invisible to AT, so

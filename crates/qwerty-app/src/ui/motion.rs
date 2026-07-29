@@ -46,6 +46,21 @@ pub const AMBIENT_FRAME: Duration = Duration::from_millis(33);
 #[allow(dead_code)]
 pub const BACKGROUND_BREATHE_PERIOD_SECS: f32 = 12.0;
 
+// --- Staggered-reveal pacing (Part 5) --------------------------------------
+//
+// On screen entry a list cascades in: item `i` starts `STAGGER_STEP * i` after
+// entry (capped at `STAGGER_MAX_ITEMS` so a long list never feels slow to
+// finish), each easing over `QUICK`. `STAGGER_TOTAL` bounds how long the shell
+// keeps requesting frames for the cascade.
+
+/// Delay added per successive item in a staggered reveal.
+pub const STAGGER_STEP: Duration = Duration::from_millis(35);
+/// Items past this index reveal immediately (no cascade), so a long list does
+/// not read as slow to load.
+pub const STAGGER_MAX_ITEMS: u32 = 8;
+/// Upper bound on a whole cascade's duration, for the shell's repaint window.
+pub const STAGGER_TOTAL: Duration = Duration::from_millis(520);
+
 // --- Easing curves (MOTION.md → easing.*) ----------------------------------
 
 /// `easing.standard` — the default for nearly everything: fast start, gentle
@@ -163,8 +178,6 @@ impl AnimState {
     /// frame's shared `now`, so a not-yet-started item reads exactly 0.0 without
     /// relying on the platform-specific behaviour of `Instant::elapsed` for a
     /// future instant.
-    // Consumed by the staggered-reveal pass (Part 5); allow until then.
-    #[allow(dead_code)]
     pub fn start_delayed(duration: std::time::Duration, starts_at: std::time::Instant) -> Self {
         Self {
             started_at: starts_at,
@@ -174,7 +187,6 @@ impl AnimState {
 
     /// Raw linear progress evaluated against an explicit `now`, saturating to
     /// 0.0 before `started_at` — the delay-safe companion to [`linear`](Self::linear).
-    #[allow(dead_code)] // consumed with start_delayed (Part 5)
     pub fn linear_at(&self, now: std::time::Instant) -> f32 {
         let secs = self.duration.as_secs_f32();
         if secs <= 0.0 {
@@ -184,7 +196,6 @@ impl AnimState {
     }
 
     /// Eased progress against an explicit `now` — the delay-safe [`t`](Self::t).
-    #[allow(dead_code)] // consumed with start_delayed (Part 5)
     pub fn t_at(&self, now: std::time::Instant, easing: Bezier) -> f32 {
         easing.eval(self.linear_at(now))
     }
