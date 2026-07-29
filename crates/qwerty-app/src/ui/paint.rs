@@ -84,6 +84,31 @@ pub(crate) fn radial_bloom(
     radial_glow(painter, center, radius * 1.0, a(1.00), 28);
 }
 
+/// Stipple `rect` with a sparse diagonal dot grid — a near-subliminal texture
+/// that keeps a flat theme fill from reading as "dead space" (the single most
+/// common tell of an unpolished app). Static: it paints only within the frame
+/// the caller is already drawing and requests no repaint of its own, so it costs
+/// nothing while idle. `color` should already carry a very low alpha (~3-4%).
+/// Rows are offset half a cell so it reads as texture, not a literal grid.
+pub(crate) fn dot_grid(painter: &Painter, rect: Rect, color: Color32, spacing: f32, radius: f32) {
+    if color.a() == 0 || spacing <= 0.0 || radius <= 0.0 || rect.width() <= 0.0 {
+        return;
+    }
+    let mut row = 0u32;
+    let mut y = rect.top();
+    while y <= rect.bottom() {
+        // Every other row is nudged half a cell right — a hex-ish stagger.
+        let x0 = rect.left() + if row.is_multiple_of(2) { 0.0 } else { spacing * 0.5 };
+        let mut x = x0;
+        while x <= rect.right() {
+            painter.circle_filled(Pos2::new(x, y), radius, color);
+            x += spacing;
+        }
+        y += spacing;
+        row += 1;
+    }
+}
+
 /// Fill `rect` with a vertical two-stop gradient (top → bottom) via a 4-vertex
 /// colored mesh. Free GPU interpolation, no shader.
 pub(crate) fn vertical_gradient(painter: &Painter, rect: Rect, top: Color32, bottom: Color32) {
@@ -145,6 +170,9 @@ mod tests {
             radial_glow(p, r.center(), 30.0, Color32::TRANSPARENT, 24); // alpha 0 → no-op
             radial_bloom(p, r.center(), 25.0, Color32::GREEN, 0.7);
             radial_bloom(p, r.center(), 25.0, Color32::GREEN, 0.0); // intensity 0 → no-op
+            dot_grid(p, r, Color32::from_white_alpha(8), 24.0, 1.4);
+            dot_grid(p, r, Color32::TRANSPARENT, 24.0, 1.4); // alpha 0 → no-op
+            dot_grid(p, r, Color32::from_white_alpha(8), 0.0, 1.4); // spacing 0 → no-op
             vertical_gradient(p, r, Color32::RED, Color32::BLUE);
             horizontal_gradient(
                 p,

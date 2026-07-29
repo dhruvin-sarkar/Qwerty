@@ -141,6 +141,13 @@ struct QwertyApp {
     last_screen: Screen,
     /// When the current screen-transition fade began; `None` once it has settled.
     screen_fade_start: Option<Instant>,
+    /// The listening-heartbeat ring (`MOTION.md`/Part 3): present only while a
+    /// pulse is expanding. Scheduled as a one-shot, so an idle listening Home
+    /// wakes once when the next pulse is due rather than looping (PERFORMANCE.md).
+    heartbeat: Option<AnimState>,
+    /// When the next heartbeat pulse is due. Reset whenever the app leaves the
+    /// heartbeat context (paused, off-Home, hidden, reduced motion).
+    heartbeat_next_at: Option<Instant>,
     /// Per-zone accept/reject pulse animations, keyed by `ZoneId`. Inserted (or
     /// replaced) each time a Home tap classifies to a zone; the value is the
     /// animation plus whether the tap was accepted (drives accept-glow vs.
@@ -250,6 +257,8 @@ impl QwertyApp {
             confirm_delete: false,
             last_screen: Screen::Home,
             screen_fade_start: None,
+            heartbeat: None,
+            heartbeat_next_at: None,
             zone_anim: HashMap::new(),
             home_extractor: FeatureExtractor::new(),
         }
@@ -652,6 +661,18 @@ impl eframe::App for QwertyApp {
                     .inner_margin(style::margin(space::XL)),
             )
             .show(ctx, |ui| {
+                // Static dot-grid texture behind everything (Part 4): near-
+                // subliminal, so a flat theme fill never reads as dead space.
+                // Painted before the fade multiply so it stays a stable
+                // background; cards paint opaque over it, so it shows only in the
+                // negative space between them. Static — it requests no repaint.
+                paint::dot_grid(
+                    ui.painter(),
+                    ui.max_rect(),
+                    with_alpha(pal.text, DOT_GRID_ALPHA),
+                    DOT_GRID_SPACING,
+                    DOT_GRID_RADIUS,
+                );
                 if content_opacity < 1.0 {
                     ui.multiply_opacity(content_opacity);
                 }
@@ -680,6 +701,46 @@ impl eframe::App for QwertyApp {
         self.zone_anim.retain(|_, (anim, _)| !anim.is_complete());
         if !self.zone_anim.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        // The listening heartbeat (Part 3) and the single ambient repaint
+        // decision (`PERFORMANCE.md`: this is the one place ambient effects
+        // schedule a frame — never scattered into home()/zone_tiles()). A slow
+        // ring pulses from the desk while idle + listening on Home. It is a
+        // scheduled one-shot: between pulses we request exactly one wake-up when
+        // the next beat is due; only while a pulse is expanding do we run at
+        // ~30fps. Paused, off-Home, hidden, or reduced-motion → no beat, no
+        // frames.
+        let heartbeat_ctx = self.state.listening == ListeningState::Listening
+            && showing
+            && self.state.screen == Screen::Home
+            && self.state.active_profile.is_some()
+            && !self.state.reduced_motion;
+        if heartbeat_ctx {
+            match self.heartbeat {
+                Some(anim) if anim.is_complete() => self.heartbeat = None,
+                Some(_) => {} // a pulse is expanding; repaint scheduled below
+                None => {
+                    let due = *self
+                        .heartbeat_next_at
+                        .get_or_insert(now + motion::HEARTBEAT_PERIOD);
+                    // Don't start a beat over an active tap pulse — the tap is
+                    // the signal that matters; the heartbeat is only ambient.
+                    if now >= due && self.zone_anim.is_empty() {
+                        self.heartbeat = Some(AnimState::start(motion::HEARTBEAT_PULSE_LEN));
+                        self.heartbeat_next_at = Some(now + motion::HEARTBEAT_PERIOD);
+                    }
+                }
+            }
+            if self.heartbeat.is_some() {
+                ctx.request_repaint_after(motion::AMBIENT_FRAME);
+            } else if let Some(due) = self.heartbeat_next_at {
+                // Wake exactly when the next pulse is due — not a poll loop.
+                ctx.request_repaint_after(due.saturating_duration_since(now));
+            }
+        } else {
+            self.heartbeat = None;
+            self.heartbeat_next_at = None;
         }
 
         // Launch the wizard at end of frame (set by a Calibrate button), after
@@ -975,8 +1036,11 @@ impl QwertyApp {
 
         // The desk: calibrated zones as a tile grid that pulses on each tap.
         ui.add_space(space::LG);
+        // Copy the heartbeat out (Copy) before the immutable profile borrow, so
+        // zone_tiles can paint the ambient ring without reading self mid-borrow.
+        let heartbeat = self.heartbeat;
         if let Some(profile) = self.state.active_profile.as_ref() {
-            zone_tiles(ui, pal, &profile.zones, &self.zone_anim);
+            zone_tiles(ui, pal, &profile.zones, &self.zone_anim, heartbeat);
         }
         ui.add_space(space::MD);
         if primary_button(ui, pal, "Recalibrate / new profile").clicked() {
@@ -1601,6 +1665,13 @@ fn dismissible_error_banner(ui: &mut egui::Ui, pal: &Palette, heading: &str, msg
 /// whitespace, a Windows-11-style readable content column).
 const CONTENT_MAX_W: f32 = 820.0;
 
+/// Background dot-grid texture (Part 4): spacing, dot radius, and alpha (~3% of
+/// `text` over `bg_base`). Kept as named constants so the texture is not a run
+/// of magic numbers at the paint site.
+const DOT_GRID_SPACING: f32 = 24.0;
+const DOT_GRID_RADIUS: f32 = 1.3;
+const DOT_GRID_ALPHA: u8 = 8;
+
 /// Wrap a text-heavy screen's body in a vertical scroll area capped to a
 /// comfortable reading width. The scroll area fills the panel (so a short window
 /// scrolls instead of clipping) while `set_max_width` keeps the content column
@@ -1889,6 +1960,7 @@ fn zone_tiles(
     pal: &Palette,
     zones: &[Zone],
     zone_anim: &HashMap<ZoneId, (AnimState, bool)>,
+    heartbeat: Option<AnimState>,
 ) {
     if zones.is_empty() {
         return;
@@ -1908,6 +1980,18 @@ fn zone_tiles(
         ui.allocate_painter(egui::vec2(avail_w, total_h), egui::Sense::hover());
     let origin = resp.rect.min;
     let round = style::rounding(radius::MD);
+
+    // Listening heartbeat ring (Part 3): a faint accent glow expands from the
+    // desk's centre and fades over the pulse — the literal "the room is being
+    // listened to" cue (`VISION.md`). Painted first so the opaque tiles sit on
+    // top; alpha caps at ~22/255, so it is felt more than seen.
+    if let Some(hb) = heartbeat {
+        let t = hb.linear();
+        let base_radius = resp.rect.size().min_elem().max(1.0) * 0.35;
+        let radius = base_radius * (1.0 + t * 1.4);
+        let alpha = ((1.0 - t) * 22.0) as u8;
+        paint::radial_glow(&painter, resp.rect.center(), radius, with_alpha(pal.accent, alpha), 40);
+    }
 
     for (i, zone) in zones.iter().enumerate() {
         let (c, row) = (i % cols, i / cols);

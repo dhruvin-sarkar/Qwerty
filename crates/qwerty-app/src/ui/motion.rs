@@ -34,18 +34,15 @@ pub const DELIBERATE: Duration = Duration::from_millis(400);
 // These pace the ambient system (`shell.rs`). Kept here so the whole ambient
 // vocabulary is one place, never a hand-picked interval at a call site.
 
-// Consumed by the ambient-system commit (Parts 3-4); allow until wired.
 /// How often the listening-heartbeat ring fires while idle + listening.
-#[allow(dead_code)]
 pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(6);
 /// How long a single heartbeat ring takes to expand and fade.
-#[allow(dead_code)]
 pub const HEARTBEAT_PULSE_LEN: Duration = Duration::from_millis(2200);
 /// The repaint cadence while any ambient effect is live (~30 fps). The shell's
 /// single ambient repaint decision schedules the next frame this far out.
-#[allow(dead_code)]
 pub const AMBIENT_FRAME: Duration = Duration::from_millis(33);
 /// Full period of the barely-perceptible background "breathe" (a slow sine).
+// Consumed by the continuous-breathe commit (deferred, needs CPU measurement).
 #[allow(dead_code)]
 pub const BACKGROUND_BREATHE_PERIOD_SECS: f32 = 12.0;
 
