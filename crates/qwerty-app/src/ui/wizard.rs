@@ -635,7 +635,7 @@ impl Wizard {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{}  {label}: {:.0}%",
+                                "{}  {label}: {:.1}%",
                                 if flagged { icon::WARNING } else { icon::CHECK },
                                 acc * 100.0
                             ))

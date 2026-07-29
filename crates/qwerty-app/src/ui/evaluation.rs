@@ -760,7 +760,7 @@ fn bar_row(ui: &mut egui::Ui, pal: &Palette, label: &str, frac: f32) {
         painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
         let filled = egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, r.height()));
         painter.rect_filled(filled, style::rounding(radius::XS), color);
-        ui.label(egui::RichText::new(format!("{:.0}%  {label}", frac * 100.0)).color(pal.text));
+        ui.label(egui::RichText::new(format!("{:.1}%  {label}", frac * 100.0)).color(pal.text));
     });
 }
 
@@ -1014,7 +1014,7 @@ fn draw_trend(ui: &mut egui::Ui, pal: &Palette, history: &[EvaluationReport]) {
     resp.widget_info(|| {
         let vals: Vec<String> = history
             .iter()
-            .map(|rp| format!("{:.0}%", rp.overall_accuracy * 100.0))
+            .map(|rp| format!("{:.1}%", rp.overall_accuracy * 100.0))
             .collect();
         egui::WidgetInfo::labeled(
             egui::WidgetType::Label,
