@@ -118,6 +118,12 @@ pub struct AppState {
     /// understand is never silently clobbered with defaults. `None` on the
     /// ordinary first-run / successfully-loaded paths.
     pub config_load_error: Option<String>,
+    /// Whether the OS asked for reduced motion (Windows "show animations" off).
+    /// Read once at startup by the shell via `platform::os_prefers_reduced_motion`
+    /// and cached here so every animation site can consult one value. Not a
+    /// persisted setting — it mirrors the live OS preference (`ACCEPTANCE.md`:
+    /// accessibility). Defaults to `false` (full motion) until the shell sets it.
+    pub reduced_motion: bool,
 }
 
 impl AppState {
@@ -421,6 +427,7 @@ impl AppState {
             system_dark,
             active_profile: None,
             config_load_error: None,
+            reduced_motion: false,
         }
     }
 

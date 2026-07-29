@@ -15,7 +15,7 @@ use std::process::Command;
 use arboard::{Clipboard, ImageData};
 use qwerty_core::profile::{KeyCombo, Modifier, ScreenshotMode, SystemSound};
 use tts::Tts;
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
@@ -28,8 +28,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, MB_ICONASTERISK, MB_ICONEXCLAMATION, MB_ICONHAND, MB_OK, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNORMAL,
+    GetSystemMetrics, SystemParametersInfoW, MB_ICONASTERISK, MB_ICONEXCLAMATION, MB_ICONHAND,
+    MB_OK, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SPI_GETCLIENTAREAANIMATION, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 use winrt_toast::{register, Toast, ToastManager};
 
@@ -42,6 +43,39 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// will display its toasts. Windows only shows a notification for a *registered*
 /// AUMID; see [`WindowsPlatform::notifier`].
 const AUM_ID: &str = "Qwerty.TapZones";
+
+/// Whether the OS accessibility setting asks for reduced motion.
+///
+/// Reads `SPI_GETCLIENTAREAANIMATION`: Windows writes `TRUE` into the out `BOOL`
+/// when client-area animations are *enabled*, so "prefers reduced motion" is its
+/// negation. Signature verified against the installed `windows-0.62.2` source —
+/// `SystemParametersInfoW` returns `windows_core::Result<()>` (the crate `.ok()`s
+/// the underlying `BOOL` for us), and `BOOL` lives at `windows::core::BOOL`, not
+/// `Win32::Foundation`. On query failure we log and report "no reduced motion",
+/// matching this module's documented degrade-with-a-warning construction pattern.
+pub(crate) fn os_prefers_reduced_motion() -> bool {
+    let mut animations_enabled = BOOL(0);
+    let queried = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            // `.cast()` infers `*mut c_void`, the same idiom as this file's
+            // GetDIBits call.
+            Some((&mut animations_enabled as *mut BOOL).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0), // fWinIni is ignored for a GET
+        )
+    };
+    match queried {
+        Ok(()) => !animations_enabled.as_bool(),
+        Err(e) => {
+            eprintln!(
+                "warning: could not read the OS animation setting \
+                 (SPI_GETCLIENTAREAANIMATION): {e}"
+            );
+            false
+        }
+    }
+}
 
 /// The Windows action backend.
 ///

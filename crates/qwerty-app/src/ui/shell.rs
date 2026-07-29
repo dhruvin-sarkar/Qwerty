@@ -155,7 +155,10 @@ struct QwertyApp {
 impl QwertyApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let system_dark = read_system_dark(&cc.egui_ctx);
-        let state = AppState::load(system_dark);
+        let mut state = AppState::load(system_dark);
+        // Cache the OS "reduced motion" preference once at startup; every
+        // animation site consults this one value (Part 7 / `ACCEPTANCE.md`).
+        state.reduced_motion = crate::platform::os_prefers_reduced_motion();
         // Paint the correct theme on the very first frame — no flash of the
         // egui default palette (`PERFORMANCE.md`: no flash of unstyled content).
         let tokens = tokens_for(state.config.theme, system_dark);
@@ -621,7 +624,11 @@ impl eframe::App for QwertyApp {
         // the content Ui's opacity ramps. Repaints only while the fade is live.
         if self.state.screen != self.last_screen {
             self.last_screen = self.state.screen;
-            self.screen_fade_start = Some(now);
+            // Reduced motion: no screen fade-in — the incoming screen appears at
+            // once (Part 7). Leaving screen_fade_start None yields opacity 1.0.
+            if !self.state.reduced_motion {
+                self.screen_fade_start = Some(now);
+            }
         }
         let content_opacity = match self.screen_fade_start {
             Some(started_at) => {
@@ -713,6 +720,12 @@ impl QwertyApp {
         let Some(tr) = self.state.theme_transition else {
             return tokens_for(self.state.config.theme, self.state.system_dark);
         };
+        // Reduced motion: switch themes instantly — no cross-fade traversal
+        // (Part 7). Clear the transition so no repaint is scheduled for it.
+        if self.state.reduced_motion {
+            self.state.theme_transition = None;
+            return tokens_for(tr.to, self.state.system_dark);
+        }
         let elapsed = now.saturating_duration_since(tr.started_at);
         let from = tokens_for(tr.from, self.state.system_dark);
         let to = tokens_for(tr.to, self.state.system_dark);

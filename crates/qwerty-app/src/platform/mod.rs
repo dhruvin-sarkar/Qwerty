@@ -135,6 +135,20 @@ pub fn platform_for_this_os() -> Box<dyn PlatformActions> {
     Box::new(windows::WindowsPlatform::new())
 }
 
+/// Whether the OS asks for reduced motion (`DESIGN.md`/`ACCEPTANCE.md`:
+/// accessibility). Read once at startup and cached in `AppState`. On Windows
+/// this consults the "show animations" accessibility setting; other platforms
+/// (none today) default to full motion until they implement their own read.
+#[cfg(windows)]
+pub fn os_prefers_reduced_motion() -> bool {
+    windows::os_prefers_reduced_motion()
+}
+
+#[cfg(not(windows))]
+pub fn os_prefers_reduced_motion() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
