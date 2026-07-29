@@ -152,6 +152,10 @@ struct QwertyApp {
     /// (Part 5). Updated on every nav change; the cascade is computed statelessly
     /// from this timestamp plus each item's index, so no per-item state persists.
     screen_entered_at: Instant,
+    /// A one-shot "calibration saved" celebration (Part 6): a stroke-drawn
+    /// checkmark + bloom overlaid after a *confirmed* save, then cleared. `None`
+    /// except during that brief moment; never shown if the save failed.
+    calib_success: Option<AnimState>,
     /// Per-zone accept/reject pulse animations, keyed by `ZoneId`. Inserted (or
     /// replaced) each time a Home tap classifies to a zone; the value is the
     /// animation plus whether the tap was accepted (drives accept-glow vs.
@@ -264,6 +268,7 @@ impl QwertyApp {
             heartbeat: None,
             heartbeat_next_at: None,
             screen_entered_at: Instant::now(),
+            calib_success: None,
             zone_anim: HashMap::new(),
             home_extractor: FeatureExtractor::new(),
         }
@@ -565,6 +570,12 @@ impl eframe::App for QwertyApp {
                             self.state.screen = Screen::Home;
                             self.wizard = None;
                             self.refresh_profiles();
+                            // Celebrate a *confirmed* save (Part 6): a checkmark
+                            // draws itself over Home, then clears. Only on
+                            // success (this Ok arm), and only with motion on.
+                            if !self.state.reduced_motion {
+                                self.calib_success = Some(AnimState::start(motion::DELIBERATE));
+                            }
                         }
                         Err(e) => {
                             eprintln!("warning: could not save profile: {e}");
@@ -700,6 +711,10 @@ impl eframe::App for QwertyApp {
                 }
             });
 
+        // The calibration-success celebration draws on the foreground layer over
+        // whatever is showing (Home), then clears itself (Part 6).
+        self.calibration_success_overlay(ctx, &pal);
+
         // Keep frames coming while any zone pulse is mid-flight, then drop the
         // completed ones so an idle Home schedules no repaints (`PERFORMANCE.md`
         // redraw discipline). Each pulse was already painted this frame at its
@@ -811,6 +826,44 @@ impl QwertyApp {
         // Still animating: ask egui for another frame, then stop once settled.
         ctx.request_repaint();
         Tokens::lerp(&from, &to, eased)
+    }
+
+    /// The calibration-success celebration (Part 6): a checkmark that draws
+    /// itself stroke-by-stroke plus one bloom pulse, painted on the foreground
+    /// layer over the (already-restored) Home screen, then cleared once the
+    /// animation completes. A confirmation, not a cutscene — under `DELIBERATE`
+    /// (400 ms). Only ever runs after a *confirmed* save (set in the wizard Ok
+    /// arm), so it never celebrates a save that actually failed.
+    fn calibration_success_overlay(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(anim) = self.calib_success else {
+            return;
+        };
+        let t = anim.t(motion::STANDARD_EASE);
+        let center = ctx.screen_rect().center();
+        let scale = 46.0_f32;
+        // A foreground-layer painter isn't bound to any panel's clip rect, so the
+        // overlay floats cleanly over the whole window.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("calib_success_overlay"),
+        ));
+        // A soft success bloom rises then fades over the pulse (0→1→0 arc).
+        let bloom = (t * std::f32::consts::PI).sin();
+        paint::radial_bloom(&painter, center, scale * 1.4, pal.success, bloom * 0.7);
+        // The check reveals as a growing prefix of a densified two-segment path.
+        let path = checkmark_path(center, scale);
+        let visible = ((path.len() as f32) * t).ceil() as usize;
+        if visible >= 2 {
+            painter.add(egui::Shape::line(
+                path[..visible.min(path.len())].to_vec(),
+                egui::Stroke::new(4.0_f32, pal.success),
+            ));
+        }
+        if anim.is_complete() {
+            self.calib_success = None;
+        } else {
+            ctx.request_repaint_after(motion::AMBIENT_FRAME);
+        }
     }
 
     /// A dismissible banner shown above the active screen when a profile save
@@ -1801,6 +1854,28 @@ fn spring_to(
         ctx.request_repaint();
     }
     spring.value
+}
+
+/// A densified checkmark polyline centred on `center`, sized by `s` — two
+/// segments (short down-right, long up-right) sampled into many points so a
+/// growing prefix reveals it as a smooth self-drawing stroke (Part 6), not three
+/// coarse jumps.
+fn checkmark_path(center: egui::Pos2, s: f32) -> Vec<egui::Pos2> {
+    let p0 = center + egui::vec2(-s * 0.55, s * 0.02);
+    let p1 = center + egui::vec2(-s * 0.15, s * 0.42); // the bottom of the tick
+    let p2 = center + egui::vec2(s * 0.60, -s * 0.50);
+    let mut pts = Vec::with_capacity(25);
+    let n1 = 10;
+    for i in 0..=n1 {
+        let f = i as f32 / n1 as f32;
+        pts.push(p0 + (p1 - p0) * f);
+    }
+    let n2 = 14;
+    for i in 1..=n2 {
+        let f = i as f32 / n2 as f32;
+        pts.push(p1 + (p2 - p1) * f);
+    }
+    pts
 }
 
 /// Reveal fraction in `[0,1]` for a staggered screen-entry cascade (Part 5):
