@@ -472,12 +472,12 @@ impl eframe::App for QwertyApp {
             }
             let tokens = self.effective_tokens(ctx, now);
             ctx.set_visuals(visuals_for(&tokens));
-            let pal = Palette::from_tokens(&tokens);
+            let pal = Palette::from_tokens_glass(&tokens, self.state.config.theme == Theme::Translucent);
             let mut outcome = None;
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::default()
-                        .fill(with_alpha(pal.base, panel_alpha(self.state.config.theme, 205)))
+                        .fill(pal.base)
                         .inner_margin(style::margin(space::XXL)),
                 )
                 .show(ctx, |ui| {
@@ -553,7 +553,7 @@ impl eframe::App for QwertyApp {
         // Resolve this frame's effective tokens, advancing any theme cross-fade.
         let tokens = self.effective_tokens(ctx, now);
         ctx.set_visuals(visuals_for(&tokens));
-        let pal = Palette::from_tokens(&tokens);
+        let pal = Palette::from_tokens_glass(&tokens, self.state.config.theme == Theme::Translucent);
 
         self.nav_rail(ctx, &pal);
 
@@ -583,7 +583,7 @@ impl eframe::App for QwertyApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(with_alpha(pal.base, panel_alpha(self.state.config.theme, 205)))
+                    .fill(pal.base)
                     .inner_margin(style::margin(space::XL)),
             )
             .show(ctx, |ui| {
@@ -769,7 +769,7 @@ impl QwertyApp {
             .exact_width(224.0)
             .frame(
                 egui::Frame::default()
-                    .fill(with_alpha(pal.surface, panel_alpha(self.state.config.theme, 224)))
+                    .fill(pal.surface)
                     .inner_margin(style::margin(space::LG)),
             )
             .show(ctx, |ui| {
@@ -1565,20 +1565,6 @@ pub(crate) fn with_alpha(c: egui::Color32, a: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-/// Alpha for a panel background fill under the current theme. The Translucent
-/// theme paints its base/surface layers semi-transparent over the transparent
-/// window for a glass look (`translucent`); every other theme is fully opaque,
-/// so it renders identically to before on a transparent-capable window. Cards
-/// (`bg_elevated`) stay opaque regardless, so they read as solid panels
-/// floating on the glass.
-fn panel_alpha(theme: Theme, translucent: u8) -> u8 {
-    if theme == Theme::Translucent {
-        translucent
-    } else {
-        255
-    }
-}
-
 /// A custom-painted 1px horizontal rule with breathing room, replacing
 /// `ui.separator()` (Part 8) — a calm divider rather than egui's default line.
 /// `pub(crate)` so the calibration wizard's header rule matches every screen's.
@@ -1937,11 +1923,34 @@ pub(crate) struct Palette {
 }
 
 impl Palette {
-    pub(crate) fn from_tokens(t: &Tokens) -> Self {
+    /// A glass palette for the Translucent theme: the three *background* layers
+    /// (`base`/`surface`/`elevated`) carry an alpha so every frame filled with
+    /// them — the central panel, nav rail, cards, meters, tiles, and the wizard
+    /// — composites over the transparent window and reveals the desktop as plain
+    /// see-through glass (no blur; that would need the wgpu backend). Text and
+    /// accent/status colors stay fully opaque so they remain crisp on the glass.
+    ///
+    /// The alphas rise with the layer's role: the central panel (`base`) is the
+    /// most see-through, so the desk shows clearly in the negative space between
+    /// cards; the nav rail (`surface`) is a touch more solid; cards (`elevated`)
+    /// stay mostly opaque because that is where body text lives, so a busy
+    /// wallpaper can't bleed through and hurt legibility. `translucent == false`
+    /// yields fully-opaque layers, so every other theme renders exactly as before.
+    pub(crate) fn from_tokens_glass(t: &Tokens, translucent: bool) -> Self {
+        Self::build(t, translucent)
+    }
+
+    fn build(t: &Tokens, translucent: bool) -> Self {
+        let (base_a, surface_a, elevated_a) = if translucent {
+            (138u8, 160u8, 214u8)
+        } else {
+            (255, 255, 255)
+        };
+        let glass = |c: Color, a: u8| egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, a);
         Self {
-            base: c32(t.bg_base),
-            surface: c32(t.bg_surface),
-            elevated: c32(t.bg_elevated),
+            base: glass(t.bg_base, base_a),
+            surface: glass(t.bg_surface, surface_a),
+            elevated: glass(t.bg_elevated, elevated_a),
             text: c32(t.text_primary),
             secondary: c32(t.text_secondary),
             border: c32(t.border),
