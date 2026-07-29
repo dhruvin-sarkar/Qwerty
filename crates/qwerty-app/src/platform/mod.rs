@@ -114,10 +114,9 @@ pub fn dispatch(action: &ActionSpec, platform: &dyn PlatformActions) -> Result<(
 
 /// Run a zone's macro chain in order, stopping at the first failure (`DESIGN.md`
 /// → macro chains). Returns the index of the failing action alongside its error
-/// so the UI can point at exactly which step failed. Exercised by the unit
-/// tests now; the live path (fire a zone's chain on an accepted tap) wires it in
-/// a later phase.
-#[allow(dead_code)]
+/// so the UI can point at exactly which step failed. Called live from the Home
+/// listening loop when an accepted tap classifies to a zone (`shell.rs` →
+/// `reconcile_capture`), and from the per-action Test button.
 pub fn dispatch_chain(
     actions: &[ActionSpec],
     platform: &dyn PlatformActions,

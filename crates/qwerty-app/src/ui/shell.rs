@@ -20,7 +20,7 @@ use crate::ui::motion::AnimState;
 use crate::app_state::{AppState, ListeningState, ProfileSummary, Screen};
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::hotkeys::Hotkeys;
-use crate::platform::{platform_for_this_os, PlatformActions};
+use crate::platform::{dispatch_chain, platform_for_this_os, PlatformActions};
 use crate::tray::{Tray, TrayCommand};
 use crate::ui::action_editor::ActionEditor;
 use crate::ui::diagnostics::DiagnosticsScreen;
@@ -103,6 +103,11 @@ struct QwertyApp {
     /// above the active screen. `None` when there is nothing to report.
     /// Transient UI state only — never persisted.
     save_error: Option<String>,
+    /// The most recent live-tap action-chain failure (e.g. an app that
+    /// wouldn't launch), surfaced as a dismissible banner so a failed action
+    /// is never silent (`CLAUDE.md`: fail loudly). Holds the zone name and the
+    /// failing step. Transient UI state only — never persisted.
+    action_error: Option<String>,
     /// Set by the tray "Quit" item so the close-to-tray guard lets the close
     /// proceed to a real exit instead of hiding the window. One-shot: once the
     /// user has chosen to quit there is no path back, so it is never reset.
@@ -232,6 +237,7 @@ impl QwertyApp {
             evaluation: EvaluationScreen::default(),
             diagnostics: DiagnosticsScreen::default(),
             save_error: None,
+            action_error: None,
             force_quit: false,
             window_visible: true,
             profiles,
@@ -291,42 +297,82 @@ impl QwertyApp {
                 } => {
                     if is_transient {
                         self.live.taps += 1;
-                        // Drive the zone-tile pulse only while Home is the active
-                        // screen: the tiles (and their pulse) are painted nowhere
-                        // else, so classifying a tap and scheduling a 16 ms repaint
-                        // off-Home would animate something invisible — burning
-                        // frames against PERFORMANCE.md's redraw discipline. The
-                        // tap tally above still updates on every screen, so the
-                        // Home counters remain correct when the user returns.
-                        if self.state.screen == Screen::Home {
-                            // Light the zone the tap landed on (accept pulse) or
-                            // shake the nearest one (reject). Visual only — no
-                            // action is dispatched here. Use `feature_space`, not
-                            // `classify`: `classify` returns zone_id=None whenever
-                            // the novelty gate rejects, which discards the nearest
-                            // centroid and left the reject-shake branch in
-                            // `zone_tiles` unreachable. `feature_space` always
-                            // reports every zone's distance plus `accepted`, so the
-                            // nearest zone is known even on a reject ("heard a tap
-                            // near here, but rejected it").
+                        // The core loop: classify the tap and, if it is accepted,
+                        // fire the matched zone's action chain (`DESIGN.md`: a tap
+                        // on a zone triggers its bound actions). This runs on every
+                        // screen and even while hidden to the tray — acting on taps
+                        // in the background is the whole point of the app. Only the
+                        // zone-tile *pulse* is gated to Home below, because the
+                        // tiles are painted nowhere else, so animating off-Home
+                        // would burn frames on something invisible
+                        // (`PERFORMANCE.md` redraw discipline). The tap tally above
+                        // updates on every screen, so the Home counters stay correct.
+                        //
+                        // `feature_space` (not `classify`) is used because it
+                        // reports every zone's distance *plus* the pooled `accepted`
+                        // flag, so the nearest zone is known even on a reject (for
+                        // the reject-shake), and `accepted` is exactly the gate for
+                        // whether to act.
+                        if window.len() == FEATURE_WINDOW_SAMPLES {
+                            let fv = self.home_extractor.extract(&window);
+                            let mut action_error = None;
                             if let Some(profile) = self.state.active_profile.as_ref() {
-                                if window.len() == FEATURE_WINDOW_SAMPLES {
-                                    let fv = self.home_extractor.extract(&window);
-                                    let space = profile.classifier.feature_space(&fv);
-                                    if let Some(nearest) = space.zones.iter().min_by(|a, b| {
-                                        a.centroid_distance.total_cmp(&b.centroid_distance)
-                                    }) {
+                                let space = profile.classifier.feature_space(&fv);
+                                if let Some(nearest) = space.zones.iter().min_by(|a, b| {
+                                    a.centroid_distance.total_cmp(&b.centroid_distance)
+                                }) {
+                                    let zone_id = nearest.zone_id;
+                                    if self.state.screen == Screen::Home {
                                         let dur = if space.accepted {
                                             motion::QUICK
                                         } else {
                                             motion::INSTANT
                                         };
-                                        self.zone_anim.insert(
-                                            nearest.zone_id,
-                                            (AnimState::start(dur), space.accepted),
-                                        );
+                                        self.zone_anim
+                                            .insert(zone_id, (AnimState::start(dur), space.accepted));
+                                    }
+                                    // Fire the chain only on an accepted tap, and
+                                    // never when the live mic differs from the one
+                                    // this profile was calibrated on — a classifier
+                                    // fitted on one device is untrustworthy on
+                                    // another, so acting on it could fire the wrong
+                                    // action (`ACCEPTANCE.md`: block zone actions on
+                                    // a mic mismatch until recalibrated; the Home
+                                    // banner already prompts the recalibration).
+                                    let mic_matches = match (
+                                        self.live.device.as_deref(),
+                                        self.live.sample_rate,
+                                    ) {
+                                        (Some(name), Some(sr)) => !profile.needs_recalibration_for(
+                                            &DeviceFingerprint::from_device(name, sr),
+                                        ),
+                                        // No device info yet (stream still opening):
+                                        // don't act until we can confirm the mic.
+                                        _ => false,
+                                    };
+                                    if space.accepted && mic_matches {
+                                        if let Some(zone) =
+                                            profile.zones.iter().find(|z| z.id == zone_id)
+                                        {
+                                            if !zone.actions.is_empty() {
+                                                if let Err((step, e)) = dispatch_chain(
+                                                    &zone.actions,
+                                                    self.platform.as_ref(),
+                                                ) {
+                                                    action_error = Some(format!(
+                                                        "“{}” — action {} failed: {e}",
+                                                        zone.label,
+                                                        step + 1
+                                                    ));
+                                                }
+                                            }
+                                        }
                                     }
                                 }
+                            }
+                            // Set outside the profile borrow above.
+                            if action_error.is_some() {
+                                self.action_error = action_error;
                             }
                         }
                     } else {
@@ -592,6 +638,7 @@ impl eframe::App for QwertyApp {
                 }
                 self.config_error_banner(ui, &pal);
                 self.save_error_banner(ui, &pal);
+                self.action_error_banner(ui, &pal);
                 // Text-heavy screens scroll vertically (so nothing clips on a
                 // short window) inside a capped-width reading column (so long
                 // lines don't stretch edge-to-edge on a wide one — DESIGN.md:
@@ -674,49 +721,23 @@ impl QwertyApp {
     /// failure `CLAUDE.md` bans. It holds until dismissed (or cleared by a later
     /// successful save), so it needs no timer and no continuous repaint.
     fn save_error_banner(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let Some(msg) = self.save_error.clone() else {
-            return;
-        };
-        // Neutral raised fill with a danger border + glyph — not a danger-tinted
-        // fill. The error reads from color + glyph + border (DESIGN.md: never
-        // color alone), while the heading and message stay in text_primary so
-        // they clear WCAG AA. Danger *text* on a danger-tinted fill did not
-        // (4.05:1 in Daylight); every color used here is a pairing the theme
-        // contrast tests already cover (text on a layer; danger on bg_elevated).
-        let inner = egui::Frame::default()
-            .fill(pal.elevated)
-            .stroke(egui::Stroke::new(1.0_f32, pal.danger))
-            .inner_margin(style::margin(space::MD))
-            .corner_radius(style::rounding(radius::MD))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(icon::WARNING).color(pal.danger).strong());
-                    ui.label(
-                        egui::RichText::new("Couldn’t save")
-                            .color(pal.text)
-                            .strong(),
-                    );
-                    ui.label(egui::RichText::new(&msg).color(pal.text));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(egui::RichText::new(icon::X).color(pal.secondary))
-                            .on_hover_text("Dismiss")
-                            .clicked()
-                        {
-                            self.save_error = None;
-                        }
-                    });
-                });
-            });
-        // A 4px danger accent bar down the banner's left edge (Part 8) — a
-        // stronger "this is an error" cue than the thin all-round border alone.
-        let r = inner.response.rect;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 4.0, r.max.y)),
-            style::rounding(radius::MD),
-            pal.danger,
-        );
-        ui.add_space(space::MD);
+        if let Some(msg) = self.save_error.clone() {
+            if dismissible_error_banner(ui, pal, "Couldn’t save", &msg) {
+                self.save_error = None;
+            }
+        }
+    }
+
+    /// A dismissible banner for a live-tap action-chain failure (e.g. an app that
+    /// would not launch). A failed action must be visible, never a silent no-op
+    /// (`CLAUDE.md`: fail loudly). Shares the save banner's visual vocabulary and
+    /// shows on every screen, since taps fire actions on every screen.
+    fn action_error_banner(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        if let Some(msg) = self.action_error.clone() {
+            if dismissible_error_banner(ui, pal, "Action failed", &msg) {
+                self.action_error = None;
+            }
+        }
     }
 
     /// A persistent banner shown when `config.json` existed but could not be
@@ -1505,6 +1526,46 @@ fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
                 ui.label(egui::RichText::new(state.label()).color(pal.text).strong());
             });
         });
+}
+
+/// The shared visual for a dismissible error banner (profile-save and live-tap
+/// action failures both use it, so the two read as one error vocabulary): a
+/// neutral raised fill with a danger border, a 4px danger accent bar down the
+/// left edge, a ⚠ glyph and bold heading, the message, and an X to dismiss.
+/// Heading and message stay in primary text so they clear WCAG AA — the danger
+/// is carried by the glyph, border, and bar, never by text color alone
+/// (`DESIGN.md` → Accessibility). Returns whether the user clicked dismiss.
+fn dismissible_error_banner(ui: &mut egui::Ui, pal: &Palette, heading: &str, msg: &str) -> bool {
+    let mut dismissed = false;
+    let inner = egui::Frame::default()
+        .fill(pal.elevated)
+        .stroke(egui::Stroke::new(1.0_f32, pal.danger))
+        .inner_margin(style::margin(space::MD))
+        .corner_radius(style::rounding(radius::MD))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(icon::WARNING).color(pal.danger).strong());
+                ui.label(egui::RichText::new(heading).color(pal.text).strong());
+                ui.label(egui::RichText::new(msg).color(pal.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(egui::RichText::new(icon::X).color(pal.secondary))
+                        .on_hover_text("Dismiss")
+                        .clicked()
+                    {
+                        dismissed = true;
+                    }
+                });
+            });
+        });
+    let r = inner.response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 4.0, r.max.y)),
+        style::rounding(radius::MD),
+        pal.danger,
+    );
+    ui.add_space(space::MD);
+    dismissed
 }
 
 /// The maximum width of a text-heavy screen's content column. Chosen so it does
