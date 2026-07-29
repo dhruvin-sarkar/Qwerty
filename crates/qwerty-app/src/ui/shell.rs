@@ -1767,6 +1767,32 @@ fn spring_to(
     spring.value
 }
 
+/// A number that counts toward `target` instead of snapping (Part 2): a
+/// per-id [`Spring`](motion::Spring) kept in egui temp memory, initialised at
+/// `0.0` so a value counts *in* on its first render (an evaluation report that
+/// counts in reads as the app doing real work, not printing static JSON), then
+/// eases to any later target. `Stiff` — a number must never overshoot. Returns
+/// the current value to format each frame; self-schedules a repaint while still
+/// counting. Snaps to the target under reduced motion (Part 7). `pub(crate)` so
+/// the Evaluation screen can count its headline accuracy in.
+pub(crate) fn count_to(ctx: &egui::Context, id: egui::Id, target: f32, reduced: bool) -> f32 {
+    if reduced {
+        return target;
+    }
+    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+    let mut spring = ctx
+        .data_mut(|d| d.get_temp::<motion::Spring>(id))
+        .unwrap_or_else(|| motion::Spring::with_preset(0.0, motion::SpringPreset::Stiff));
+    spring.set_target(target);
+    spring.step(dt);
+    let settled = spring.is_settled();
+    ctx.data_mut(|d| d.insert_temp(id, spring));
+    if !settled {
+        ctx.request_repaint();
+    }
+    spring.value
+}
+
 /// A simple elevated card frame. `pub(crate)` so the action editor reuses it.
 pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::default()

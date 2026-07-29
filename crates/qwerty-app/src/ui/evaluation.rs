@@ -31,7 +31,9 @@ use qwerty_core::profile::{Profile, ProfileId, ZoneId};
 
 use crate::app_state::AppState;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
-use crate::ui::shell::{empty_state_note, mix, primary_button, screen_header, section, Palette};
+use crate::ui::shell::{
+    count_to, empty_state_note, mix, primary_button, screen_header, section, Palette,
+};
 use crate::ui::style::{self, radius, space, text};
 use egui_phosphor::regular as icon;
 
@@ -576,9 +578,19 @@ impl EvaluationScreen {
         } else {
             (icon::WARNING, pal.warning, "below the 92% target")
         };
+        // The hero number counts in from zero on first render (Part 2) rather
+        // than snapping — a report that counts in reads as real work. The
+        // verdict/threshold logic above is computed from the true value, so the
+        // pass/needs-work colour never lies during the count.
+        let shown = count_to(
+            ui.ctx(),
+            egui::Id::new("eval_headline_accuracy"),
+            report.overall_accuracy * 100.0,
+            state.reduced_motion,
+        );
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!("{:.1}%", report.overall_accuracy * 100.0))
+                egui::RichText::new(format!("{shown:.1}%"))
                     .color(color)
                     .size(text::DISPLAY)
                     .strong(),

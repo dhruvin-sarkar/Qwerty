@@ -288,8 +288,8 @@ impl Spring {
 
 /// Spring feel presets (`stiffness`, `damping`). Kept as three named feels so a
 /// call site picks an intent, never raw physics constants.
-// Smooth is in use (nav/swatch hover); Stiff and Bouncy are reserved for the
-// focus-ring and toggle-knob interactions (a later Part 2 commit).
+// Smooth (nav/swatch hover) and Stiff (number count-up) are in use; Bouncy is
+// reserved for the toggle-knob interaction (a later Part 2 commit).
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum SpringPreset {
