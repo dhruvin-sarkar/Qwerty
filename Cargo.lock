@@ -2656,6 +2656,7 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "global-hotkey",
+ "png",
  "qwerty-core",
  "rtrb",
  "tray-icon",

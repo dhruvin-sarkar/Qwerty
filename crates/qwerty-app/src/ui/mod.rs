@@ -7,6 +7,7 @@
 pub mod action_editor;
 pub mod diagnostics;
 pub mod evaluation;
+pub mod icon;
 pub mod motion;
 pub mod paint;
 pub mod shell;

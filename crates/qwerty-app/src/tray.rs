@@ -143,31 +143,13 @@ fn tooltip(state: ListeningState) -> String {
     format!("Qwerty — {}", state.label())
 }
 
-/// A 32×32 RGBA icon: a filled disc in the status color on a transparent
-/// background. Distinct color per state (`DESIGN.md`: listening/paused/error),
-/// generated deterministically so no image file is needed.
+/// The tray icon: the keycap app mark with a state-colored status dot in the
+/// corner (`DESIGN.md`: the tray reflects listening/paused/error at a glance).
+/// The RGBA is produced by [`crate::ui::icon::tray_rgba`], which decodes the
+/// bundled keycap once and composites the dot per state.
 fn status_icon(state: ListeningState) -> Icon {
-    let (r, g, b) = match state {
-        ListeningState::Listening => (0x35, 0xC4, 0x6B), // success green
-        ListeningState::Paused => (0x9A, 0xA6, 0xB2),    // neutral gray
-        ListeningState::Error => (0xF0, 0x6A, 0x6A),     // danger red
-    };
-    const SIZE: u32 = 32;
-    let (cx, cy, radius) = (15.5_f32, 15.5_f32, 14.0_f32);
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
-            if (dx * dx + dy * dy).sqrt() <= radius {
-                let i = ((y * SIZE + x) * 4) as usize;
-                rgba[i] = r;
-                rgba[i + 1] = g;
-                rgba[i + 2] = b;
-                rgba[i + 3] = 255;
-            }
-        }
-    }
-    // A hardcoded 32×32 buffer is always a valid icon; a failure here would be
-    // a programmer error, not a runtime condition.
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("32x32 RGBA is a valid tray icon")
+    let (rgba, w, h) = crate::ui::icon::tray_rgba(state);
+    // A fixed-size, in-memory RGBA buffer is always a valid icon; a failure here
+    // would be a programmer error, not a runtime condition.
+    Icon::from_rgba(rgba, w, h).expect("keycap tray icon is valid RGBA")
 }

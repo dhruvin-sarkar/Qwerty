@@ -57,6 +57,8 @@ pub fn run() -> eframe::Result<()> {
             .with_title("Qwerty")
             .with_inner_size([1040.0, 720.0])
             .with_min_inner_size([840.0, 560.0])
+            // The keycap app icon (window title bar + taskbar).
+            .with_icon(std::sync::Arc::new(crate::ui::icon::app_icon()))
             // Transparent-capable so the Translucent theme can paint see-through
             // glass panels; every opaque theme fills alpha 255 and looks normal.
             .with_transparent(true),

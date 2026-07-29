@@ -37,3 +37,7 @@ egui = { workspace = true }
 egui-phosphor = { version = "0.9", default-features = false, features = ["regular"] }
 tray-icon = { workspace = true }
 global-hotkey = { workspace = true }
+# Decode the bundled app icon (assets/icon.png) at startup into raw RGBA for the
+# window/taskbar icon and the tray icon. Pinned to 0.18 — the version already in
+# the lockfile via tray-icon, so this adds no new dependency, only a direct edge.
+png = "0.18"
