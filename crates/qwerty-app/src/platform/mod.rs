@@ -11,6 +11,12 @@
 #[cfg(windows)]
 pub mod windows;
 
+/// The interactive region-select overlay for the region-select screenshot
+/// action. Windows-only and used only by `windows.rs`; a future Linux backend
+/// would provide its own selector.
+#[cfg(windows)]
+mod region_select;
+
 use std::path::Path;
 
 use qwerty_core::profile::{ActionSpec, KeyCombo, ScreenshotMode, SystemSound};
@@ -45,9 +51,6 @@ pub enum ActionError {
     Notification(String),
     /// Playing a system sound failed.
     Sound(String),
-    /// An action variant the current build cannot perform (today: region-select
-    /// screenshot). A loud, honest state, not a silent no-op.
-    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for ActionError {
@@ -63,9 +66,6 @@ impl std::fmt::Display for ActionError {
             ActionError::Screenshot(e) => write!(f, "screenshot error: {e}"),
             ActionError::Notification(e) => write!(f, "notification error: {e}"),
             ActionError::Sound(e) => write!(f, "sound error: {e}"),
-            ActionError::Unsupported(what) => {
-                write!(f, "not supported on this build: {what}")
-            }
         }
     }
 }

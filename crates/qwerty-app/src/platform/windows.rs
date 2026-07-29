@@ -161,6 +161,78 @@ pub(crate) fn set_start_with_windows(enabled: bool) -> Result<(), String> {
     result
 }
 
+/// Capture a sub-rectangle of the virtual screen — `src_x`, `src_y` in
+/// virtual-screen pixels, size `w`x`h` — to the clipboard as an RGBA image.
+/// Shared by both screenshot modes (full-screen passes the whole virtual
+/// screen; region-select passes the user's chosen rectangle). Kept a safe fn
+/// with one internal `unsafe` block, like the code it was extracted from.
+fn capture_rect_to_clipboard(src_x: i32, src_y: i32, w: i32, h: i32) -> Result<(), ActionError> {
+    if w <= 0 || h <= 0 {
+        return Err(ActionError::Screenshot("capture rectangle is empty".into()));
+    }
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return Err(ActionError::Screenshot("GetDC(NULL) returned null".into()));
+        }
+
+        let grab = || -> Result<(usize, usize, Vec<u8>), ActionError> {
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, bmp.into());
+            let blt = BitBlt(mem, 0, 0, w, h, Some(screen), src_x, src_y, SRCCOPY);
+            let mut bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // negative => top-down rows
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0, // BI_RGB
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4]; // BGRX
+                                                                      // With a buffer supplied, GetDIBits returns the number of scan
+                                                                      // lines copied; require the FULL height, not merely nonzero, so
+                                                                      // a short copy is a loud error rather than a truncated image.
+            let lines = GetDIBits(
+                mem,
+                bmp,
+                0,
+                h as u32,
+                Some(buf.as_mut_ptr().cast()),
+                &mut bi,
+                DIB_RGB_COLORS,
+            );
+            let ok = blt.is_ok() && lines == h;
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            if !ok {
+                return Err(ActionError::Screenshot("BitBlt/GetDIBits failed".into()));
+            }
+            // BGRX -> RGBA (arboard wants meaningful RGBA; force opaque alpha).
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+                px[3] = 255;
+            }
+            Ok((w as usize, h as usize, buf))
+        };
+        let result = grab();
+        let _ = ReleaseDC(None, screen);
+        let (wi, hi, rgba) = result?;
+        let mut cb = Clipboard::new().map_err(|e| ActionError::Screenshot(e.to_string()))?;
+        cb.set_image(ImageData {
+            width: wi,
+            height: hi,
+            bytes: rgba.into(),
+        })
+        .map_err(|e| ActionError::Screenshot(e.to_string()))
+    }
+}
+
 /// The Windows action backend.
 ///
 /// It holds two lazily-created, then long-lived, handles. Both live behind a
@@ -412,84 +484,33 @@ impl PlatformActions for WindowsPlatform {
     }
 
     fn screenshot_to_clipboard(&self, mode: ScreenshotMode) -> Result<(), ActionError> {
-        match mode {
-            ScreenshotMode::RegionSelect => {
-                return Err(ActionError::Unsupported("region-select screenshot"))
-            }
-            ScreenshotMode::FullScreen => {}
-        }
-        unsafe {
-            let (x, y) = (
+        // The virtual screen (the bounding box of every monitor) is the shared
+        // coordinate space for both the region-select overlay and the capture.
+        let (vx, vy, vw, vh) = unsafe {
+            (
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
                 GetSystemMetrics(SM_YVIRTUALSCREEN),
-            );
-            let (w, h) = (
                 GetSystemMetrics(SM_CXVIRTUALSCREEN),
                 GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            );
-            if w <= 0 || h <= 0 {
-                return Err(ActionError::Screenshot("virtual screen size is 0".into()));
-            }
-            let screen = GetDC(None);
-            if screen.is_invalid() {
-                return Err(ActionError::Screenshot("GetDC(NULL) returned null".into()));
-            }
-
-            let grab = || -> Result<(usize, usize, Vec<u8>), ActionError> {
-                let mem = CreateCompatibleDC(Some(screen));
-                let bmp = CreateCompatibleBitmap(screen, w, h);
-                let old = SelectObject(mem, bmp.into());
-                let blt = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY);
-                let mut bi = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: w,
-                        biHeight: -h, // negative => top-down rows
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: 0, // BI_RGB
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                let mut buf = vec![0u8; (w as usize) * (h as usize) * 4]; // BGRX
-                                                                          // With a buffer supplied, GetDIBits returns the number of scan
-                                                                          // lines copied; require the FULL height, not merely nonzero, so
-                                                                          // a short copy is a loud error rather than a truncated image.
-                let lines = GetDIBits(
-                    mem,
-                    bmp,
-                    0,
-                    h as u32,
-                    Some(buf.as_mut_ptr().cast()),
-                    &mut bi,
-                    DIB_RGB_COLORS,
-                );
-                let ok = blt.is_ok() && lines == h;
-                SelectObject(mem, old);
-                let _ = DeleteObject(bmp.into());
-                let _ = DeleteDC(mem);
-                if !ok {
-                    return Err(ActionError::Screenshot("BitBlt/GetDIBits failed".into()));
-                }
-                // BGRX -> RGBA (arboard wants meaningful RGBA; force opaque alpha).
-                for px in buf.chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                    px[3] = 255;
-                }
-                Ok((w as usize, h as usize, buf))
-            };
-            let result = grab();
-            let _ = ReleaseDC(None, screen);
-            let (wi, hi, rgba) = result?;
-            let mut cb = Clipboard::new().map_err(|e| ActionError::Screenshot(e.to_string()))?;
-            cb.set_image(ImageData {
-                width: wi,
-                height: hi,
-                bytes: rgba.into(),
-            })
-            .map_err(|e| ActionError::Screenshot(e.to_string()))
+            )
+        };
+        if vw <= 0 || vh <= 0 {
+            return Err(ActionError::Screenshot("virtual screen size is 0".into()));
         }
+
+        let (x, y, w, h) = match mode {
+            ScreenshotMode::FullScreen => (vx, vy, vw, vh),
+            ScreenshotMode::RegionSelect => {
+                match super::region_select::select_screen_region(vx, vy, vw, vh) {
+                    Some(rect) => rect,
+                    // The user dismissed the overlay without selecting — a
+                    // deliberate no-capture, not a failure.
+                    None => return Ok(()),
+                }
+            }
+        };
+
+        capture_rect_to_clipboard(x, y, w, h)
     }
 
     fn speak(&self, text: &str) -> Result<(), ActionError> {
