@@ -646,7 +646,14 @@ impl EvaluationScreen {
                     .get(i)
                     .and_then(|z| report.per_zone_accuracy.get(z).copied())
                     .unwrap_or(0.0);
-                bar_row(ui, pal, label, acc);
+                bar_row(
+                    ui,
+                    pal,
+                    label,
+                    acc,
+                    egui::Id::new(("eval_zone_bar", i)),
+                    state.reduced_motion,
+                );
             }
             ui.add_space(space::LG);
 
@@ -757,11 +764,16 @@ impl EvaluationScreen {
 }
 
 /// A labeled horizontal accuracy bar in `[0, 1]`.
-fn bar_row(ui: &mut egui::Ui, pal: &Palette, label: &str, frac: f32) {
-    let frac = frac.clamp(0.0, 1.0);
-    let color = if frac >= TARGET_ACCURACY {
+fn bar_row(ui: &mut egui::Ui, pal: &Palette, label: &str, frac: f32, id: egui::Id, reduced: bool) {
+    let target = frac.clamp(0.0, 1.0);
+    // Count the bar in from zero on first render (Part 2): both the fill width
+    // and the % text track the counted value, so the bar grows as the number
+    // rises. The threshold colour is keyed off the true `target`, not the
+    // counting value, so it never flickers between bands mid-count.
+    let shown = (count_to(ui.ctx(), id, target * 100.0, reduced) / 100.0).clamp(0.0, 1.0);
+    let color = if target >= TARGET_ACCURACY {
         pal.success
-    } else if frac >= 0.75 {
+    } else if target >= 0.75 {
         pal.warning
     } else {
         pal.danger
@@ -770,9 +782,9 @@ fn bar_row(ui: &mut egui::Ui, pal: &Palette, label: &str, frac: f32) {
         let (resp, painter) = ui.allocate_painter(egui::vec2(220.0, 18.0), egui::Sense::hover());
         let r = resp.rect;
         painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
-        let filled = egui::Rect::from_min_size(r.min, egui::vec2(r.width() * frac, r.height()));
+        let filled = egui::Rect::from_min_size(r.min, egui::vec2(r.width() * shown, r.height()));
         painter.rect_filled(filled, style::rounding(radius::XS), color);
-        ui.label(egui::RichText::new(format!("{:.1}%  {label}", frac * 100.0)).color(pal.text));
+        ui.label(egui::RichText::new(format!("{:.1}%  {label}", shown * 100.0)).color(pal.text));
     });
 }
 
