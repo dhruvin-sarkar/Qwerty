@@ -592,12 +592,18 @@ impl eframe::App for QwertyApp {
                 }
                 self.config_error_banner(ui, &pal);
                 self.save_error_banner(ui, &pal);
+                // Text-heavy screens scroll vertically (so nothing clips on a
+                // short window) inside a capped-width reading column (so long
+                // lines don't stretch edge-to-edge on a wide one — DESIGN.md:
+                // generous whitespace, a Win11-style content column). The viz
+                // screens opt out: their waveform/spectrogram/matrix want the
+                // full width, and they manage their own scrolling.
                 match self.state.screen {
-                    Screen::Home => self.home(ui, &pal),
-                    Screen::Zones => self.zones(ui, &pal),
+                    Screen::Home => screen_body(ui, |ui| self.home(ui, &pal)),
+                    Screen::Zones => screen_body(ui, |ui| self.zones(ui, &pal)),
+                    Screen::Settings => screen_body(ui, |ui| self.settings(ui, &pal, now)),
                     Screen::Diagnostics => self.diagnostics.ui(ui, &pal, &self.state),
                     Screen::Evaluation => self.evaluation.ui(ui, &pal, &self.state),
-                    Screen::Settings => self.settings(ui, &pal, now),
                 }
             });
 
@@ -1498,6 +1504,28 @@ fn status_pill(ui: &mut egui::Ui, pal: &Palette, state: ListeningState) {
                 ui.label(egui::RichText::new(glyph).color(color).strong());
                 ui.label(egui::RichText::new(state.label()).color(pal.text).strong());
             });
+        });
+}
+
+/// The maximum width of a text-heavy screen's content column. Chosen so it does
+/// not bind at the default window size (≈780px of content area) — the app looks
+/// unchanged out of the box — and only takes effect when the user widens the
+/// window, keeping line lengths comfortable rather than letting paragraphs run
+/// the full width of a maximized display (`DESIGN.md` → Layout: generous
+/// whitespace, a Windows-11-style readable content column).
+const CONTENT_MAX_W: f32 = 820.0;
+
+/// Wrap a text-heavy screen's body in a vertical scroll area capped to a
+/// comfortable reading width. The scroll area fills the panel (so a short window
+/// scrolls instead of clipping) while `set_max_width` keeps the content column
+/// from stretching edge-to-edge on a wide one. Diagnostics/Evaluation deliberately
+/// do *not* use this — their plots want the full width and scroll themselves.
+fn screen_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_max_width(CONTENT_MAX_W);
+            add(ui);
         });
 }
 
