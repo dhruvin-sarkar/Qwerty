@@ -225,8 +225,6 @@ impl AnimState {
 /// current position and velocity, not from a fixed start/end pair. Integrated
 /// with semi-implicit Euler; pure and egui-free, so the physics is unit-tested
 /// with no window involved.
-// Consumed by the micro-interaction pass (Part 2); allow until then.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Spring {
     pub value: f32,
@@ -236,8 +234,11 @@ pub struct Spring {
     damping: f32,
 }
 
-#[allow(dead_code)] // consumed by the micro-interaction pass (Part 2)
 impl Spring {
+    /// A spring with the default (`Smooth`) feel. Part of the primitive's API
+    /// and exercised by the unit tests; the shell's `spring_to` uses
+    /// `with_preset` directly, so this carries an allow in the binary build.
+    #[allow(dead_code)]
     pub fn new(initial: f32) -> Self {
         Self::with_preset(initial, SpringPreset::Smooth)
     }
@@ -270,8 +271,11 @@ impl Spring {
         self.value
     }
 
-    /// Jump straight to the target with zero velocity — used under reduced
-    /// motion, where a spring must not visibly travel.
+    /// Jump straight to the target with zero velocity. The reduced-motion path
+    /// is handled at the consumer (`spring_to` early-returns the target without
+    /// stepping), so this is currently exercised only by the unit tests; kept as
+    /// part of the primitive's API for a direct consumer that stores a spring.
+    #[allow(dead_code)]
     pub fn snap_to_target(&mut self) {
         self.value = self.target;
         self.velocity = 0.0;
@@ -284,7 +288,9 @@ impl Spring {
 
 /// Spring feel presets (`stiffness`, `damping`). Kept as three named feels so a
 /// call site picks an intent, never raw physics constants.
-#[allow(dead_code)] // consumed by the micro-interaction pass (Part 2)
+// Smooth is in use (nav/swatch hover); Stiff and Bouncy are reserved for the
+// focus-ring and toggle-knob interactions (a later Part 2 commit).
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum SpringPreset {
     /// No overshoot. Precise — focus rings, meter needles, anything that should
@@ -298,7 +304,6 @@ pub enum SpringPreset {
     Bouncy,
 }
 
-#[allow(dead_code)] // consumed by the micro-interaction pass (Part 2)
 impl SpringPreset {
     fn constants(self) -> (f32, f32) {
         match self {

@@ -901,9 +901,10 @@ impl QwertyApp {
                 );
                 ui.add_space(space::LG);
 
+                let reduced = self.state.reduced_motion;
                 for screen in Screen::ALL {
                     let selected = self.state.screen == screen;
-                    if nav_item(ui, pal, nav_icon(screen), screen.label(), selected) {
+                    if nav_item(ui, pal, nav_icon(screen), screen.label(), selected, reduced) {
                         self.state.screen = screen;
                     }
                     ui.add_space(space::XXS);
@@ -1398,7 +1399,7 @@ impl QwertyApp {
                 for (theme, name) in THEME_CHOICES {
                     let selected = self.state.config.theme == theme;
                     let tokens = tokens_for(theme, self.state.system_dark);
-                    if theme_swatch(ui, pal, name, &tokens, selected)
+                    if theme_swatch(ui, pal, name, &tokens, selected, self.state.reduced_motion)
                         && self.state.begin_theme_switch(theme, now)
                     {
                         if let Err(e) = self.state.save_config() {
@@ -1520,7 +1521,14 @@ fn nav_icon(screen: Screen) -> &'static str {
     }
 }
 
-fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected: bool) -> bool {
+fn nav_item(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    glyph: &str,
+    label: &str,
+    selected: bool,
+    reduced: bool,
+) -> bool {
     let height = 36.0;
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
@@ -1533,10 +1541,15 @@ fn nav_item(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, selected
         selected,
         motion::QUICK.as_secs_f32(),
     );
-    let hover_t = ui.ctx().animate_bool_with_time(
-        egui::Id::new(("nav_hover", label)),
-        resp.hovered() && !selected,
-        motion::INSTANT.as_secs_f32(),
+    // Hover is interruptible (rapid pointer on/off), so it rides a Spring rather
+    // than a fixed-duration tween: an interrupted enter/leave settles
+    // continuously instead of restarting (Part 2 / the audit's spring-vs-anim).
+    let hover_t = spring_to(
+        ui.ctx(),
+        egui::Id::new(("nav_hover_spring", label)),
+        if resp.hovered() && !selected { 1.0 } else { 0.0 },
+        motion::SpringPreset::Smooth,
+        reduced,
     );
 
     let painter = ui.painter();
@@ -1722,6 +1735,38 @@ pub(crate) fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
+/// Advance a per-widget [`Spring`](motion::Spring) toward `target` and return its
+/// value. The spring persists across frames in egui's temp memory keyed by `id`,
+/// so re-targeting mid-flight (a rapid hover on/off) redirects continuously
+/// instead of restarting a fixed-duration tween — the reason [`Spring`] exists.
+/// Self-schedules a repaint while unsettled, exactly like
+/// `animate_bool_with_time`. Under reduced motion it snaps to the target and
+/// schedules nothing (Part 7). dt comes from egui's `stable_dt` (its own
+/// animation delta), clamped so a stall can't blow up the simulation.
+fn spring_to(
+    ctx: &egui::Context,
+    id: egui::Id,
+    target: f32,
+    preset: motion::SpringPreset,
+    reduced: bool,
+) -> f32 {
+    if reduced {
+        return target;
+    }
+    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+    let mut spring = ctx
+        .data_mut(|d| d.get_temp::<motion::Spring>(id))
+        .unwrap_or_else(|| motion::Spring::with_preset(target, preset));
+    spring.set_target(target);
+    spring.step(dt);
+    let settled = spring.is_settled();
+    ctx.data_mut(|d| d.insert_temp(id, spring));
+    if !settled {
+        ctx.request_repaint();
+    }
+    spring.value
+}
+
 /// A simple elevated card frame. `pub(crate)` so the action editor reuses it.
 pub(crate) fn card(ui: &mut egui::Ui, pal: &Palette, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::default()
@@ -1880,12 +1925,25 @@ fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
 /// a design-tool color chip rather than a dropdown row. Selected gets an accent
 /// border; hover adds a faint accent tint; keyboard focus draws a ring. Returns
 /// whether it was clicked.
-fn theme_swatch(ui: &mut egui::Ui, pal: &Palette, name: &str, tokens: &Tokens, selected: bool) -> bool {
+fn theme_swatch(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    name: &str,
+    tokens: &Tokens,
+    selected: bool,
+    reduced: bool,
+) -> bool {
     ui.vertical(|ui| {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(80.0, 56.0), egui::Sense::click());
-        let hover = ui
-            .ctx()
-            .animate_bool_with_time(resp.id, resp.hovered(), motion::INSTANT.as_secs_f32());
+        // Interruptible hover → Spring (Part 2 / audit), so a rapid pointer
+        // in/out settles continuously rather than restarting a fixed tween.
+        let hover = spring_to(
+            ui.ctx(),
+            resp.id.with("swatch_hover_spring"),
+            if resp.hovered() { 1.0 } else { 0.0 },
+            motion::SpringPreset::Smooth,
+            reduced,
+        );
         let round = style::rounding(radius::SM);
         let painter = ui.painter();
         painter.rect_filled(rect, round, c32(tokens.bg_surface));
