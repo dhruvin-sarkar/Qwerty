@@ -595,6 +595,22 @@ impl eframe::App for QwertyApp {
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         let showing = self.window_visible && !minimized;
 
+        // Tray heartbeat while hidden. A viewport hidden to the tray (or
+        // minimized) receives no OS redraws, so the tray forwarder's
+        // `request_repaint()` never actually runs `update()` — tray menu clicks
+        // and the left-click-to-open would queue forever and do nothing (the
+        // window could not even reopen itself). A timer wake fires regardless of
+        // visibility, so keep a slow heartbeat whenever hidden and a tray exists:
+        // the loop wakes ~5x/s, drains `tray.poll()` in `handle_external_events`,
+        // and acts within ~200 ms. It paints nothing (the window is hidden), so
+        // it pumps events, not frames — the "no frames while hidden" budget
+        // (`PERFORMANCE.md`) is about rendering, which this does not do. The first
+        // heartbeat is armed by the same `update()` that hid the window, so the
+        // cycle is self-sustaining.
+        if !showing && self.tray.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+
         // The calibration wizard takes over the entire window when active.
         if self.wizard.is_some() {
             self.capture = None; // the wizard owns its own mic
