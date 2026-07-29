@@ -187,6 +187,10 @@ impl EvalRun {
                 // Evaluation requests `CaptureDetail::Standard`; display frames
                 // are a Diagnostics-only concern.
                 CaptureEvent::Frame { .. } => {}
+                // A held-out run collects a fixed set of labelled taps; a dropped
+                // sample just means the tap is re-tapped. No separate surface —
+                // Home owns the overload warning for always-on listening.
+                CaptureEvent::Overrun { .. } => {}
                 CaptureEvent::Failed(msg) => self.capture_error = Some(msg),
             }
         }

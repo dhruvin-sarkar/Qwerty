@@ -329,6 +329,11 @@ impl Wizard {
                 // never computes display frames for it. Named explicitly rather
                 // than swept up by a catch-all arm.
                 CaptureEvent::Frame { .. } => {}
+                // The wizard captures a fixed count of accepted taps, so a
+                // dropped sample just means the user taps again — no separate
+                // surface here (Home is the always-on listening path that owns
+                // the overload warning).
+                CaptureEvent::Overrun { .. } => {}
                 CaptureEvent::Failed(msg) => self.capture_error = Some(msg),
             }
         }

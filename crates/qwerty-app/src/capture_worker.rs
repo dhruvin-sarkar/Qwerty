@@ -57,12 +57,13 @@ pub enum CaptureDetail {
 /// An event from the capture worker to the UI thread.
 #[derive(Debug, Clone)]
 pub enum CaptureEvent {
-    /// The device opened and streaming started. `sample_rate` is consumed by
-    /// the calibration wizard (Phase 4b.2) to flag device/DSP-rate mismatch;
-    /// Home listening reads only `device_name`.
+    /// The device opened and streaming started. Both fields are live: Home
+    /// listening and the wizard pair `device_name` + `sample_rate` into the
+    /// current `DeviceFingerprint`, which gates action-firing and drives the
+    /// "recalibrate — the mic changed" warning (`shell.rs`, `wizard.rs`). The
+    /// Diagnostics/Evaluation screens read only `device_name`.
     Started {
         device_name: String,
-        #[allow(dead_code)]
         sample_rate: u32,
     },
     /// A periodic input-level sample (linear amplitudes in `[0, 1]`).
@@ -96,9 +97,33 @@ pub enum CaptureEvent {
         waveform: Vec<f32>,
         bands: [f32; SPECTRAL_BAND_COUNT],
     },
+    /// The capture ring overflowed: the consumer (this worker) fell behind the
+    /// real-time callback and samples were dropped rather than blocking the
+    /// audio thread (`audio_thread.rs`). `dropped` is the **cumulative** total so
+    /// far this session. Emitted only when that total grows, so a healthy run
+    /// never sends it. The UI surfaces it loudly (`CLAUDE.md`: fail fast, don't
+    /// let capture degrade silently) because dropped samples mean taps in that
+    /// window were missed with no other visible symptom. Sent regardless of the
+    /// visibility gate — a stall can happen while hidden to the tray — but it
+    /// only *wakes* the UI when visible, per the redraw discipline.
+    Overrun { dropped: usize },
     /// The device failed to open, or the stream faulted mid-session (unplugged,
     /// permission revoked). Terminal — the worker exits after sending this.
     Failed(String),
+}
+
+/// Report a newly-grown cumulative drop count. Returns `Some(current)` when
+/// `current` exceeds the last-seen value (updating `last` to match), else
+/// `None`. Factored out as the one piece of real logic on the drop path — the
+/// "only tell the UI when it actually got worse" rule — so it can be unit-tested
+/// without a live audio device.
+fn newly_dropped(current: usize, last: &mut usize) -> Option<usize> {
+    if current > *last {
+        *last = current;
+        Some(current)
+    } else {
+        None
+    }
 }
 
 /// A running capture worker. Dropping it stops the worker thread and closes the
@@ -190,6 +215,9 @@ fn run_worker(
     let mut buf: Vec<f32> = Vec::new();
     let (mut sum_sq, mut count, mut peak) = (0.0f64, 0usize, 0.0f32);
     let mut last_level = Instant::now();
+    // Last cumulative ring-overflow count reported to the UI, so we only send an
+    // `Overrun` when it actually grows (see `newly_dropped`).
+    let mut last_dropped = 0usize;
 
     // Diagnostics-only state: a bounded rolling tail of recent audio plus the
     // extractor that turns its newest feature window into a spectrum column.
@@ -249,6 +277,16 @@ fn run_worker(
         }
 
         if last_level.elapsed() >= LEVEL_INTERVAL {
+            // Ring-overflow check, on the same cadence as the meter. Reported
+            // whenever the cumulative count grows — even while hidden, so a
+            // background stall is still visible when the window returns — but it
+            // only requests a repaint when visible (redraw discipline).
+            if let Some(dropped) = newly_dropped(cap.dropped(), &mut last_dropped) {
+                let _ = tx.send(CaptureEvent::Overrun { dropped });
+                if visible.load(Ordering::Relaxed) {
+                    ctx.request_repaint();
+                }
+            }
             // Report the meter only while the UI is visible — a hidden window
             // has no meter to animate. Reset the accumulators regardless, so
             // they never grow unbounded and the RMS isn't stale on return.
@@ -337,5 +375,23 @@ mod tests {
         assert!(envelope(&[0.5, 0.5], 0).is_empty());
         // More requested points than samples must not panic or produce empties.
         assert_eq!(envelope(&[0.2, 0.4], 8).len(), 8);
+    }
+
+    #[test]
+    fn newly_dropped_reports_only_on_growth() {
+        let mut last = 0usize;
+        // A healthy start (no drops yet) says nothing.
+        assert_eq!(newly_dropped(0, &mut last), None);
+        // First drops → report the cumulative total and remember it.
+        assert_eq!(newly_dropped(5, &mut last), Some(5));
+        assert_eq!(last, 5);
+        // No further growth → stay silent (no repeated warnings on a steady count).
+        assert_eq!(newly_dropped(5, &mut last), None);
+        // More drops → report the new cumulative total.
+        assert_eq!(newly_dropped(8, &mut last), Some(8));
+        assert_eq!(last, 8);
+        // A count that somehow regressed is not "worse" → silent.
+        assert_eq!(newly_dropped(7, &mut last), None);
+        assert_eq!(last, 8, "the high-water mark never rolls backwards");
     }
 }

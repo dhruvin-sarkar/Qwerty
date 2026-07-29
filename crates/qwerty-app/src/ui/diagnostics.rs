@@ -147,6 +147,9 @@ impl DiagnosticsScreen {
                         is_transient,
                     });
                 }
+                // Ring overflow is surfaced on Home (the always-on listening
+                // path); the Diagnostics live views don't add a second warning.
+                CaptureEvent::Overrun { .. } => {}
                 CaptureEvent::Failed(msg) => {
                     self.error = Some(msg);
                     self.capture = None;

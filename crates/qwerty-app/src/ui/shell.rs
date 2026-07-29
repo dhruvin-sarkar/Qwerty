@@ -47,6 +47,12 @@ struct LiveStatus {
     peak_hold: f32,
     taps: u32,
     rejects: u32,
+    /// Cumulative count of samples the capture ring dropped because the UI
+    /// thread fell behind (`CaptureEvent::Overrun`). `0` on a healthy run;
+    /// surfaced on Home when non-zero so a stall that silently swallows taps is
+    /// visible rather than mysterious. Reset with the rest of `LiveStatus` each
+    /// time listening (re)starts.
+    dropped: usize,
     error: Option<String>,
 }
 
@@ -428,6 +434,10 @@ impl QwertyApp {
                 // Home listening requests `CaptureDetail::Standard`; display
                 // frames belong to the Diagnostics screen's own capture.
                 CaptureEvent::Frame { .. } => {}
+                // Ring overflow: the UI fell behind and taps may have been
+                // missed. Record the cumulative total; the Home panel surfaces
+                // it so the degradation isn't silent.
+                CaptureEvent::Overrun { dropped } => self.live.dropped = dropped,
                 CaptureEvent::Failed(msg) => {
                     self.live.error = Some(msg);
                     self.state.listening = ListeningState::Error;
@@ -1107,6 +1117,22 @@ impl QwertyApp {
                                 .color(pal.warning),
                             );
                         }
+                    }
+
+                    // Fail loud on capture overload: if the ring dropped samples,
+                    // taps in that window were missed with no other symptom, so
+                    // say so plainly rather than letting it look like a
+                    // misclassification (`CLAUDE.md`: no silent degradation).
+                    if self.live.dropped > 0 {
+                        ui.add_space(space::SM);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠ {} audio sample(s) dropped — the system fell behind and \
+                                 some taps may have been missed. Close heavy background apps.",
+                                self.live.dropped
+                            ))
+                            .color(pal.warning),
+                        );
                     }
                 }
                 ListeningState::Error => {
