@@ -1522,27 +1522,53 @@ impl QwertyApp {
 
         card(ui, pal, |ui| {
             section(ui, pal, "Startup");
-            // "Start with Windows" has no OS startup entry wired behind it in
-            // this build, so it is shown disabled rather than as a toggle that
-            // silently persists a value nothing acts on (DESIGN.md honest
-            // framing; mirrors the Diagnostics "not available in this build"
-            // treatment of Active/Hybrid sensing). Registering a real startup
-            // entry is deferred to the packaging phase (`ROADMAP.md` Phase 9).
-            ui.add_enabled(
-                false,
-                egui::Checkbox::new(
-                    &mut self.state.config.start_with_windows,
-                    "Start Qwerty when I sign in",
-                ),
-            );
+            let reduced = self.state.reduced_motion;
+            // "Start with Windows" writes a per-user Run-key entry via
+            // `platform::set_start_with_windows`. The OS write is the source of
+            // truth; `config.start_with_windows` mirrors the user's intent and
+            // is persisted only once that write succeeds. If the OS refuses, the
+            // optimistic toggle is undone and the reason surfaced (CLAUDE.md:
+            // fail loud, never persist a value nothing acted on).
+            let startup_changed = ui
+                .horizontal(|ui| {
+                    let r = toggle(
+                        ui,
+                        pal,
+                        &mut self.state.config.start_with_windows,
+                        reduced,
+                    )
+                    .changed();
+                    ui.add_space(space::SM);
+                    ui.label(
+                        egui::RichText::new("Start Qwerty when I sign in").color(pal.text),
+                    );
+                    r
+                })
+                .inner;
+            if startup_changed {
+                let desired = self.state.config.start_with_windows;
+                match crate::platform::set_start_with_windows(desired) {
+                    Ok(()) => {
+                        if let Err(e) = self.state.save_config() {
+                            self.save_error = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        // Undo the toggle so the UI never shows a state the OS
+                        // isn't actually in, and say why.
+                        self.state.config.start_with_windows = !desired;
+                        self.save_error =
+                            Some(format!("Couldn't update the startup setting: {e}"));
+                    }
+                }
+            }
             ui.label(
-                egui::RichText::new("Not available in this build yet.")
+                egui::RichText::new("Adds a per-user startup entry — no admin needed.")
                     .color(pal.secondary)
                     .size(text::CAPTION),
             );
             ui.add_space(space::SM);
             // This one *is* wired — the close-to-tray guard reads it.
-            let reduced = self.state.reduced_motion;
             let changed = ui
                 .horizontal(|ui| {
                     let r = toggle(

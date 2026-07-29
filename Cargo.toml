@@ -49,6 +49,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Registry",
 ] }
 arboard = "3"
 # Speech + toast, the last two ActionSpec variants. These were stubbed as

@@ -16,7 +16,11 @@ use arboard::{Clipboard, ImageData};
 use qwerty_core::profile::{KeyCombo, Modifier, ScreenshotMode, SystemSound};
 use tts::Tts;
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
-use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_SET_VALUE, REG_SZ,
+};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY,
@@ -75,6 +79,86 @@ pub(crate) fn os_prefers_reduced_motion() -> bool {
             false
         }
     }
+}
+
+/// Register or remove this executable's "Start with Windows" entry under the
+/// per-user Run key (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+///
+/// Per-user (HKCU, not HKLM) needs no admin rights and matches this app's
+/// local-only, single-user nature. `enabled == true` writes the value to the
+/// current exe's quoted path; `false` removes it. On any failure this returns a
+/// human-readable message for the UI to show — a loud error, never a silent
+/// no-op (`CLAUDE.md`: fail fast). Signatures verified against the installed
+/// `windows-0.62.2` source, like the rest of this module: the `Reg*` calls
+/// return a `WIN32_ERROR` (compared against `ERROR_SUCCESS`), and
+/// `RegSetValueExW` takes the value as an `Option<&[u8]>`.
+pub(crate) fn set_start_with_windows(enabled: bool) -> Result<(), String> {
+    // Resolve the value to write up front, before touching the registry, so the
+    // only fallible step while the key handle is open is the registry call
+    // itself — nothing early-returns and leaks the `HKEY`.
+    let command = if enabled {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("could not resolve this app's path: {e}"))?;
+        // Quote the path so a space in it can't split the launch command line.
+        Some(format!("\"{}\"", exe.display()))
+    } else {
+        None
+    };
+
+    // The Run key exists on every Windows install, so open it (not create it)
+    // for writing.
+    let mut hkey = HKEY(std::ptr::null_mut());
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            None,
+            KEY_SET_VALUE,
+            &mut hkey,
+        )
+    };
+    if opened != ERROR_SUCCESS {
+        return Err(format!(
+            "could not open the startup registry key (code {})",
+            opened.0
+        ));
+    }
+
+    let result = match command {
+        Some(cmd) => {
+            // REG_SZ stores a NUL-terminated UTF-16 string; hand the API a byte
+            // view of the wide buffer (`wide` must outlive the call — it does,
+            // it lives to the end of this arm).
+            let wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes =
+                unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2) };
+            let code =
+                unsafe { RegSetValueExW(hkey, w!("Qwerty"), None, REG_SZ, Some(bytes)) };
+            if code == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!("could not write the startup entry (code {})", code.0))
+            }
+        }
+        None => {
+            let code = unsafe { RegDeleteValueW(hkey, w!("Qwerty")) };
+            // Deleting a value that isn't there still yields the desired
+            // end-state (no startup entry), so treat "not found" as success.
+            if code == ERROR_SUCCESS || code == ERROR_FILE_NOT_FOUND {
+                Ok(())
+            } else {
+                Err(format!(
+                    "could not remove the startup entry (code {})",
+                    code.0
+                ))
+            }
+        }
+    };
+
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    result
 }
 
 /// The Windows action backend.

@@ -149,6 +149,21 @@ pub fn os_prefers_reduced_motion() -> bool {
     false
 }
 
+/// Register or remove this app's per-user "Start with Windows" entry
+/// (`HKCU\...\CurrentVersion\Run` on Windows). Called from the Settings toggle;
+/// returns a human-readable error the UI surfaces on failure. Other platforms
+/// have no such registry, so they report the feature is unavailable rather than
+/// pretending success (`CLAUDE.md`: one correct path, no silent fallbacks).
+#[cfg(windows)]
+pub fn set_start_with_windows(enabled: bool) -> Result<(), String> {
+    windows::set_start_with_windows(enabled)
+}
+
+#[cfg(not(windows))]
+pub fn set_start_with_windows(_enabled: bool) -> Result<(), String> {
+    Err("Start with Windows is only available on Windows.".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
