@@ -477,10 +477,15 @@ pub(crate) fn parse_versioned<T: DeserializeOwned>(
     file: &str,
 ) -> Result<T, PersistenceError> {
     let value: serde_json::Value = serde_json::from_str(s).map_err(PersistenceError::Json)?;
+    // `u32::try_from` (not `as u32`): a hand-edited/corrupt file carrying an
+    // out-of-range version (e.g. 2^32+1) would silently *truncate* under `as`
+    // and could wrap onto a valid `expected`, slipping past the very
+    // schema-mismatch guard this function exists to enforce. An out-of-range
+    // version instead becomes `None` → `0` → a loud `SchemaMismatch`.
     let found = value
         .get("schema_version")
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
+        .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(0);
     if found != expected {
         return Err(PersistenceError::SchemaMismatch {
@@ -678,6 +683,22 @@ mod tests {
             } => {
                 assert_eq!(file, "config.json");
                 assert_eq!(found, 999);
+                assert_eq!(expected, CONFIG_SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn out_of_range_schema_version_is_a_mismatch_not_truncated() {
+        // A version beyond u32 (here 2^32 + 1) must NOT be truncated with `as`
+        // into a value that could wrap onto `expected` and slip past the guard.
+        // It is out of range → treated as 0 → a loud SchemaMismatch.
+        let mut v: serde_json::Value = serde_json::from_str(&Config::default().to_json()).unwrap();
+        v["schema_version"] = serde_json::json!(4_294_967_297u64); // 2^32 + 1, ≡ 1 mod 2^32
+        match Config::from_json(&v.to_string(), "config.json").unwrap_err() {
+            PersistenceError::SchemaMismatch { found, expected, .. } => {
+                assert_eq!(found, 0, "an out-of-range version must not truncate to 1");
                 assert_eq!(expected, CONFIG_SCHEMA_VERSION);
             }
             other => panic!("expected SchemaMismatch, got {other:?}"),

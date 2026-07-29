@@ -87,7 +87,16 @@ struct SyntheticDesk {
 impl SyntheticDesk {
     fn new(zone_count: usize) -> Self {
         // Base frequency per zone spread across the audible band, each with a
-        // small harmonic stack.
+        // small harmonic stack. NOTE: this fixture gives every zone the *same*
+        // harmonic-ratio template scaled by a per-zone fundamental, so it is a
+        // faithful sanity check only at the default zone count it was validated
+        // against (≈99% at 4 zones). It is deliberately NOT used to assert a
+        // multi-zone *accuracy* floor: at higher zone counts the scaled-template
+        // signatures crowd together in a way that reflects the fixture's own
+        // degeneracy, not the classifier — real multi-zone accuracy is gated by
+        // the hardware-based ≥92% row in ACCEPTANCE.md, not by this generator.
+        // (The `--zones` flag on the soak example exists to *explore* that
+        // synthetic separability, not to gate on it.)
         let zone_partials = (0..zone_count)
             .map(|z| {
                 let base = 700.0 + z as f32 * 430.0;
@@ -140,6 +149,25 @@ impl SyntheticDesk {
         clip.extend(std::iter::repeat_n(0.0, FEATURE_WINDOW_SAMPLES));
         clip
     }
+
+    /// A *foreign* tap-like transient: a fast-decaying broadband noise burst.
+    /// Crucially it has the SAME sharp attack + fast decay as a real tap, so it
+    /// PASSES the onset detector's sustain gate and reaches the classifier —
+    /// unlike [`sustained`], which onset rejects before the classifier sees it.
+    /// But its spectrum is broadband noise, matching no calibrated zone's peaky
+    /// harmonic signature, so the classifier's *novelty gate* must reject it.
+    /// This is what makes the novelty gate actually testable end-to-end.
+    fn foreign_tap(&self, rng: &mut Lcg) -> Vec<f32> {
+        let n = FEATURE_WINDOW_SAMPLES;
+        let mut clip = vec![0.0f32; LEAD_SILENCE];
+        for i in 0..n {
+            let t = i as f32 / SAMPLE_RATE_HZ as f32;
+            let env = (-t * 130.0).exp(); // same decay envelope as a real tap
+            clip.push(0.6 * env * rng.next_bipolar());
+        }
+        clip.extend(std::iter::repeat_n(0.0, n));
+        clip
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,20 +193,43 @@ impl Default for SoakConfig {
 }
 
 /// Outcome counts from one or more batches.
+///
+/// Invariant: `taps == correct + rejected_taps + misclassified`. Splitting
+/// "clean miss" (`rejected_taps`) from "confidently wrong zone"
+/// (`misclassified`) matters for root-causing per the detective method — a
+/// pooled `taps - correct` would hide which failure mode a regression hit.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BatchTally {
     /// Tap clips presented (one per zone per batch).
     pub taps: u32,
     /// Taps accepted and assigned to the correct zone.
     pub correct: u32,
-    /// Real taps not credited as correct: no onset detected, the onset rejected
-    /// as non-transient by the sustain gate, or an accepted onset rejected by
-    /// the classifier's novelty gate.
+    /// Real taps not credited as correct because they were *rejected*: no onset
+    /// detected, the onset rejected as non-transient by the sustain gate, or an
+    /// accepted onset rejected by the classifier's novelty gate.
     pub rejected_taps: u32,
+    /// Real taps that were accepted but assigned to the *wrong* zone. Distinct
+    /// from `rejected_taps`: the gate let them through, the classifier misread
+    /// the location. Also depresses `accuracy()` (in the denominator, not the
+    /// numerator), but is tracked separately so a soak log is diagnosable.
+    pub misclassified: u32,
     /// Sustained (non-tap) clips presented.
     pub sustained: u32,
-    /// Sustained clips wrongly accepted as a tap — MUST stay zero.
+    /// Sustained clips wrongly accepted as a tap — MUST stay zero. Exercises the
+    /// onset detector's sustain gate (sustained sounds don't decay, so they are
+    /// rejected before the classifier ever sees them).
     pub sustained_false_accepts: u32,
+    /// Foreign *transients* that reached the classifier: tap-like impulses
+    /// (sharp attack, fast decay — so they PASS the onset sustain gate) whose
+    /// acoustic signature matches no calibrated zone. This is the population the
+    /// classifier's novelty gate exists to reject; counting it proves the gate
+    /// is actually exercised (unlike sustained sounds, which never get past
+    /// onset). MUST be > 0 for the false-accept check below to be meaningful.
+    pub foreign_transients: u32,
+    /// Foreign transients wrongly accepted as a calibrated zone — the novelty
+    /// gate failing. MUST stay zero. A regression that widened the novelty
+    /// threshold to accept-everything shows up here (and nowhere else).
+    pub foreign_false_accepts: u32,
 }
 
 impl BatchTally {
@@ -186,8 +237,11 @@ impl BatchTally {
         self.taps += o.taps;
         self.correct += o.correct;
         self.rejected_taps += o.rejected_taps;
+        self.misclassified += o.misclassified;
         self.sustained += o.sustained;
         self.sustained_false_accepts += o.sustained_false_accepts;
+        self.foreign_transients += o.foreign_transients;
+        self.foreign_false_accepts += o.foreign_false_accepts;
     }
 
     /// Fraction of presented taps assigned to the correct zone.
@@ -208,6 +262,12 @@ pub struct Soak {
     desk: SyntheticDesk,
     zone_ids: Vec<ZoneId>,
     rng: Lcg,
+    /// A *separate* generator for the foreign-transient population, seeded
+    /// independently so drawing foreign clips cannot perturb the RNG stream that
+    /// drives tap jitter — otherwise adding the novelty-gate check would shift
+    /// the very accuracy it sits beside (the tap/sustained streams stay bit-for-
+    /// bit what they were before foreign transients existed).
+    foreign_rng: Lcg,
     config: SoakConfig,
     batch: u64,
 }
@@ -241,6 +301,7 @@ impl Soak {
             desk,
             zone_ids,
             rng,
+            foreign_rng: Lcg::new(0xF0),
             config,
             batch: 0,
         }
@@ -263,6 +324,9 @@ impl Soak {
                     tally.rejected_taps += 1;
                 } else if c.zone_id == Some(zid) {
                     tally.correct += 1;
+                } else {
+                    // Accepted, but the classifier named the wrong zone.
+                    tally.misclassified += 1;
                 }
             } else {
                 tally.rejected_taps += 1;
@@ -278,6 +342,24 @@ impl Soak {
                     let fv = self.extractor.extract(&ev.window);
                     if self.classifier.classify(&fv).accepted {
                         tally.sustained_false_accepts += 1;
+                    }
+                }
+            }
+        }
+
+        // Foreign transients: tap-like impulses that ARE accepted by the onset
+        // sustain gate (they decay) but match no calibrated zone — the exact
+        // population the classifier's novelty gate must reject. Counting the
+        // ones that reach `classify()` proves the gate is genuinely exercised.
+        for _ in 0..self.config.sustained_per_batch {
+            let clip = self.desk.foreign_tap(&mut self.foreign_rng);
+            let mut detector = OnsetDetector::new();
+            for ev in detector.process(&clip) {
+                if ev.is_transient {
+                    tally.foreign_transients += 1;
+                    let fv = self.extractor.extract(&ev.window);
+                    if self.classifier.classify(&fv).accepted {
+                        tally.foreign_false_accepts += 1;
                     }
                 }
             }
@@ -333,6 +415,72 @@ mod tests {
         assert_eq!(
             tally.sustained_false_accepts, 0,
             "sustained sounds produced false accepts"
+        );
+    }
+
+    #[test]
+    fn novelty_gate_rejects_foreign_transients() {
+        // Closes the blind spot the sustained-sound test leaves open: sustained
+        // sounds never pass the onset gate, so they never reach the classifier.
+        // Foreign transients DO reach it (tap-like decay, non-zone spectrum), so
+        // this is the only end-to-end test of the classifier's novelty gate. A
+        // regression that widened the threshold to accept-everything fails here.
+        let mut soak = Soak::new(SoakConfig::default());
+        let mut tally = BatchTally::default();
+        for _ in 0..50 {
+            tally.add(&soak.run_batch());
+        }
+        assert!(
+            tally.foreign_transients >= 100,
+            "novelty gate was not exercised: only {} foreign transients reached it",
+            tally.foreign_transients
+        );
+        assert_eq!(
+            tally.foreign_false_accepts, 0,
+            "novelty gate accepted a foreign (non-zone) transient as a tap"
+        );
+    }
+
+    #[test]
+    fn novelty_gate_holds_across_all_supported_zone_counts() {
+        // The "never fire on a non-tap" safety property must hold at every zone
+        // count the product offers (2/4/6/8), unlike synthetic *accuracy*, which
+        // is only a faithful sanity check at the default config. This assertion
+        // is fixture-independent: foreign broadband-noise transients must be
+        // novelty-rejected regardless of how many zones are calibrated.
+        for zone_count in [2usize, 4, 6, 8] {
+            let mut soak = Soak::new(SoakConfig {
+                zone_count,
+                ..SoakConfig::default()
+            });
+            let mut tally = BatchTally::default();
+            for _ in 0..20 {
+                tally.add(&soak.run_batch());
+            }
+            assert!(
+                tally.foreign_transients > 0,
+                "{zone_count} zones: novelty gate not exercised"
+            );
+            assert_eq!(
+                tally.foreign_false_accepts, 0,
+                "{zone_count} zones: a foreign transient was accepted as a tap"
+            );
+        }
+    }
+
+    #[test]
+    fn tally_accounts_for_every_presented_tap() {
+        // The BatchTally invariant: every presented tap is exactly one of
+        // correct / rejected / misclassified — no outcome silently dropped.
+        let mut soak = Soak::new(SoakConfig::default());
+        let mut tally = BatchTally::default();
+        for _ in 0..30 {
+            tally.add(&soak.run_batch());
+        }
+        assert_eq!(
+            tally.taps,
+            tally.correct + tally.rejected_taps + tally.misclassified,
+            "a presented tap fell through all three outcome buckets"
         );
     }
 

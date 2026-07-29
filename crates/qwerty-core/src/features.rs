@@ -287,6 +287,14 @@ fn compute_band_bins(fft_size: usize, sample_rate: u32, band_count: usize) -> Ve
     for i in 0..band_count {
         let lo = edges[i];
         let hi = edges[i + 1].max(lo + 1).min(max_bin);
+        // Invariant: every band spans at least one real bin. This can only be
+        // violated if a future constant change (band_count / BAND_LOW_HZ /
+        // sample_rate) pushes `lo` to saturate at `max_bin`, collapsing the
+        // range to empty — which would then feed `power[lo..hi]` a zero-length
+        // slice and silently drop a band. Fail loudly in debug builds rather
+        // than ship a silently-degraded feature space; the invariant test below
+        // pins it for the shipped constants.
+        debug_assert!(hi > lo, "band {i} collapsed to an empty bin range ({lo}..{hi})");
         ranges.push((lo, hi));
     }
     ranges
@@ -300,6 +308,22 @@ mod tests {
         (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE_HZ as f32).sin())
             .collect()
+    }
+
+    #[test]
+    fn band_bins_are_nonempty_monotonic_and_in_range() {
+        // Pins the "each band spans ≥1 bin" invariant for the shipped constants
+        // (the latent collapse guarded by the debug_assert in compute_band_bins).
+        let max_bin = FEATURE_WINDOW_SAMPLES / 2;
+        let bins = compute_band_bins(FEATURE_WINDOW_SAMPLES, SAMPLE_RATE_HZ, SPECTRAL_BAND_COUNT);
+        assert_eq!(bins.len(), SPECTRAL_BAND_COUNT);
+        let mut prev_lo = 0usize;
+        for (i, &(lo, hi)) in bins.iter().enumerate() {
+            assert!(hi > lo, "band {i} is empty: {lo}..{hi}");
+            assert!(hi <= max_bin, "band {i} exceeds Nyquist bin: {hi} > {max_bin}");
+            assert!(lo >= prev_lo, "band {i} lo {lo} went backwards from {prev_lo}");
+            prev_lo = lo;
+        }
     }
 
     #[test]

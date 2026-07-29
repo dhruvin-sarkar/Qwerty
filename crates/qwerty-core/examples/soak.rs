@@ -24,7 +24,10 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 fn main() {
     let duration = Duration::from_secs(parse_duration_secs());
 
-    let config = SoakConfig::default();
+    let config = SoakConfig {
+        zone_count: parse_zone_count(),
+        ..SoakConfig::default()
+    };
     println!(
         "qwerty-core soak: {} zones, duration {}s",
         config.zone_count,
@@ -75,9 +78,12 @@ fn main() {
     println!("taps presented:        {}", tally.taps);
     println!("correct zone:          {}", tally.correct);
     println!("rejected taps (miss):  {}", tally.rejected_taps);
+    println!("misclassified (wrong): {}", tally.misclassified);
     println!("clean accuracy:        {:.4}", tally.accuracy());
     println!("sustained presented:   {}", tally.sustained);
     println!("sustained FALSE accept:{}", tally.sustained_false_accepts);
+    println!("foreign transients:    {}", tally.foreign_transients);
+    println!("foreign FALSE accept:  {}", tally.foreign_false_accepts);
     println!(
         "live heap start/end:   {} / {} bytes  (peak {} bytes)",
         heap_start, heap_end, heap_peak
@@ -97,6 +103,19 @@ fn main() {
     }
     if growth_pct.abs() >= 5.0 {
         failures.push(format!("live heap growth {growth_pct:+.3}% exceeds ±5%"));
+    }
+    if tally.foreign_false_accepts != 0 {
+        failures.push(format!(
+            "{} foreign transients accepted by the novelty gate (must be 0)",
+            tally.foreign_false_accepts
+        ));
+    }
+    // Guard against a vacuous novelty check: if no foreign transient ever
+    // reached the classifier, the false-accept count above proves nothing.
+    if tally.foreign_transients == 0 {
+        failures.push(
+            "no foreign transients reached the novelty gate — the gate was not exercised".into(),
+        );
     }
 
     if failures.is_empty() {
@@ -125,4 +144,23 @@ fn parse_duration_secs() -> u64 {
         }
     }
     30
+}
+
+/// Parse `--zones <n>`; default 4. Restricted to the product's supported zone
+/// counts (2/4/6/8, per `DESIGN.md`) — this both matches what the app offers
+/// and keeps `zone_count` ≥ 2, so `Soak::new` always has zones to calibrate.
+fn parse_zone_count() -> usize {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--zones" {
+            match args.next().and_then(|v| v.parse::<usize>().ok()) {
+                Some(n @ (2 | 4 | 6 | 8)) => return n,
+                _ => {
+                    eprintln!("--zones requires one of: 2, 4, 6, 8");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    4
 }

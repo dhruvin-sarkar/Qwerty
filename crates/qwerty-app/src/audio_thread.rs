@@ -139,6 +139,51 @@ fn resolve_device(selector: Option<&str>) -> Result<cpal::Device, CaptureError> 
     Err(CaptureError::DeviceNotFound(sel.to_string()))
 }
 
+/// Choose the input config to open. Prefers a config that supports the DSP
+/// core's tuned rate (`SAMPLE_RATE_HZ`, 44.1 kHz) exactly, because `onset` and
+/// `features` compute their window timing (`HOP`, `EDGE_SAMPLES`) and spectral
+/// band→frequency mapping (`compute_band_bins`) against that constant — a
+/// device negotiated at, say, 48 kHz (a common Windows default) would shift the
+/// ~92.9 ms window and misalign every band. This closes the "the pipeline
+/// resamples/validates against this" gap documented in `features.rs`: we pick
+/// 44.1 kHz when the hardware offers it, rather than blindly taking whatever
+/// `default_input_config()` returns. Only when no supported range covers
+/// 44.1 kHz do we fall back to the device default (still internally consistent,
+/// since calibration and live classification then use the same rate) — and the
+/// negotiated rate remains visible via [`AudioSource::sample_rate`] for the UI.
+fn choose_input_config(
+    device: &cpal::Device,
+) -> Result<cpal::SupportedStreamConfig, CaptureError> {
+    let target = cpal::SampleRate(SAMPLE_RATE_HZ);
+    if let Ok(ranges) = device.supported_input_configs() {
+        let mut best: Option<cpal::SupportedStreamConfigRange> = None;
+        for r in ranges {
+            if r.min_sample_rate() <= target && target <= r.max_sample_rate() {
+                // Prefer an f32 range (no per-sample conversion); otherwise take
+                // the first range that can hit 44.1 kHz.
+                let better = match &best {
+                    None => true,
+                    Some(b) => {
+                        r.sample_format() == cpal::SampleFormat::F32
+                            && b.sample_format() != cpal::SampleFormat::F32
+                    }
+                };
+                if better {
+                    best = Some(r);
+                }
+            }
+        }
+        if let Some(r) = best {
+            return Ok(r.with_sample_rate(target));
+        }
+    }
+    // No range covers 44.1 kHz (or the device wouldn't enumerate configs):
+    // fall back to the device's own default so capture still works.
+    device
+        .default_input_config()
+        .map_err(CaptureError::DefaultConfig)
+}
+
 /// An open capture stream on the default input device. Holds the live `cpal`
 /// stream and the consumer end of the sample ring.
 pub struct AudioCapture {
@@ -166,9 +211,7 @@ impl AudioCapture {
     pub fn open(selector: Option<&str>) -> Result<Self, CaptureError> {
         let device = resolve_device(selector)?;
         let device_name = device.name().map_err(CaptureError::DeviceName)?;
-        let supported = device
-            .default_input_config()
-            .map_err(CaptureError::DefaultConfig)?;
+        let supported = choose_input_config(&device)?;
 
         let sample_format = supported.sample_format();
         let channels = supported.channels();
