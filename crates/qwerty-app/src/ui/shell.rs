@@ -156,6 +156,14 @@ struct QwertyApp {
     /// checkmark + bloom overlaid after a *confirmed* save, then cleared. `None`
     /// except during that brief moment; never shown if the save failed.
     calib_success: Option<AnimState>,
+    /// Epoch for the shared [`AmbientClock`](motion::AmbientClock) — the single
+    /// per-frame clock driving the background breathe (Part 4). Set on the first
+    /// frame; elapsed seconds since it feed the breathing sine.
+    ambient_epoch: Instant,
+    /// Smoothed input level for the desk's RMS-reactive glow (Part 4): the desk
+    /// visually breathes a little harder when the room is louder. A `Smooth`
+    /// spring so it tracks the ~20 Hz level without flickering per audio callback.
+    rms_glow: motion::Spring,
     /// Per-zone accept/reject pulse animations, keyed by `ZoneId`. Inserted (or
     /// replaced) each time a Home tap classifies to a zone; the value is the
     /// animation plus whether the tap was accepted (drives accept-glow vs.
@@ -269,6 +277,8 @@ impl QwertyApp {
             heartbeat_next_at: None,
             screen_entered_at: Instant::now(),
             calib_success: None,
+            ambient_epoch: Instant::now(),
+            rms_glow: motion::Spring::with_preset(0.0, motion::SpringPreset::Smooth),
             zone_anim: HashMap::new(),
             home_extractor: FeatureExtractor::new(),
         }
@@ -641,6 +651,31 @@ impl eframe::App for QwertyApp {
         ctx.set_visuals(visuals_for(&tokens));
         let pal = Palette::from_tokens_glass(&tokens, self.state.config.theme == Theme::Translucent);
 
+        // --- Ambient system, computed once per frame (Parts 3-4) ---
+        // "Alive" = the user is watching the desk listen: listening, on Home,
+        // window visible, a profile loaded, motion on. Only then do the desk
+        // breathe + react; tray-hidden or off-Home it is fully idle (zero
+        // frames). The shared AmbientClock drives the background breathe; a
+        // Smooth spring tracks the input level for the desk's reactive glow.
+        let ambient = motion::AmbientClock {
+            seconds: now.saturating_duration_since(self.ambient_epoch).as_secs_f32(),
+        };
+        let alive = self.state.listening == ListeningState::Listening
+            && showing
+            && self.state.screen == Screen::Home
+            && self.state.active_profile.is_some()
+            && !self.state.reduced_motion;
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        self.rms_glow
+            .set_target(if alive { self.live.rms.clamp(0.0, 1.0).sqrt() } else { 0.0 });
+        self.rms_glow.step(dt);
+        // The central panel fill breathes ±a hair of lightness while alive.
+        let panel_fill = if alive {
+            breathe_color(pal.base, ambient.breathe(motion::BACKGROUND_BREATHE_PERIOD_SECS))
+        } else {
+            pal.base
+        };
+
         self.nav_rail(ctx, &pal);
 
         // Screen-transition fade (`MOTION.md` → Screen transition): when the nav
@@ -674,7 +709,7 @@ impl eframe::App for QwertyApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(pal.base)
+                    .fill(panel_fill)
                     .inner_margin(style::margin(space::XL)),
             )
             .show(ctx, |ui| {
@@ -724,49 +759,37 @@ impl eframe::App for QwertyApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        // The listening heartbeat (Part 3) and the single ambient repaint
-        // decision (`PERFORMANCE.md`: this is the one place ambient effects
-        // schedule a frame — never scattered into home()/zone_tiles()). A slow
-        // ring pulses from the desk while idle + listening on Home. It is a
-        // scheduled one-shot: between pulses we request exactly one wake-up when
-        // the next beat is due; only while a pulse is expanding do we run at
-        // ~30fps. Paused, off-Home, hidden, or reduced-motion → no beat, no
-        // frames.
-        let heartbeat_ctx = self.state.listening == ListeningState::Listening
-            && showing
-            && self.state.screen == Screen::Home
-            && self.state.active_profile.is_some()
-            && !self.state.reduced_motion;
-        if heartbeat_ctx {
+        // The listening heartbeat (Part 3): schedule a slow ring on its period
+        // while alive; don't start one over an active tap pulse (the tap is the
+        // real signal). Cleared the moment we leave the alive state.
+        if alive {
             match self.heartbeat {
                 Some(anim) if anim.is_complete() => self.heartbeat = None,
-                Some(_) => {} // a pulse is expanding; repaint scheduled below
+                Some(_) => {}
                 None => {
                     let due = *self
                         .heartbeat_next_at
                         .get_or_insert(now + motion::HEARTBEAT_PERIOD);
-                    // Don't start a beat over an active tap pulse — the tap is
-                    // the signal that matters; the heartbeat is only ambient.
                     if now >= due && self.zone_anim.is_empty() {
                         self.heartbeat = Some(AnimState::start(motion::HEARTBEAT_PULSE_LEN));
                         self.heartbeat_next_at = Some(now + motion::HEARTBEAT_PERIOD);
                     }
                 }
             }
-            if self.heartbeat.is_some() {
-                ctx.request_repaint_after(motion::AMBIENT_FRAME);
-            } else if let Some(due) = self.heartbeat_next_at {
-                // Wake exactly when the next pulse is due — not a poll loop.
-                ctx.request_repaint_after(due.saturating_duration_since(now));
-            }
         } else {
             self.heartbeat = None;
             self.heartbeat_next_at = None;
         }
 
-        // Keep frames coming through a staggered screen-entry cascade (Part 5),
-        // then stop — bounded by STAGGER_TOTAL, so it never becomes a loop.
-        if !self.state.reduced_motion && now < self.screen_entered_at + motion::STAGGER_TOTAL {
+        // THE single ambient repaint decision (`PERFORMANCE.md`: the one place
+        // ambient effects schedule a frame — never scattered into paint code).
+        // While alive the desk breathes + reacts to input at ~30fps; otherwise
+        // we only keep frames for a decaying glow or a screen-entry stagger, and
+        // go fully idle (zero frames) when neither applies — the tray-hidden
+        // always-on case in particular.
+        let stagger_active =
+            !self.state.reduced_motion && now < self.screen_entered_at + motion::STAGGER_TOTAL;
+        if alive || !self.rms_glow.is_settled() || stagger_active {
             ctx.request_repaint_after(motion::AMBIENT_FRAME);
         }
 
@@ -1108,6 +1131,7 @@ impl QwertyApp {
         let heartbeat = self.heartbeat;
         let entered_at = self.screen_entered_at;
         let reduced = self.state.reduced_motion;
+        let rms_glow = self.rms_glow.value.clamp(0.0, 1.0);
         if let Some(profile) = self.state.active_profile.as_ref() {
             zone_tiles(
                 ui,
@@ -1118,6 +1142,7 @@ impl QwertyApp {
                 entered_at,
                 now,
                 reduced,
+                rms_glow,
             );
         }
         ui.add_space(space::MD);
@@ -1856,6 +1881,16 @@ fn spring_to(
     spring.value
 }
 
+/// Nudge a color's lightness by a breathing value `b` in `[0,1]` (Part 4): a
+/// ±~3/255 shift per channel around the midpoint, so a background fill drifts at
+/// the very edge of perception rather than reading as a dead flat fill. Alpha is
+/// preserved (so the Translucent glass base keeps its transparency).
+fn breathe_color(c: egui::Color32, b: f32) -> egui::Color32 {
+    let shift = ((b - 0.5) * 6.0).round() as i32;
+    let ch = |v: u8| (v as i32 + shift).clamp(0, 255) as u8;
+    egui::Color32::from_rgba_unmultiplied(ch(c.r()), ch(c.g()), ch(c.b()), c.a())
+}
+
 /// A densified checkmark polyline centred on `center`, sized by `s` — two
 /// segments (short down-right, long up-right) sampled into many points so a
 /// growing prefix reveals it as a smooth self-drawing stroke (Part 6), not three
@@ -2219,6 +2254,7 @@ fn zone_tiles(
     entered_at: Instant,
     now: Instant,
     reduced: bool,
+    rms_glow: f32,
 ) {
     if zones.is_empty() {
         return;
@@ -2249,6 +2285,19 @@ fn zone_tiles(
         let radius = base_radius * (1.0 + t * 1.4);
         let alpha = ((1.0 - t) * 22.0) as u8;
         paint::radial_glow(&painter, resp.rect.center(), radius, with_alpha(pal.accent, alpha), 40);
+    }
+    // RMS-reactive glow (Part 4): the desk breathes a little harder when the
+    // room is louder — a continuous, near-subliminal accent halo whose alpha
+    // tracks the smoothed input level (caps ~12/255). Rests at 0 in silence.
+    if rms_glow > 0.001 {
+        let base_radius = resp.rect.size().min_elem().max(1.0) * 0.32;
+        paint::radial_glow(
+            &painter,
+            resp.rect.center(),
+            base_radius * (1.0 + rms_glow * 0.3),
+            with_alpha(pal.accent, (rms_glow * 12.0) as u8),
+            40,
+        );
     }
 
     for (i, zone) in zones.iter().enumerate() {

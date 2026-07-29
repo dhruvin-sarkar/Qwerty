@@ -42,8 +42,6 @@ pub const HEARTBEAT_PULSE_LEN: Duration = Duration::from_millis(2200);
 /// single ambient repaint decision schedules the next frame this far out.
 pub const AMBIENT_FRAME: Duration = Duration::from_millis(33);
 /// Full period of the barely-perceptible background "breathe" (a slow sine).
-// Consumed by the continuous-breathe commit (deferred, needs CPU measurement).
-#[allow(dead_code)]
 pub const BACKGROUND_BREATHE_PERIOD_SECS: f32 = 12.0;
 
 // --- Staggered-reveal pacing (Part 5) --------------------------------------
@@ -328,14 +326,11 @@ impl SpringPreset {
 /// by value so no effect reads its own timer. `seconds` is the elapsed time
 /// since the ambient epoch (the first frame). Copy + egui-free so it threads
 /// through painters without borrow hazards.
-// Consumed by the ambient-system commit (Parts 3-4); allow until wired.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AmbientClock {
     pub seconds: f32,
 }
 
-#[allow(dead_code)] // consumed by the ambient-system commit (Parts 3-4)
 impl AmbientClock {
     /// A smooth 0→1→0 breathing value over `period_secs`: a raised sine, so it
     /// eases at both ends rather than resetting hard at the loop boundary.
