@@ -66,8 +66,13 @@ pub enum CaptureEvent {
         device_name: String,
         sample_rate: u32,
     },
-    /// A periodic input-level sample (linear amplitudes in `[0, 1]`).
-    Level { rms: f32, peak: f32 },
+    /// A periodic input-level sample. `rms`/`peak` are linear amplitudes in
+    /// `[0, 1]` measured *after* input normalization (what the detector sees).
+    /// `gain` is the normalizer's currently-applied boost, carried so the UI can
+    /// warn on a low-signal mic — a faint mic still paints an active meter once
+    /// normalized, so the gain is the honest indicator of true input strength
+    /// (`audio_thread::gain_indicates_low_signal`).
+    Level { rms: f32, peak: f32, gain: f32 },
     /// A detected onset and its feature window. `is_transient` distinguishes a
     /// tap from a rejected sustained sound; `window` is fed to
     /// `CalibrationSession::record_tap` by the wizard (Phase 4b.2). Home
@@ -296,7 +301,11 @@ fn run_worker(
                 } else {
                     0.0
                 };
-                let _ = tx.send(CaptureEvent::Level { rms, peak });
+                let _ = tx.send(CaptureEvent::Level {
+                    rms,
+                    peak,
+                    gain: normalizer.gain(),
+                });
                 ctx.request_repaint();
             }
             sum_sq = 0.0;

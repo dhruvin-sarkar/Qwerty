@@ -296,7 +296,7 @@ impl Wizard {
                     self.device_name = Some(device_name);
                     self.sample_rate = Some(sample_rate);
                 }
-                CaptureEvent::Level { peak, rms } => {
+                CaptureEvent::Level { peak, rms, .. } => {
                     self.level_peak = peak;
                     if self.step == Step::Environment {
                         self.env_rms_accum += rms as f64;

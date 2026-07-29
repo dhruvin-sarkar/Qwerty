@@ -41,6 +41,11 @@ struct LiveStatus {
     sample_rate: Option<u32>,
     rms: f32,
     peak: f32,
+    /// The normalizer's currently-applied input boost (from `CaptureEvent::Level`).
+    /// Home warns when this indicates a low-signal mic
+    /// (`audio_thread::gain_indicates_low_signal`) — the meter alone can't show
+    /// it, since normalization lifts a faint mic to a healthy-looking level.
+    gain: f32,
     /// A slowly-decaying peak, so the level meter's peak needle holds briefly at
     /// a transient's crest and eases down rather than snapping — the behaviour of
     /// a real audio input meter.
@@ -335,9 +340,10 @@ impl QwertyApp {
                     self.live.device = Some(device_name);
                     self.live.sample_rate = Some(sample_rate);
                 }
-                CaptureEvent::Level { rms, peak } => {
+                CaptureEvent::Level { rms, peak, gain } => {
                     self.live.rms = rms;
                     self.live.peak = peak;
+                    self.live.gain = gain;
                     // Peak-hold: snap up to the crest, otherwise ease down at
                     // ~0.5/sec (Level arrives ~20 Hz → ~0.025 per sample).
                     self.live.peak_hold = (self.live.peak_hold - 0.025).max(peak);
@@ -1130,6 +1136,24 @@ impl QwertyApp {
                                 "⚠ {} audio sample(s) dropped — the system fell behind and \
                                  some taps may have been missed. Close heavy background apps.",
                                 self.live.dropped
+                            ))
+                            .color(pal.warning),
+                        );
+                    }
+
+                    // Low-signal mic: the meter above reads the *normalized*
+                    // level, so a faint mic still looks active. The applied gain
+                    // is the honest tell — warn when the normalizer is straining
+                    // (`audio_thread::gain_indicates_low_signal`) so a "why is it
+                    // missing my taps" mic is explained rather than silent.
+                    if crate::audio_thread::gain_indicates_low_signal(self.live.gain) {
+                        ui.add_space(space::SM);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠ Low mic signal — Qwerty is boosting the input ×{:.0} to hear \
+                                 the desk. Move the mic closer to the tap zones or raise its \
+                                 input level for reliable detection.",
+                                self.live.gain
                             ))
                             .color(pal.warning),
                         );

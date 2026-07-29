@@ -346,6 +346,21 @@ const TARGET_PEAK: f32 = 0.18;
 /// Gain ceiling (+36 dB) and floor (never attenuate).
 const MAX_GAIN: f32 = 64.0;
 const MIN_GAIN: f32 = 1.0;
+/// Applied gain at or above which the input counts as "low signal": the
+/// normalizer is boosting by more than +30 dB (half its range) to reach the
+/// target peak, i.e. the mic is hearing the desk only faintly. The Home level
+/// meter shows the *normalized* level, so a faint mic still paints an active
+/// bar; this threshold is the honest tell the UI uses to warn instead
+/// (`CLAUDE.md`: surface degradation, don't hide it behind normalization).
+pub const LOW_SIGNAL_GAIN: f32 = MAX_GAIN / 2.0;
+
+/// Whether an applied normalizer `gain` indicates a low-signal mic (see
+/// [`LOW_SIGNAL_GAIN`]). A pure decision rule so the "warn the user" gate is
+/// unit-tested without a live device — the capture path that produces the gain
+/// cannot be.
+pub fn gain_indicates_low_signal(gain: f32) -> bool {
+    gain >= LOW_SIGNAL_GAIN
+}
 /// Envelope attack/release per block (fast up, slow down → multi-second release).
 const ENV_ATTACK: f32 = 0.5;
 const ENV_RELEASE: f32 = 0.02;
@@ -715,6 +730,17 @@ mod normalizer_tests {
         }
         assert!(nz.gain() > 10.0, "gain only reached {}", nz.gain());
         assert!(5e-4 * nz.gain() > 0.02, "signal not meaningfully lifted");
+    }
+
+    #[test]
+    fn low_signal_gate_trips_only_when_boost_is_heavy() {
+        // A mic at unity or light boost is fine; a heavily-boosted one (>= half
+        // the gain range) is the "faint mic, taps may be missed" state the Home
+        // warning is for. The boundary is inclusive at LOW_SIGNAL_GAIN.
+        assert!(!gain_indicates_low_signal(MIN_GAIN));
+        assert!(!gain_indicates_low_signal(LOW_SIGNAL_GAIN - 0.1));
+        assert!(gain_indicates_low_signal(LOW_SIGNAL_GAIN));
+        assert!(gain_indicates_low_signal(MAX_GAIN));
     }
 
     #[test]
