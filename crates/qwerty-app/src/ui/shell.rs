@@ -260,7 +260,19 @@ impl QwertyApp {
         match self.state.listening {
             ListeningState::Listening if self.capture.is_none() => {
                 self.live = LiveStatus::default();
-                let cap = LiveCapture::start(None, ctx.clone(), CaptureDetail::Standard);
+                // Open the mic the active profile was calibrated on, not just the
+                // system default: the classifier is only trustworthy on that
+                // device, and the live gate fires actions only when the mic
+                // matches. If that device is gone, `resolve_device` errors (no
+                // silent fallback) and we surface an Error state — the honest
+                // "your mic is missing, recalibrate" path. With no profile yet,
+                // fall back to the default so the meter still works.
+                let device = self
+                    .state
+                    .active_profile
+                    .as_ref()
+                    .map(|p| p.device_fingerprint.device_name.clone());
+                let cap = LiveCapture::start(device, ctx.clone(), CaptureDetail::Standard);
                 self.capture = Some(cap);
             }
             ListeningState::Paused | ListeningState::Error if self.capture.is_some() => {

@@ -21,6 +21,7 @@ use qwerty_core::profile::{
     DeviceFingerprint, Profile, ProfileId, SensingMode, ZoneId, ZoneLayout,
 };
 
+use crate::audio_thread::list_input_devices;
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::motion::{self, AnimState};
 use crate::ui::shell::{c32, divider, mix, primary_button, with_alpha, Palette};
@@ -101,6 +102,15 @@ pub struct Wizard {
     capture_error: Option<String>,
     level_peak: f32,
 
+    // Microphone selection (Environment step). `devices` is the list of input
+    // devices, queried once at construction; `selected_device` is the user's
+    // pick (`None` = the system default, matching `LiveCapture::start(None,..)`).
+    // Calibrating on the chosen mic records *its* fingerprint on the profile, so
+    // the mic is a property of the calibration, not a global setting — and the
+    // live mismatch gate then enforces it at listen time.
+    devices: Vec<String>,
+    selected_device: Option<String>,
+
     // Environment step: running mean of the input RMS → noise floor.
     env_rms_accum: f64,
     env_rms_count: u64,
@@ -152,6 +162,10 @@ impl Wizard {
             sample_rate: None,
             capture_error: None,
             level_peak: 0.0,
+            // Enumerate input devices once; an enumeration failure just leaves
+            // the list empty, so the picker still offers "System default".
+            devices: list_input_devices().unwrap_or_default(),
+            selected_device: None,
             env_rms_accum: 0.0,
             env_rms_count: 0,
             noise_floor: 0.0,
@@ -330,9 +344,57 @@ impl Wizard {
         );
         ui.add_space(space::MD);
 
+        // Microphone picker: choose which mic to calibrate on. Its identity is
+        // recorded on the profile, so switching mics later prompts a recalibrate
+        // (and the live gate blocks actions on a mismatch) — hence pick the mic
+        // you'll actually use. Changing it reopens the stream on the new device
+        // and restarts the room measurement (a different mic has its own noise
+        // floor). Only offered here on the Environment step, before capture, so
+        // the device can't change mid-calibration.
+        let mut new_choice: Option<Option<String>> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Microphone").color(pal.text));
+            egui::ComboBox::from_id_salt("wizard_mic")
+                .selected_text(self.selected_device.as_deref().unwrap_or("System default"))
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.selected_device.is_none(), "System default")
+                        .clicked()
+                    {
+                        new_choice = Some(None);
+                    }
+                    for d in &self.devices {
+                        let sel = self.selected_device.as_deref() == Some(d.as_str());
+                        if ui.selectable_label(sel, d).clicked() {
+                            new_choice = Some(Some(d.clone()));
+                        }
+                    }
+                });
+        });
+        if let Some(choice) = new_choice {
+            if choice != self.selected_device {
+                self.selected_device = choice;
+                // Reopen on the new device (the old LiveCapture stops via Drop),
+                // and reset the device info + room measurement for the new mic.
+                self.capture = LiveCapture::start(
+                    self.selected_device.clone(),
+                    ui.ctx().clone(),
+                    CaptureDetail::Standard,
+                );
+                self.capture.set_visible(self.visible);
+                self.device_name = None;
+                self.sample_rate = None;
+                self.level_peak = 0.0;
+                self.env_rms_accum = 0.0;
+                self.env_rms_count = 0;
+                self.noise_floor = 0.0;
+            }
+        }
+        ui.add_space(space::SM);
+
         let mic = self.device_name.as_deref().unwrap_or("opening microphone…");
         ui.label(
-            egui::RichText::new(format!("Mic: {mic}"))
+            egui::RichText::new(format!("Active: {mic}"))
                 .color(pal.secondary)
                 .small(),
         );
