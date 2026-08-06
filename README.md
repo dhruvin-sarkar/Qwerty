@@ -15,7 +15,7 @@ No cloud. No accounts. Everything runs and stays on your machine.
 - **A microphone** — the built-in laptop mic works; an external or USB mic
   often works better. Qwerty calibrates to whichever mic you pick.
 
-That's it. No .NET, no Python, no Rust toolchain needed to *run* it.
+ No .NET, no Python, no Rust toolchain needed
 
 ## Install
 
