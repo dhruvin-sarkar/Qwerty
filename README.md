@@ -19,8 +19,6 @@ No cloud. No accounts. Everything runs and stays on your machine.
 
 ## Install
 
-Qwerty ships as a **portable folder** — there is no installer and it needs no
-administrator rights.
 
 1. Unzip the release anywhere (e.g. your Desktop, or `C:\Tools\Qwerty`).
 2. Run **`qwerty-app.exe`**.
