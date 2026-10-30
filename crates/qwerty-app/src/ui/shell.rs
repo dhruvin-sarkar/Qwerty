@@ -27,10 +27,10 @@ use crate::ui::diagnostics::DiagnosticsScreen;
 use crate::ui::evaluation::EvaluationScreen;
 use crate::ui::motion;
 use crate::ui::paint;
-use egui_phosphor::regular as icon;
 use crate::ui::style::{self, radius, space, text};
 use crate::ui::theme::{on_color, tokens_for, Color, Tokens};
 use crate::ui::wizard::{Wizard, WizardOutcome};
+use egui_phosphor::regular as icon;
 
 /// Live input status while listening, drained from the capture worker.
 #[derive(Default)]
@@ -395,8 +395,10 @@ impl QwertyApp {
                                         } else {
                                             motion::INSTANT
                                         };
-                                        self.zone_anim
-                                            .insert(zone_id, (AnimState::start(dur), space.accepted));
+                                        self.zone_anim.insert(
+                                            zone_id,
+                                            (AnimState::start(dur), space.accepted),
+                                        );
                                     }
                                     // Fire the chain only on an accepted tap, and
                                     // never when the live mic differs from the one
@@ -554,7 +556,12 @@ impl eframe::App for QwertyApp {
             [0.0, 0.0, 0.0, 0.0]
         } else {
             let b = tokens_for(self.state.config.theme, self.state.system_dark).bg_base;
-            [b.r as f32 / 255.0, b.g as f32 / 255.0, b.b as f32 / 255.0, 1.0]
+            [
+                b.r as f32 / 255.0,
+                b.g as f32 / 255.0,
+                b.b as f32 / 255.0,
+                1.0,
+            ]
         }
     }
 
@@ -622,7 +629,8 @@ impl eframe::App for QwertyApp {
             }
             let tokens = self.effective_tokens(ctx, now);
             ctx.set_visuals(visuals_for(&tokens));
-            let pal = Palette::from_tokens_glass(&tokens, self.state.config.theme == Theme::Translucent);
+            let pal =
+                Palette::from_tokens_glass(&tokens, self.state.config.theme == Theme::Translucent);
             let mut outcome = None;
             egui::CentralPanel::default()
                 .frame(
@@ -709,7 +717,8 @@ impl eframe::App for QwertyApp {
         // Resolve this frame's effective tokens, advancing any theme cross-fade.
         let tokens = self.effective_tokens(ctx, now);
         ctx.set_visuals(visuals_for(&tokens));
-        let pal = Palette::from_tokens_glass(&tokens, self.state.config.theme == Theme::Translucent);
+        let pal =
+            Palette::from_tokens_glass(&tokens, self.state.config.theme == Theme::Translucent);
 
         // --- Ambient system, computed once per frame (Parts 3-4) ---
         // "Alive" = the user is watching the desk listen: listening, on Home,
@@ -718,7 +727,9 @@ impl eframe::App for QwertyApp {
         // frames). The shared AmbientClock drives the background breathe; a
         // Smooth spring tracks the input level for the desk's reactive glow.
         let ambient = motion::AmbientClock {
-            seconds: now.saturating_duration_since(self.ambient_epoch).as_secs_f32(),
+            seconds: now
+                .saturating_duration_since(self.ambient_epoch)
+                .as_secs_f32(),
         };
         let alive = self.state.listening == ListeningState::Listening
             && showing
@@ -726,12 +737,18 @@ impl eframe::App for QwertyApp {
             && self.state.active_profile.is_some()
             && !self.state.reduced_motion;
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        self.rms_glow
-            .set_target(if alive { self.live.rms.clamp(0.0, 1.0).sqrt() } else { 0.0 });
+        self.rms_glow.set_target(if alive {
+            self.live.rms.clamp(0.0, 1.0).sqrt()
+        } else {
+            0.0
+        });
         self.rms_glow.step(dt);
         // The central panel fill breathes ±a hair of lightness while alive.
         let panel_fill = if alive {
-            breathe_color(pal.base, ambient.breathe(motion::BACKGROUND_BREATHE_PERIOD_SECS))
+            breathe_color(
+                pal.base,
+                ambient.breathe(motion::BACKGROUND_BREATHE_PERIOD_SECS),
+            )
         } else {
             pal.base
         };
@@ -745,8 +762,8 @@ impl eframe::App for QwertyApp {
         if self.state.screen != self.last_screen {
             self.last_screen = self.state.screen;
             self.screen_entered_at = now; // drives the Part 5 stagger
-            // Reduced motion: no screen fade-in — the incoming screen appears at
-            // once (Part 7). Leaving screen_fade_start None yields opacity 1.0.
+                                          // Reduced motion: no screen fade-in — the incoming screen appears at
+                                          // once (Part 7). Leaving screen_fade_start None yields opacity 1.0.
             if !self.state.reduced_motion {
                 self.screen_fade_start = Some(now);
             }
@@ -997,7 +1014,11 @@ impl QwertyApp {
             .corner_radius(style::rounding(radius::MD))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(icon::WARNING).color(pal.danger).strong());
+                    ui.label(
+                        egui::RichText::new(icon::WARNING)
+                            .color(pal.danger)
+                            .strong(),
+                    );
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new("Your settings can’t be saved")
@@ -1333,8 +1354,9 @@ impl QwertyApp {
                     Ok(_) => {
                         self.duplicate_name.clear();
                         self.selected_zone = None;
-                        self.io_message =
-                            Some("Duplicated — rebind this copy's zones to the new context.".into());
+                        self.io_message = Some(
+                            "Duplicated — rebind this copy's zones to the new context.".into(),
+                        );
                         self.save_error = None;
                         self.refresh_profiles();
                     }
@@ -1625,17 +1647,10 @@ impl QwertyApp {
             // fail loud, never persist a value nothing acted on).
             let startup_changed = ui
                 .horizontal(|ui| {
-                    let r = toggle(
-                        ui,
-                        pal,
-                        &mut self.state.config.start_with_windows,
-                        reduced,
-                    )
-                    .changed();
+                    let r = toggle(ui, pal, &mut self.state.config.start_with_windows, reduced)
+                        .changed();
                     ui.add_space(space::SM);
-                    ui.label(
-                        egui::RichText::new("Start Qwerty when I sign in").color(pal.text),
-                    );
+                    ui.label(egui::RichText::new("Start Qwerty when I sign in").color(pal.text));
                     r
                 })
                 .inner;
@@ -1651,8 +1666,7 @@ impl QwertyApp {
                         // Undo the toggle so the UI never shows a state the OS
                         // isn't actually in, and say why.
                         self.state.config.start_with_windows = !desired;
-                        self.save_error =
-                            Some(format!("Couldn't update the startup setting: {e}"));
+                        self.save_error = Some(format!("Couldn't update the startup setting: {e}"));
                     }
                 }
             }
@@ -1764,8 +1778,10 @@ fn nav_item(
     reduced: bool,
 ) -> bool {
     let height = 36.0;
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
 
     // Eased 0→1 progress for selection and (unselected-only) hover. Distinct ids
     // per row so each animates independently; the built-in stops repainting once
@@ -1781,7 +1797,11 @@ fn nav_item(
     let hover_t = spring_to(
         ui.ctx(),
         egui::Id::new(("nav_hover_spring", label)),
-        if resp.hovered() && !selected { 1.0 } else { 0.0 },
+        if resp.hovered() && !selected {
+            1.0
+        } else {
+            0.0
+        },
         motion::SpringPreset::Smooth,
         reduced,
     );
@@ -1880,7 +1900,11 @@ fn dismissible_error_banner(ui: &mut egui::Ui, pal: &Palette, heading: &str, msg
         .corner_radius(style::rounding(radius::MD))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(icon::WARNING).color(pal.danger).strong());
+                ui.label(
+                    egui::RichText::new(icon::WARNING)
+                        .color(pal.danger)
+                        .strong(),
+                );
                 ui.label(egui::RichText::new(heading).color(pal.text).strong());
                 ui.label(egui::RichText::new(msg).color(pal.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2153,8 +2177,11 @@ pub(crate) fn divider(ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(space::SM);
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter()
-        .hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0_f32, pal.border));
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        egui::Stroke::new(1.0_f32, pal.border),
+    );
     ui.add_space(space::SM);
 }
 
@@ -2195,7 +2222,13 @@ fn empty_state(
 /// read-only `&AppState` that can't route a fix from where they sit. Same calm,
 /// centered layout as [`empty_state`] minus the button (Part 6). `pub(crate)`
 /// so the Evaluation/Diagnostics screens share it.
-pub(crate) fn empty_state_note(ui: &mut egui::Ui, pal: &Palette, glyph: &str, title: &str, body: &str) {
+pub(crate) fn empty_state_note(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    glyph: &str,
+    title: &str,
+    body: &str,
+) {
     ui.add_space(space::XXL);
     ui.vertical_centered(|ui| {
         ui.label(egui::RichText::new(glyph).size(64.0).color(pal.border));
@@ -2250,13 +2283,16 @@ fn level_meter(ui: &mut egui::Ui, pal: &Palette, live: &LiveStatus) {
     let peak_frac = live.peak_hold.clamp(0.0, 1.0).sqrt();
     // Soft clip-warning zone (rightmost 7%) — a warning, not a hard color flip.
     if peak_frac > 0.93 {
-        let warn =
-            egui::Rect::from_min_max(egui::pos2(r.min.x + r.width() * 0.93, r.min.y), r.max);
+        let warn = egui::Rect::from_min_max(egui::pos2(r.min.x + r.width() * 0.93, r.min.y), r.max);
         painter.rect_filled(warn, round, with_alpha(pal.danger, 60));
     }
     // Peak needle.
     let x = r.min.x + r.width() * peak_frac;
-    painter.vline(x, r.y_range(), egui::Stroke::new(2.0_f32, with_alpha(pal.text, 200)));
+    painter.vline(
+        x,
+        r.y_range(),
+        egui::Stroke::new(2.0_f32, with_alpha(pal.text, 200)),
+    );
 
     // Announce the meter to screen readers with a *stable* label — a live
     // percentage here would make Narrator chatter (the value changes ~20×/s, as
@@ -2299,7 +2335,11 @@ fn theme_swatch(
         let painter = ui.painter();
         painter.rect_filled(rect, round, c32(tokens.bg_surface));
         if hover > 0.01 {
-            painter.rect_filled(rect, round, with_alpha(c32(tokens.accent), (hover * 32.0) as u8));
+            painter.rect_filled(
+                rect,
+                round,
+                with_alpha(c32(tokens.accent), (hover * 32.0) as u8),
+            );
         }
         // Accent stripe across the bottom.
         let stripe = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 8.0), rect.max);
@@ -2315,7 +2355,12 @@ fn theme_swatch(
         } else {
             (1.0_f32, pal.border)
         };
-        painter.rect_stroke(rect, round, egui::Stroke::new(bw, bc), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            round,
+            egui::Stroke::new(bw, bc),
+            egui::StrokeKind::Inside,
+        );
         if resp.has_focus() {
             painter.rect_stroke(
                 rect.expand(2.0),
@@ -2354,7 +2399,11 @@ fn mini_pill(ui: &mut egui::Ui, pal: &Palette, glyph: &str, label: &str, color: 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = space::XS;
                 ui.label(egui::RichText::new(glyph).color(color).size(text::CAPTION));
-                ui.label(egui::RichText::new(label).color(pal.text).size(text::CAPTION));
+                ui.label(
+                    egui::RichText::new(label)
+                        .color(pal.text)
+                        .size(text::CAPTION),
+                );
             });
         });
 }
@@ -2390,8 +2439,7 @@ fn zone_tiles(
     let tile_w = (avail_w - gap * (cols as f32 - 1.0)) / cols as f32;
     let tile_h = tile_w * 0.6;
     let total_h = tile_h * rows as f32 + gap * (rows as f32 - 1.0).max(0.0);
-    let (resp, painter) =
-        ui.allocate_painter(egui::vec2(avail_w, total_h), egui::Sense::hover());
+    let (resp, painter) = ui.allocate_painter(egui::vec2(avail_w, total_h), egui::Sense::hover());
     let origin = resp.rect.min;
     let round = style::rounding(radius::MD);
 
@@ -2404,7 +2452,13 @@ fn zone_tiles(
         let base_radius = resp.rect.size().min_elem().max(1.0) * 0.35;
         let radius = base_radius * (1.0 + t * 1.4);
         let alpha = ((1.0 - t) * 22.0) as u8;
-        paint::radial_glow(&painter, resp.rect.center(), radius, with_alpha(pal.accent, alpha), 40);
+        paint::radial_glow(
+            &painter,
+            resp.rect.center(),
+            radius,
+            with_alpha(pal.accent, alpha),
+            40,
+        );
     }
     // RMS-reactive glow (Part 4): the desk breathes a little harder when the
     // room is louder — a continuous, near-subliminal accent halo whose alpha
@@ -2436,7 +2490,14 @@ fn zone_tiles(
             Some((anim, true)) => {
                 // Accept: a 0→1→0 arc so scale/flash/bloom rise then settle.
                 let arc = (anim.t(motion::EMPHASIZED_EASE) * std::f32::consts::PI).sin();
-                (1.0 + 0.06 * arc, (1.0 - anim.linear()) * 0.7, 0.10 * arc, 0.0, true, arc)
+                (
+                    1.0 + 0.06 * arc,
+                    (1.0 - anim.linear()) * 0.7,
+                    0.10 * arc,
+                    0.0,
+                    true,
+                    arc,
+                )
             }
             Some((anim, false)) => {
                 // Reject: quick decaying horizontal shake + danger flash.
@@ -2461,7 +2522,13 @@ fn zone_tiles(
         // in the gap between tiles). Layered 3-pass mesh bloom, no shader.
         if bloom > 0.001 {
             let radius = rect.size().length() * 0.5 * 1.8;
-            paint::radial_bloom(&painter, rect.center(), radius, pal.accent, bloom * 0.8 * reveal);
+            paint::radial_bloom(
+                &painter,
+                rect.center(),
+                radius,
+                pal.accent,
+                bloom * 0.8 * reveal,
+            );
         }
         let flash_color = if accept { pal.accent } else { pal.danger };
         painter.rect_filled(rect, round, fade(mix(pal.elevated, flash_color, flash)));
@@ -2475,7 +2542,10 @@ fn zone_tiles(
             painter.rect_stroke(
                 rect.expand(3.0),
                 round,
-                egui::Stroke::new(2.0_f32, with_alpha(pal.accent, (glow * 255.0 * reveal) as u8)),
+                egui::Stroke::new(
+                    2.0_f32,
+                    with_alpha(pal.accent, (glow * 255.0 * reveal) as u8),
+                ),
                 egui::StrokeKind::Outside,
             );
         }
@@ -2528,7 +2598,11 @@ fn zone_tiles(
 /// or teal Aurora accents. `pub(crate)` so the Home and Zones calibrate buttons
 /// share exactly one primary-CTA shape.
 pub(crate) fn primary_button(ui: &mut egui::Ui, pal: &Palette, label: &str) -> egui::Response {
-    let ink = c32(on_color(Color::rgb(pal.accent.r(), pal.accent.g(), pal.accent.b())));
+    let ink = c32(on_color(Color::rgb(
+        pal.accent.r(),
+        pal.accent.g(),
+        pal.accent.b(),
+    )));
     ui.add(
         egui::Button::new(egui::RichText::new(label).color(ink).strong())
             .fill(pal.accent)

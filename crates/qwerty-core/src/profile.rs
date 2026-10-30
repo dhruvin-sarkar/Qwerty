@@ -697,7 +697,9 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(&Config::default().to_json()).unwrap();
         v["schema_version"] = serde_json::json!(4_294_967_297u64); // 2^32 + 1, ≡ 1 mod 2^32
         match Config::from_json(&v.to_string(), "config.json").unwrap_err() {
-            PersistenceError::SchemaMismatch { found, expected, .. } => {
+            PersistenceError::SchemaMismatch {
+                found, expected, ..
+            } => {
                 assert_eq!(found, 0, "an out-of-range version must not truncate to 1");
                 assert_eq!(expected, CONFIG_SCHEMA_VERSION);
             }

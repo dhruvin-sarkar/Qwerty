@@ -98,7 +98,12 @@ pub(crate) fn dot_grid(painter: &Painter, rect: Rect, color: Color32, spacing: f
     let mut y = rect.top();
     while y <= rect.bottom() {
         // Every other row is nudged half a cell right — a hex-ish stagger.
-        let x0 = rect.left() + if row.is_multiple_of(2) { 0.0 } else { spacing * 0.5 };
+        let x0 = rect.left()
+            + if row.is_multiple_of(2) {
+                0.0
+            } else {
+                spacing * 0.5
+            };
         let mut x = x0;
         while x <= rect.right() {
             painter.circle_filled(Pos2::new(x, y), radius, color);
@@ -177,7 +182,11 @@ mod tests {
             horizontal_gradient(
                 p,
                 r,
-                &[(0.0, Color32::GREEN), (0.7, Color32::YELLOW), (1.0, Color32::RED)],
+                &[
+                    (0.0, Color32::GREEN),
+                    (0.7, Color32::YELLOW),
+                    (1.0, Color32::RED),
+                ],
             );
             horizontal_gradient(p, r, &[(0.0, Color32::GREEN)]); // 1 stop → no-op
         });

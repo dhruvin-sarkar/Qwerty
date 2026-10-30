@@ -294,7 +294,10 @@ fn compute_band_bins(fft_size: usize, sample_rate: u32, band_count: usize) -> Ve
         // slice and silently drop a band. Fail loudly in debug builds rather
         // than ship a silently-degraded feature space; the invariant test below
         // pins it for the shipped constants.
-        debug_assert!(hi > lo, "band {i} collapsed to an empty bin range ({lo}..{hi})");
+        debug_assert!(
+            hi > lo,
+            "band {i} collapsed to an empty bin range ({lo}..{hi})"
+        );
         ranges.push((lo, hi));
     }
     ranges
@@ -320,8 +323,14 @@ mod tests {
         let mut prev_lo = 0usize;
         for (i, &(lo, hi)) in bins.iter().enumerate() {
             assert!(hi > lo, "band {i} is empty: {lo}..{hi}");
-            assert!(hi <= max_bin, "band {i} exceeds Nyquist bin: {hi} > {max_bin}");
-            assert!(lo >= prev_lo, "band {i} lo {lo} went backwards from {prev_lo}");
+            assert!(
+                hi <= max_bin,
+                "band {i} exceeds Nyquist bin: {hi} > {max_bin}"
+            );
+            assert!(
+                lo >= prev_lo,
+                "band {i} lo {lo} went backwards from {prev_lo}"
+            );
             prev_lo = lo;
         }
     }

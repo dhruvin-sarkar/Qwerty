@@ -26,8 +26,8 @@ use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::ui::motion::{self, AnimState};
 use crate::ui::shell::{c32, divider, mix, primary_button, with_alpha, Palette};
 use crate::ui::style::{self, radius, space, text};
-use egui_phosphor::regular as icon;
 use crate::ui::theme::{on_color, Color};
+use egui_phosphor::regular as icon;
 
 /// Supported zone counts (`DESIGN.md`: 2, 4, 6, 8).
 const ZONE_COUNTS: [usize; 4] = [2, 4, 6, 8];
@@ -273,7 +273,10 @@ impl Wizard {
                 Step::Environment | Step::Capture | Step::Negatives
             );
             let anim_live = !self.step_anim.is_complete()
-                || self.pip_fill.as_ref().is_some_and(|(_, a)| !a.is_complete());
+                || self
+                    .pip_fill
+                    .as_ref()
+                    .is_some_and(|(_, a)| !a.is_complete());
             if mic_live {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(33));
@@ -835,7 +838,11 @@ fn auto_layouts(n: usize) -> Vec<ZoneLayout> {
 /// every theme's accent (yellow High-Contrast, teal Aurora) rather than
 /// assuming a fixed light-on-dark.
 fn ink_on_accent(pal: &Palette) -> egui::Color32 {
-    c32(on_color(Color::rgb(pal.accent.r(), pal.accent.g(), pal.accent.b())))
+    c32(on_color(Color::rgb(
+        pal.accent.r(),
+        pal.accent.g(),
+        pal.accent.b(),
+    )))
 }
 
 /// The step-progress indicator (Part 4): a horizontal row of circles joined by
@@ -857,7 +864,11 @@ fn draw_stepper(ui: &mut egui::Ui, pal: &Palette, current: Step, step_anim: &Ani
     let cy = area.min.y + r + 2.0;
     let x0 = area.min.x + r;
     let x1 = area.max.x - r;
-    let step_x = if n > 1 { (x1 - x0) / (n - 1) as f32 } else { 0.0 };
+    let step_x = if n > 1 {
+        (x1 - x0) / (n - 1) as f32
+    } else {
+        0.0
+    };
     let cx = |i: usize| x0 + step_x * i as f32;
 
     // Connector segments behind the circles: accent up to the current step,
@@ -941,10 +952,8 @@ fn draw_tap_pips(
     let r = 9.0_f32;
     let gap = 14.0_f32;
     let w = target as f32 * (r * 2.0) + target.saturating_sub(1) as f32 * gap;
-    let (resp, painter) = ui.allocate_painter(
-        egui::vec2(w.max(1.0), r * 2.0 + 12.0),
-        egui::Sense::hover(),
-    );
+    let (resp, painter) =
+        ui.allocate_painter(egui::vec2(w.max(1.0), r * 2.0 + 12.0), egui::Sense::hover());
     let area = resp.rect;
     let cy = area.center().y;
     let cx = |i: usize| area.min.x + r + i as f32 * (r * 2.0 + gap);
@@ -961,7 +970,10 @@ fn draw_tap_pips(
                 painter.circle_stroke(
                     center,
                     r + 2.0 + lin * 10.0,
-                    egui::Stroke::new(2.0_f32, with_alpha(pal.success, ((1.0 - lin) * 200.0) as u8)),
+                    egui::Stroke::new(
+                        2.0_f32,
+                        with_alpha(pal.success, ((1.0 - lin) * 200.0) as u8),
+                    ),
                 );
             }
         } else if i == count {
@@ -1010,9 +1022,11 @@ fn draw_desk_diagram(ui: &mut egui::Ui, pal: &Palette, layouts: &[ZoneLayout], l
         )
         .shrink(5.0);
         let hovered = hover_pos.is_some_and(|p| rect.contains(p));
-        let hl =
-            ui.ctx()
-                .animate_bool_with_time(resp.id.with(i), hovered, motion::INSTANT.as_secs_f32());
+        let hl = ui.ctx().animate_bool_with_time(
+            resp.id.with(i),
+            hovered,
+            motion::INSTANT.as_secs_f32(),
+        );
         painter.rect_filled(rect, tile_round, mix(pal.elevated, pal.accent, hl * 0.18));
         painter.rect_stroke(
             rect,
@@ -1031,12 +1045,17 @@ fn draw_desk_diagram(ui: &mut egui::Ui, pal: &Palette, layouts: &[ZoneLayout], l
 
     // Laptop across the middle: a base slab plus a raised screen.
     let lw = area.width() * 0.34;
-    let base = egui::Rect::from_center_size(area.center() + egui::vec2(0.0, 7.0), egui::vec2(lw, 13.0));
+    let base =
+        egui::Rect::from_center_size(area.center() + egui::vec2(0.0, 7.0), egui::vec2(lw, 13.0));
     let screen = egui::Rect::from_center_size(
         area.center() - egui::vec2(0.0, 9.0),
         egui::vec2(lw * 0.9, 17.0),
     );
-    painter.rect_filled(screen, style::rounding(radius::XS), mix(pal.accent, pal.base, 0.2));
+    painter.rect_filled(
+        screen,
+        style::rounding(radius::XS),
+        mix(pal.accent, pal.base, 0.2),
+    );
     painter.rect_stroke(
         screen,
         style::rounding(radius::XS),

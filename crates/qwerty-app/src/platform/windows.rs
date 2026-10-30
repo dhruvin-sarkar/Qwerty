@@ -17,16 +17,16 @@ use qwerty_core::profile::{KeyCombo, Modifier, ScreenshotMode, SystemSound};
 use tts::Tts;
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_SET_VALUE, REG_SZ,
-};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_SET_VALUE, REG_SZ,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY,
@@ -154,12 +154,14 @@ pub(crate) fn set_start_with_windows(enabled: bool) -> Result<(), String> {
             let wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
             let bytes =
                 unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2) };
-            let code =
-                unsafe { RegSetValueExW(hkey, w!("Qwerty"), None, REG_SZ, Some(bytes)) };
+            let code = unsafe { RegSetValueExW(hkey, w!("Qwerty"), None, REG_SZ, Some(bytes)) };
             if code == ERROR_SUCCESS {
                 Ok(())
             } else {
-                Err(format!("could not write the startup entry (code {})", code.0))
+                Err(format!(
+                    "could not write the startup entry (code {})",
+                    code.0
+                ))
             }
         }
         None => {

@@ -416,7 +416,10 @@ mod tests {
             s.step(1.0 / 60.0);
         }
         let before = s.value;
-        assert!(before > 0.0, "should have moved off the start, got {before}");
+        assert!(
+            before > 0.0,
+            "should have moved off the start, got {before}"
+        );
         s.set_target(0.0); // reverse mid-flight
         let after = s.step(1.0 / 60.0);
         assert!(

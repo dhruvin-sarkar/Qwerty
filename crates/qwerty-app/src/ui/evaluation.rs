@@ -725,11 +725,8 @@ impl EvaluationScreen {
                 .add_enabled(can_export, egui::Button::new("Export CSV"))
                 .clicked()
             {
-                new_csv = Some(state.export_evaluation_csv(
-                    &res.report,
-                    &res.zone_ids,
-                    &res.zone_labels,
-                ));
+                new_csv =
+                    Some(state.export_evaluation_csv(&res.report, &res.zone_ids, &res.zone_labels));
             }
         });
         // Show the just-produced export outcome, else any prior one.

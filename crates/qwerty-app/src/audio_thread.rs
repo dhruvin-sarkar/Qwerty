@@ -151,9 +151,7 @@ fn resolve_device(selector: Option<&str>) -> Result<cpal::Device, CaptureError> 
 /// 44.1 kHz do we fall back to the device default (still internally consistent,
 /// since calibration and live classification then use the same rate) — and the
 /// negotiated rate remains visible via [`AudioSource::sample_rate`] for the UI.
-fn choose_input_config(
-    device: &cpal::Device,
-) -> Result<cpal::SupportedStreamConfig, CaptureError> {
+fn choose_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, CaptureError> {
     let target = cpal::SampleRate(SAMPLE_RATE_HZ);
     if let Ok(ranges) = device.supported_input_configs() {
         let mut best: Option<cpal::SupportedStreamConfigRange> = None;

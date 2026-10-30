@@ -387,7 +387,10 @@ mod tests {
     fn on_color_picks_the_higher_contrast_ink() {
         // Light fill → black ink; dark fill → white ink.
         assert_eq!(on_color(Color::rgb(0xFF, 0xD6, 0x00)), Color::rgb(0, 0, 0));
-        assert_eq!(on_color(Color::rgb(0x0A, 0x0A, 0x0C)), Color::rgb(255, 255, 255));
+        assert_eq!(
+            on_color(Color::rgb(0x0A, 0x0A, 0x0C)),
+            Color::rgb(255, 255, 255)
+        );
     }
 
     #[test]

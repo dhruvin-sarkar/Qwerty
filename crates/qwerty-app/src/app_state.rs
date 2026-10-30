@@ -49,7 +49,6 @@ impl Screen {
             Screen::Settings => "Settings",
         }
     }
-
 }
 
 /// Whether the app is currently acting on taps. In Phase 3 this is toggled
@@ -850,7 +849,10 @@ mod tests {
         // Once the error is resolved, normal saving resumes.
         s.config_load_error = None;
         assert!(s.save_config().is_ok());
-        assert!(path.exists(), "config.json is written after the error clears");
+        assert!(
+            path.exists(),
+            "config.json is written after the error clears"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

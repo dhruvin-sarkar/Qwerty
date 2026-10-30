@@ -491,7 +491,10 @@ mod tests {
             "row = label + 2 counts + accuracy"
         );
         // Confidence block present.
-        assert!(csv.contains("confidence_bin,count"), "missing confidence block");
+        assert!(
+            csv.contains("confidence_bin,count"),
+            "missing confidence block"
+        );
     }
 
     #[test]

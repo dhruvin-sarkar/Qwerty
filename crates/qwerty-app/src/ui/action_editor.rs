@@ -234,11 +234,11 @@ impl ActionEditor {
                                             RichText::new(format!("{} sent", icon::CHECK))
                                                 .color(pal.success),
                                         )
-                                            .on_hover_text(
-                                                "Handed off to Windows. This action reports \
+                                        .on_hover_text(
+                                            "Handed off to Windows. This action reports \
                                                  success asynchronously, so the check means it \
                                                  was dispatched — confirm it actually appeared.",
-                                            );
+                                        );
                                     }
                                 }
                                 Some(Err(e)) => {

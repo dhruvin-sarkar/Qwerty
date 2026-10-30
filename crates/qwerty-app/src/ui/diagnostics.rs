@@ -192,7 +192,11 @@ impl DiagnosticsScreen {
             if let Some(sr) = self.sample_rate {
                 let tuned = sr == qwerty_core::features::SAMPLE_RATE_HZ;
                 let color = if tuned { pal.secondary } else { pal.warning };
-                let suffix = if tuned { "" } else { " (DSP tuned for 44.1 kHz)" };
+                let suffix = if tuned {
+                    ""
+                } else {
+                    " (DSP tuned for 44.1 kHz)"
+                };
                 ui.label(
                     egui::RichText::new(format!("{:.1} kHz{suffix}", sr as f32 / 1000.0))
                         .color(color)
@@ -211,7 +215,11 @@ impl DiagnosticsScreen {
                     .small(),
             );
             dot(ui);
-            let drop_color = if self.dropped > 0 { pal.warning } else { pal.secondary };
+            let drop_color = if self.dropped > 0 {
+                pal.warning
+            } else {
+                pal.secondary
+            };
             ui.label(
                 egui::RichText::new(format!("{} dropped", self.dropped))
                     .color(drop_color)
@@ -312,7 +320,11 @@ fn draw_waveform(ui: &mut egui::Ui, pal: &Palette, envelope: &[f32], flash: Opti
     // Announce the view's presence with a stable label (its contents change
     // ~30×/s; a live-valued label would make Narrator chatter every frame).
     resp.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "Live microphone input waveform")
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            "Live microphone input waveform",
+        )
     });
     painter.rect_filled(r, style::rounding(radius::XS), pal.surface);
     let mid = r.center().y;
@@ -485,7 +497,11 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
                     pal.secondary
                 },
             );
-            let marker = if is_winner { icon::CHECK_CIRCLE } else { icon::CIRCLE };
+            let marker = if is_winner {
+                icon::CHECK_CIRCLE
+            } else {
+                icon::CIRCLE
+            };
             ui.label(
                 egui::RichText::new(format!(
                     "{marker} {}  (distance {:.2})",
@@ -501,7 +517,11 @@ fn draw_feature_space(ui: &mut egui::Ui, pal: &Palette, profile: &Profile, tap: 
     let (glyph, color, verdict) = if s.accepted {
         (icon::CHECK, pal.success, "accepted")
     } else {
-        (icon::WARNING, pal.warning, "rejected as not matching any zone")
+        (
+            icon::WARNING,
+            pal.warning,
+            "rejected as not matching any zone",
+        )
     };
     ui.label(
         egui::RichText::new(format!(

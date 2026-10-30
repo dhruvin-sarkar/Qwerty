@@ -34,7 +34,9 @@ static DECODED: LazyLock<(Vec<u8>, u32, u32)> = LazyLock::new(|| {
         .output_buffer_size()
         .expect("bundled icon.png has known dimensions");
     let mut buf = vec![0u8; size];
-    let info = reader.next_frame(&mut buf).expect("decode bundled icon.png");
+    let info = reader
+        .next_frame(&mut buf)
+        .expect("decode bundled icon.png");
     assert!(
         info.color_type == png::ColorType::Rgba && info.bit_depth == png::BitDepth::Eight,
         "bundled icon.png must be 8-bit RGBA",

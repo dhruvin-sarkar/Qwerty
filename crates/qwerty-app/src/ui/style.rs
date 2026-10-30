@@ -140,7 +140,12 @@ mod tests {
             text::CAPTION,
         ];
         for w in sizes.windows(2) {
-            assert!(w[1] < w[0], "type scale not decreasing: {} !< {}", w[1], w[0]);
+            assert!(
+                w[1] < w[0],
+                "type scale not decreasing: {} !< {}",
+                w[1],
+                w[0]
+            );
         }
     }
 
@@ -148,7 +153,12 @@ mod tests {
     fn radius_scale_is_strictly_increasing() {
         let steps = [radius::XS, radius::SM, radius::MD, radius::LG];
         for w in steps.windows(2) {
-            assert!(w[1] > w[0], "radius scale not increasing: {} !> {}", w[1], w[0]);
+            assert!(
+                w[1] > w[0],
+                "radius scale not increasing: {} !> {}",
+                w[1],
+                w[0]
+            );
         }
     }
 }
