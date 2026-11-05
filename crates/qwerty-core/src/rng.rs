@@ -21,10 +21,12 @@ impl Rng64 {
     }
 
     /// Derive an independent stream: SplitMix64 of (seed ^ a·0x9E3779B97F4A7C15 ^ b·0xC2B2AE3D27D4EB4F).
-    // SPEC: "SplitMix64 of x" is read as the SplitMix64 generator seeded with x, so
-    // derive(seed, 0, 0) is new(seed); products wrap modulo 2^64.
+    // SPEC: "SplitMix64 of x" is the first output of the generator seeded with x, and that output
+    // seeds the stream. Seeding with x itself is not independent: a's multiplier is the increment,
+    // so a carry-free x is new(seed ^ b·δ) advanced a draws. Products wrap modulo 2^64.
     pub fn derive(seed: u64, a: u64, b: u64) -> Self {
-        Rng64::new(seed ^ a.wrapping_mul(GOLDEN_GAMMA) ^ b.wrapping_mul(DERIVE_MUL_B))
+        let combined = seed ^ a.wrapping_mul(GOLDEN_GAMMA) ^ b.wrapping_mul(DERIVE_MUL_B);
+        Rng64::new(Rng64::new(combined).next_u64())
     }
 
     /// state += 0x9E3779B97F4A7C15; z=state; z=(z^(z>>30))*0xBF58476D1CE4E5B9;
@@ -65,6 +67,34 @@ impl Rng64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn derived_streams_are_independent() {
+        // Seeds 0, 2, 8, 42 share no low bits with a·γ, and 7 none with 8·γ: a raw-seeded derive
+        // made those streams shifted copies of new(seed).
+        for seed in [0, 2, 7, 8, 42] {
+            let mut seen = BTreeSet::new();
+            let mut parent = Rng64::new(seed);
+            for _ in 0..64 {
+                assert!(seen.insert(parent.next_u64()));
+            }
+            for a in 0..256 {
+                for b in 0..4 {
+                    let mut rng = Rng64::derive(seed, a, b);
+                    for _ in 0..4 {
+                        let draw = rng.next_u64();
+                        assert!(seen.insert(draw), "derive({seed}, {a}, {b}) repeats a draw");
+                    }
+                }
+            }
+        }
+        // The stream is seeded with SplitMix64's output for the combined value: RN1's first value here.
+        assert_eq!(
+            Rng64::derive(0, 0, 0).next_u64(),
+            Rng64::new(0xE220_A839_7B1D_CDAF).next_u64()
+        );
+    }
 
     #[test]
     fn rn1_splitmix64_known_answer() {
@@ -92,7 +122,6 @@ mod tests {
             assert!(z.is_finite());
             assert_eq!(z.to_bits(), b.normal().to_bits());
         }
-        assert_eq!(Rng64::derive(7, 0, 0).next_u64(), Rng64::new(7).next_u64());
         assert_ne!(
             Rng64::derive(7, 1, 0).next_u64(),
             Rng64::derive(7, 0, 1).next_u64()
