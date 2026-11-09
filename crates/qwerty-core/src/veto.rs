@@ -130,6 +130,7 @@ const INPUT_CAP: usize = 512;
 /// Stored self-outputs, open and closed (§1.21 I14).
 const OUTPUT_CAP: usize = 16;
 /// Stored gap spans. Beyond it the two oldest merge into one span, which can only widen a veto.
+// SPEC: §1.13.2 bounds events (512) and outputs (16) but not gaps; I14 needs a bound, so 16 here.
 const GAP_CAP: usize = 16;
 
 /// The parameters in host ticks, converted once.
@@ -278,7 +279,10 @@ impl VetoTimeline {
     /// `Pending` until now = t0 + input_after + settle; then the first match of: a gap in the
     /// window, an input event in the window, a self-output interval containing t0.
     pub fn decide(&self, t0: HostTime, now: HostTime) -> VetoDecision {
-        let until = after(t0, HostDuration(self.spans.after.0 + self.spans.settle.0));
+        let until = after(
+            t0,
+            HostDuration(self.spans.after.0.saturating_add(self.spans.settle.0)),
+        );
         if now < until {
             return VetoDecision::Pending { until };
         }
