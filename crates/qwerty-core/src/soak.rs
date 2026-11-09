@@ -484,6 +484,42 @@ mod tests {
         );
     }
 
+    /// FNV-1a 64 offset basis and prime: a hash that is stable across Rust versions, unlike
+    /// `DefaultHasher`.
+    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    /// K4 golden hash of 4 zones × 3 clips, recorded from the pre-move v1 generator.
+    const K4_GOLDEN: u64 = 0x6DA1_1BAD_C8FF_61FB;
+
+    /// Folds the clip length and every sample's little-endian bit pattern into `hash`.
+    fn fnv1a_clip(mut hash: u64, clip: &[f32]) -> u64 {
+        let len = clip.len() as u64;
+        for byte in len
+            .to_le_bytes()
+            .into_iter()
+            .chain(clip.iter().flat_map(|s| s.to_bits().to_le_bytes()))
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    #[test]
+    fn k4_clean_signatures_match_v1_generator() {
+        // SPEC: "4 zones × 3 clips" read as one clip from each of the three generators per
+        // zone (tap, sustained, foreign tap), drawn from one Lcg stream seeded as the soak's.
+        let desk = SyntheticDesk::new(4);
+        let mut rng = Lcg::new(1);
+        let mut hash = FNV_OFFSET;
+        for zone in 0..4 {
+            hash = fnv1a_clip(hash, &desk.tap(zone, &mut rng, 1.0));
+            hash = fnv1a_clip(hash, &desk.sustained(&mut rng));
+            hash = fnv1a_clip(hash, &desk.foreign_tap(&mut rng));
+        }
+        assert_eq!(hash, K4_GOLDEN, "got {hash:#018X}");
+    }
+
     #[test]
     fn loop_runs_cleanly_many_times() {
         // Exercises the full pipeline repeatedly to shake out leaks/panics; the
