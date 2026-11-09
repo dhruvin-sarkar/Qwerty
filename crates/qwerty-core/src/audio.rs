@@ -1,6 +1,7 @@
 //! Audio formats, blocks, the sample→host clock map, channel layout analysis and the capture
 //! device identity (§1.4).
 
+use crate::dsp::Biquad;
 use crate::units::{
     ChannelCount, Hertz, HostDuration, HostTime, Milliseconds, SampleIndex, SampleRate,
 };
@@ -246,7 +247,9 @@ impl ChannelLayout {
         }
 
         // One pass: high-pass every channel and accumulate Σy, Σy² and Σy_c·y_p (p < c) in f64.
-        let mut filters = vec![HighPass::butterworth(format.rate, LAYOUT_HIGHPASS); n];
+        // INVARIANT: 100 Hz is below Nyquist at every valid rate (fs ≥ 16 kHz).
+        let hpf = Biquad::highpass(format.rate, LAYOUT_HIGHPASS).expect("100 Hz < fs/2");
+        let mut filters = vec![hpf; n];
         let mut sum = vec![0.0f64; n];
         let mut sum_sq = vec![0.0f64; n];
         let mut cross = vec![0.0f64; n * n]; // cross[c·n + p] = Σ y_c·y_p for p < c
@@ -359,50 +362,6 @@ impl ChannelLayout {
             duplicates,
             silent,
         })
-    }
-}
-
-/// Private copy of `dsp::Biquad::highpass` (§1.5.1): 2nd-order Butterworth high-pass, RBJ
-/// cookbook, transposed direct form II, f64 coefficients and state. WP-A1 replaces it with a call
-/// to `dsp::Biquad::highpass` (§1.4).
-#[derive(Debug, Clone)]
-struct HighPass {
-    b0: f64,
-    b1: f64,
-    b2: f64,
-    a1: f64,
-    a2: f64,
-    z1: f64,
-    z2: f64,
-}
-
-impl HighPass {
-    /// Q = 1/√2. w0 = 2π·fc/fs, α = sin w0/(2Q),
-    /// b = [(1+cos w0)/2, −(1+cos w0), (1+cos w0)/2]/a0, a = [−2cos w0, 1−α]/a0, a0 = 1+α.
-    /// The only caller passes 100 Hz, below Nyquist at every valid rate.
-    fn butterworth(rate: SampleRate, cutoff: Hertz) -> Self {
-        let w0 = std::f64::consts::TAU * cutoff.get() / f64::from(rate.hz());
-        let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
-        let a0 = 1.0 + alpha;
-        HighPass {
-            b0: (1.0 + cos) / 2.0 / a0,
-            b1: -(1.0 + cos) / a0,
-            b2: (1.0 + cos) / 2.0 / a0,
-            a1: -2.0 * cos / a0,
-            a2: (1.0 - alpha) / a0,
-            z1: 0.0,
-            z2: 0.0,
-        }
-    }
-
-    /// y = b0·x + z1; z1 = b1·x − a1·y + z2; z2 = b2·x − a2·y
-    fn process(&mut self, x: f32) -> f32 {
-        let x = f64::from(x);
-        let y = self.b0 * x + self.z1;
-        self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
-        y as f32
     }
 }
 
