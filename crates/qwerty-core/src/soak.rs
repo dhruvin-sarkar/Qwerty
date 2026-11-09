@@ -9,6 +9,7 @@
 //! [`CountingAllocator`] defined here.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::classifier::ClassifierParams;
@@ -24,18 +25,31 @@ use crate::profile::ZoneId;
 
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// Successful `alloc`/`realloc` calls made by the current thread. `const`-initialized and
+    /// without a destructor, so reading or bumping it never allocates and never fails, even
+    /// from inside the allocator or during thread teardown.
+    static THREAD_ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Counts one allocation on the current thread.
+fn count_thread_allocation() {
+    THREAD_ALLOCATIONS.with(|n| n.set(n.get() + 1));
+}
+
 /// A `GlobalAlloc` wrapper that tracks currently-live heap bytes. Install it in
 /// a binary with `#[global_allocator]` to measure steady-state heap use across
 /// a long run (see the `soak` example).
 pub struct CountingAllocator;
 
 // SAFETY: forwards every call to the system allocator unchanged, only adding
-// atomic byte accounting around it.
+// atomic byte accounting and a per-thread call count around it.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
             ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+            count_thread_allocation();
         }
         ptr
     }
@@ -43,11 +57,28 @@ unsafe impl GlobalAlloc for CountingAllocator {
         System.dealloc(ptr, layout);
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
     }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = System.realloc(ptr, layout, new_size);
+        if !new_ptr.is_null() {
+            // The live-byte total moves exactly as the default alloc + dealloc pair moved it.
+            ALLOCATED.fetch_add(new_size, Ordering::Relaxed);
+            ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
+            count_thread_allocation();
+        }
+        new_ptr
+    }
 }
 
 /// Currently-live heap bytes as tracked by [`CountingAllocator`].
 pub fn allocated_bytes() -> usize {
     ALLOCATED.load(Ordering::Relaxed)
+}
+
+/// Successful `alloc` and `realloc` calls the current thread has made through
+/// [`CountingAllocator`] (0 when it is not the global allocator). Tests take the
+/// difference across a region to assert it allocates nothing.
+pub fn thread_allocations() -> u64 {
+    THREAD_ALLOCATIONS.with(Cell::get)
 }
 
 // ---------------------------------------------------------------------------
