@@ -12,7 +12,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::classifier::ClassifierParams;
-use crate::features::{FeatureExtractor, FeatureVector, FEATURE_WINDOW_SAMPLES, SAMPLE_RATE_HZ};
+use crate::desk::{CleanSignatures, Lcg};
+use crate::features::{FeatureExtractor, FeatureVector};
 use crate::onset::OnsetDetector;
 use crate::profile::ZoneId;
 
@@ -47,127 +48,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
 /// Currently-live heap bytes as tracked by [`CountingAllocator`].
 pub fn allocated_bytes() -> usize {
     ALLOCATED.load(Ordering::Relaxed)
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic PRNG (no dependency; keeps the soak reproducible)
-// ---------------------------------------------------------------------------
-
-struct Lcg(u64);
-impl Lcg {
-    fn new(seed: u64) -> Self {
-        Self(seed ^ 0x9E37_79B9_7F4A_7C15)
-    }
-    /// Uniform in [0, 1).
-    fn next_unit(&mut self) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 40) as f32) / ((1u64 << 24) as f32)
-    }
-    /// Uniform in [-1, 1).
-    fn next_bipolar(&mut self) -> f32 {
-        self.next_unit() * 2.0 - 1.0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Synthetic desk: distinct acoustic signature per zone
-// ---------------------------------------------------------------------------
-
-const LEAD_SILENCE: usize = 256 * 8;
-
-struct SyntheticDesk {
-    /// Resonant partials (Hz) for each zone — distinct sets make zones
-    /// spectrally separable, mirroring how desk positions resonate differently.
-    zone_partials: Vec<Vec<f32>>,
-}
-
-impl SyntheticDesk {
-    fn new(zone_count: usize) -> Self {
-        // Base frequency per zone spread across the audible band, each with a
-        // small harmonic stack. NOTE: this fixture gives every zone the *same*
-        // harmonic-ratio template scaled by a per-zone fundamental, so it is a
-        // faithful sanity check only at the default zone count it was validated
-        // against (≈99% at 4 zones). It is deliberately NOT used to assert a
-        // multi-zone *accuracy* floor: at higher zone counts the scaled-template
-        // signatures crowd together in a way that reflects the fixture's own
-        // degeneracy, not the classifier — real multi-zone accuracy is gated by
-        // the hardware-based ≥92% row in ACCEPTANCE.md, not by this generator.
-        // (The `--zones` flag on the soak example exists to *explore* that
-        // synthetic separability, not to gate on it.)
-        let zone_partials = (0..zone_count)
-            .map(|z| {
-                let base = 700.0 + z as f32 * 430.0;
-                vec![base, base * 1.9, base * 2.7]
-            })
-            .collect();
-        Self { zone_partials }
-    }
-
-    /// A tap clip for `zone`: lead silence, then a fast-decaying multi-partial
-    /// impulse, then trailing silence so a full window fits after the onset.
-    fn tap(&self, zone: usize, rng: &mut Lcg, jitter: f32) -> Vec<f32> {
-        let n = FEATURE_WINDOW_SAMPLES;
-        let mut clip = vec![0.0f32; LEAD_SILENCE];
-        let partials = &self.zone_partials[zone];
-        for i in 0..n {
-            let t = i as f32 / SAMPLE_RATE_HZ as f32;
-            let env = (-t * 130.0).exp();
-            let mut s = 0.0f32;
-            for (k, &f) in partials.iter().enumerate() {
-                let fj = f * (1.0 + jitter * rng.next_bipolar() * 0.02);
-                let amp = 1.0 / (k as f32 + 1.0);
-                s += amp * (2.0 * std::f32::consts::PI * fj * t).sin();
-            }
-            clip.push(0.6 * env * s);
-        }
-        clip.extend(std::iter::repeat_n(0.0, n));
-        clip
-    }
-
-    /// A sustained (non-tap) clip: a steady tone or a slowly amplitude-modulated
-    /// broadband sound — energy that does not decay, so it must be rejected.
-    fn sustained(&self, rng: &mut Lcg) -> Vec<f32> {
-        let n = FEATURE_WINDOW_SAMPLES * 2;
-        let mut clip = vec![0.0f32; LEAD_SILENCE];
-        let speechlike = rng.next_unit() > 0.5;
-        let f = 300.0 + rng.next_unit() * 500.0;
-        for i in 0..n {
-            let t = i as f32 / SAMPLE_RATE_HZ as f32;
-            let s = if speechlike {
-                // Amplitude-modulated multi-tone, like voiced speech.
-                let am = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * 5.0 * t).sin();
-                am * ((2.0 * std::f32::consts::PI * f * t).sin()
-                    + 0.5 * (2.0 * std::f32::consts::PI * f * 2.5 * t).sin())
-            } else {
-                (2.0 * std::f32::consts::PI * f * t).sin()
-            };
-            clip.push(0.5 * s);
-        }
-        clip.extend(std::iter::repeat_n(0.0, FEATURE_WINDOW_SAMPLES));
-        clip
-    }
-
-    /// A *foreign* tap-like transient: a fast-decaying broadband noise burst.
-    /// Crucially it has the SAME sharp attack + fast decay as a real tap, so it
-    /// PASSES the onset detector's sustain gate and reaches the classifier —
-    /// unlike [`sustained`], which onset rejects before the classifier sees it.
-    /// But its spectrum is broadband noise, matching no calibrated zone's peaky
-    /// harmonic signature, so the classifier's *novelty gate* must reject it.
-    /// This is what makes the novelty gate actually testable end-to-end.
-    fn foreign_tap(&self, rng: &mut Lcg) -> Vec<f32> {
-        let n = FEATURE_WINDOW_SAMPLES;
-        let mut clip = vec![0.0f32; LEAD_SILENCE];
-        for i in 0..n {
-            let t = i as f32 / SAMPLE_RATE_HZ as f32;
-            let env = (-t * 130.0).exp(); // same decay envelope as a real tap
-            clip.push(0.6 * env * rng.next_bipolar());
-        }
-        clip.extend(std::iter::repeat_n(0.0, n));
-        clip
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +139,7 @@ impl BatchTally {
 pub struct Soak {
     classifier: ClassifierParams,
     extractor: FeatureExtractor,
-    desk: SyntheticDesk,
+    desk: CleanSignatures,
     zone_ids: Vec<ZoneId>,
     rng: Lcg,
     /// A *separate* generator for the foreign-transient population, seeded
@@ -276,7 +156,7 @@ impl Soak {
     /// Build the harness: synthesize calibration taps, extract their features,
     /// and train the classifier — so the pipeline is ready to evaluate.
     pub fn new(config: SoakConfig) -> Self {
-        let desk = SyntheticDesk::new(config.zone_count);
+        let desk = CleanSignatures::new(config.zone_count);
         let zone_ids: Vec<ZoneId> = (0..config.zone_count)
             .map(|z| ZoneId::from_uuid(uuid::Uuid::from_u128(1000 + z as u128)))
             .collect();
@@ -482,42 +362,6 @@ mod tests {
             tally.correct + tally.rejected_taps + tally.misclassified,
             "a presented tap fell through all three outcome buckets"
         );
-    }
-
-    /// FNV-1a 64 offset basis and prime: a hash that is stable across Rust versions, unlike
-    /// `DefaultHasher`.
-    const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
-    /// K4 golden hash of 4 zones × 3 clips, recorded from the pre-move v1 generator.
-    const K4_GOLDEN: u64 = 0x6DA1_1BAD_C8FF_61FB;
-
-    /// Folds the clip length and every sample's little-endian bit pattern into `hash`.
-    fn fnv1a_clip(mut hash: u64, clip: &[f32]) -> u64 {
-        let len = clip.len() as u64;
-        for byte in len
-            .to_le_bytes()
-            .into_iter()
-            .chain(clip.iter().flat_map(|s| s.to_bits().to_le_bytes()))
-        {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        hash
-    }
-
-    #[test]
-    fn k4_clean_signatures_match_v1_generator() {
-        // SPEC: "4 zones × 3 clips" read as one clip from each of the three generators per
-        // zone (tap, sustained, foreign tap), drawn from one Lcg stream seeded as the soak's.
-        let desk = SyntheticDesk::new(4);
-        let mut rng = Lcg::new(1);
-        let mut hash = FNV_OFFSET;
-        for zone in 0..4 {
-            hash = fnv1a_clip(hash, &desk.tap(zone, &mut rng, 1.0));
-            hash = fnv1a_clip(hash, &desk.sustained(&mut rng));
-            hash = fnv1a_clip(hash, &desk.foreign_tap(&mut rng));
-        }
-        assert_eq!(hash, K4_GOLDEN, "got {hash:#018X}");
     }
 
     #[test]
