@@ -1033,19 +1033,21 @@ impl LatencyStats {
         for &v in &sorted {
             histogram[bin(v, LATENCY_BIN.get(), LATENCY_BINS)] += 1;
         }
-        let rank = |p: f64| -> Milliseconds {
-            if sorted.is_empty() {
+        // Nearest rank: the ⌈percent·n/100⌉-th smallest, in integers so no rounding moves a rank.
+        let rank = |percent: usize| -> Milliseconds {
+            let n = sorted.len();
+            if n == 0 {
                 return Milliseconds::new(0.0);
             }
-            let r = (p * sorted.len() as f64).ceil() as usize;
-            Milliseconds::new(sorted[r.clamp(1, sorted.len()) - 1])
+            let r = (percent * n).div_ceil(100);
+            Milliseconds::new(sorted[r.clamp(1, n) - 1])
         };
         LatencyStats {
             count: sorted.len() as u32,
             untimed,
-            p50: rank(0.50),
-            p95: rank(0.95),
-            p99: rank(0.99),
+            p50: rank(50),
+            p95: rank(95),
+            p99: rank(99),
             max: match sorted.last() {
                 Some(&v) => Milliseconds::new(v),
                 None => Milliseconds::new(0.0),
