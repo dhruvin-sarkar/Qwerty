@@ -157,7 +157,8 @@ struct Output {
     id: OutputId,
     kind: SelfOutputKind,
     start: HostTime,
-    /// `None` while open.
+    /// `None` while a Speech or Sound waits for its end. A Toast gets no `Ended` (p2 §2.6), so
+    /// its end is set when it begins: start + toast_allowance.
     end: Option<HostTime>,
 }
 
@@ -239,9 +240,9 @@ impl VetoTimeline {
         });
     }
 
-    /// `Began{Speech}` closes any open Speech (interrupt). An `Ended` for an unknown or
-    /// already-closed id is ignored and counted in `unmatched_ends` (processing maps speech ends
-    /// to ids through a FIFO; X01-07).
+    /// `Began{Speech}` closes any open Speech (interrupt). A Toast is complete when it begins. An
+    /// `Ended` for an unknown or already-closed id (a Toast included) is ignored and counted in
+    /// `unmatched_ends` (processing maps speech ends to ids through a FIFO; X01-07).
     pub fn self_output(&mut self, e: SelfOutputEvent) {
         match e {
             SelfOutputEvent::Began { id, kind, at } => {
@@ -256,11 +257,15 @@ impl VetoTimeline {
                 if self.outputs.len() == OUTPUT_CAP {
                     self.evict_output();
                 }
+                let end = match kind {
+                    SelfOutputKind::Speech | SelfOutputKind::Sound => None,
+                    SelfOutputKind::Toast => Some(after(at, self.spans.toast)),
+                };
                 self.outputs.push(Output {
                     id,
                     kind,
                     start: at,
-                    end: None,
+                    end,
                 });
             }
             SelfOutputEvent::Ended { id, at } => {
@@ -291,8 +296,8 @@ impl VetoTimeline {
         }
     }
 
-    /// Drops input events, gaps and closed outputs that end before now − horizon. Open outputs
-    /// stay until they end or `close_stuck` closes them.
+    /// Drops input events, gaps and closed outputs (toasts included) whose veto ends before
+    /// now − horizon. An open Speech or Sound stays until it ends or `close_stuck` closes it.
     pub fn prune(&mut self, now: HostTime) {
         let cutoff = before(now, self.spans.horizon);
         while self.inputs.front().is_some_and(|x| x.time < cutoff) {
@@ -388,9 +393,10 @@ impl VetoTimeline {
     }
 
     /// Frees one output slot: the closed output whose veto ends first, else the oldest open one.
-    // SPEC: §1.13.2 caps outputs at 16 but names no eviction rule. Only a closed output's interval
-    // is complete, so the one ending first goes; 16 outputs open at once (speech closes speech,
-    // sounds play synchronously) would drop the oldest.
+    // SPEC: §1.13.2 caps outputs at 16 but names no eviction rule. A closed output's interval is
+    // complete (a Toast's from the moment it begins), so the one ending first goes; an open one
+    // still vetoes up to now + tail. 16 outputs open at once (speech closes speech, sounds play
+    // synchronously, toasts are never open) would drop the oldest.
     fn evict_output(&mut self) {
         let spans = self.spans;
         let closed = self
@@ -412,15 +418,13 @@ impl VetoTimeline {
     }
 }
 
-/// The closed interval of host time in which `o` vetoes a candidate: Speech and Sound from their
-/// start to (end, or `now` while open) + tail; Toast from its start to start + allowance + tail.
+/// The closed interval of host time in which `o` vetoes a candidate: from its start to (end, or
+/// `now` while open) + tail. A Toast's end is start + allowance, so it gives
+/// [start, start + allowance + tail].
 fn veto_interval(o: &Output, spans: &Spans, now: HostTime) -> (HostTime, HostTime) {
-    let end = match o.kind {
-        SelfOutputKind::Speech | SelfOutputKind::Sound => match o.end {
-            Some(end) => end,
-            None => now,
-        },
-        SelfOutputKind::Toast => after(o.start, spans.toast),
+    let end = match o.end {
+        Some(end) => end,
+        None => now,
     };
     (o.start, after(end, spans.tail))
 }
@@ -588,7 +592,8 @@ mod tests {
         assert_eq!(verdict(&v, 1300.0), self_out(SelfOutputKind::Sound));
         assert_eq!(verdict(&v, 1300.1), VetoVerdict::Clear);
 
-        // A Toast vetoes on [s, s + 1700 ms], whenever it ends.
+        // A Toast vetoes on [s, s + 1700 ms]. It is complete when it begins (the engine sends it
+        // no Ended, p2 §2.6), so an Ended for it is unmatched and changes nothing.
         let toast = self_out(SelfOutputKind::Toast);
         let mut v = timeline();
         v.self_output(began(1, SelfOutputKind::Toast, 1000.0));
@@ -598,7 +603,8 @@ mod tests {
         assert_eq!(verdict(&v, 2700.1), VetoVerdict::Clear);
         v.self_output(ended(1, 1050.0));
         assert_eq!(verdict(&v, 2700.0), toast);
-        assert_eq!(v.counters().unmatched_ends, 0);
+        assert_eq!(verdict(&v, 2700.1), VetoVerdict::Clear);
+        assert_eq!(v.counters().unmatched_ends, 1);
 
         // A new Speech Began closes the previous one: once speech 2 has ended, nothing holds the
         // veto open, as a still-open speech 1 would.
@@ -733,5 +739,39 @@ mod tests {
         // Its real end arrives later: already closed, so it is unmatched.
         v.self_output(ended(7, 171_000.0));
         assert_eq!(v.counters().unmatched_ends, 1);
+
+        // A Toast never gets an Ended (p2 §2.6); its interval is complete when it begins, so it
+        // is never stuck and never raises a SelfOutputStuck.
+        let mut v = timeline();
+        v.self_output(began(9, SelfOutputKind::Toast, 1000.0));
+        assert_eq!(v.close_stuck(at(121_000.1)), vec![]);
+        assert_eq!(v.close_stuck(at(500_000.0)), vec![]);
+        assert_eq!(v.counters().stuck_closed, 0);
+    }
+
+    #[test]
+    fn outputs_prune_and_cap_keep_live_intervals() {
+        // prune drops a Toast once its interval [1000, 2700] ends before now − horizon.
+        let mut v = timeline();
+        v.self_output(began(1, SelfOutputKind::Toast, 1000.0));
+        v.prune(at(4700.0));
+        assert_eq!(v.outputs.len(), 1);
+        v.prune(at(4700.1));
+        assert!(v.outputs.is_empty());
+
+        // At the 16-output cap the output whose veto ends first goes: 15 toasts whose intervals
+        // ended long ago go before a closed Speech still in its tail.
+        let mut v = timeline();
+        for i in 0..15_u64 {
+            v.self_output(began(i, SelfOutputKind::Toast, 10.0 * i as f64));
+        }
+        v.self_output(began(100, SelfOutputKind::Speech, 3000.0));
+        v.self_output(ended(100, 4000.0));
+        assert_eq!(v.outputs.len(), OUTPUT_CAP);
+        assert_eq!(verdict(&v, 4020.0), self_out(SelfOutputKind::Speech));
+        v.self_output(began(101, SelfOutputKind::Sound, 4050.0));
+        assert_eq!(v.outputs.len(), OUTPUT_CAP);
+        assert!(v.outputs.iter().all(|o| o.id != OutputId(0)));
+        assert_eq!(verdict(&v, 4020.0), self_out(SelfOutputKind::Speech));
     }
 }
