@@ -51,8 +51,9 @@ pub const ROOM_MODERATE_RATE: f64 = 0.1;
 pub const ROOM_MODERATE_FLOOR: Decibels = Decibels::new(-45.0);
 pub const DEFAULT_AUDIO_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The ambient noise estimate leaves out [onset − 50 ms, onset + 300 ms) around every ambient
-/// candidate (rule 1).
+/// The ambient noise estimate leaves out the closed range [onset − 50 ms, onset + 300 ms] around
+/// every ambient candidate (rule 1). `estimate_noise` and `AmbientRecording` read an exclusion as
+/// half-open (x0, x1), so the session passes x1 = onset + 300 ms + 1.
 const EXCLUDE_BEFORE: Milliseconds = Milliseconds::new(50.0);
 const EXCLUDE_AFTER: Milliseconds = Milliseconds::new(300.0);
 /// Floor for the noise-floor `log10` argument (§0.8).
@@ -912,7 +913,7 @@ impl CalibrationSession {
             .iter()
             .map(|onset| {
                 let at = onset.0.saturating_sub(start);
-                (at.saturating_sub(before), at.saturating_add(after))
+                (at.saturating_sub(before), at.saturating_add(after + 1))
             })
             .collect();
         let noise = match estimate_noise(format, &layout, &samples, &exclude) {
@@ -974,16 +975,12 @@ impl CalibrationSession {
             CalibrationInput::Candidate {
                 candidate,
                 live,
-                veto,
+                veto: _,
             } => {
-                // Every candidate is a disturbance of the recording, whatever its veto.
+                // Rule 1: every candidate is a disturbance of the recording and is kept as an
+                // EnvironmentOnset negative, whatever its veto (rule 3's SelfOutput exception is
+                // the Negatives step's only).
                 self.ambient_onsets.push(candidate.onset);
-                // SPEC: rule 1 keeps ambient candidates as EnvironmentOnset negatives; Qwerty's own
-                // output (and an untimed or overflowed candidate) is never kept, as in rule 3.
-                match VetoClass::of(&veto) {
-                    VetoClass::SelfOutput => return Ok(TapFeedback::SelfOutput),
-                    VetoClass::Clear | VetoClass::Input => {}
-                }
                 let Some(stored) = stored_clip(*candidate, live) else {
                     return Ok(TapFeedback::Ignored);
                 };
@@ -2618,5 +2615,85 @@ mod tests {
             })
         );
         assert_eq!(s.view(), failed);
+    }
+
+    /// Rule 1: every candidate during Ambient gives `AmbientDisturbance` and is kept as an
+    /// `EnvironmentOnset` negative, whatever its veto (rule 3's SelfOutput exception is the
+    /// Negatives step's only).
+    #[test]
+    fn ambient_candidates_are_kept_whatever_their_veto() {
+        let mut rig = Rig::new(0xA3B1, Mics::Stereo);
+        let mut s = CalibrationSession::new(plan(2, 5, 0xA3)).expect("session");
+        s.start_ambient().expect("start_ambient");
+        let sounds: Vec<(f64, Vec<f32>)> = (0..5)
+            .map(|k| (300.0 + 500.0 * f64::from(k), rig.tap(1, TAP_FORCE)))
+            .collect();
+        let (_, _, inputs) = rig.play(3000.0, &sounds);
+        let vetoes = [
+            VetoVerdict::Vetoed {
+                reason: VetoReason::SelfOutput {
+                    kind: crate::veto::SelfOutputKind::Toast,
+                },
+            },
+            VetoVerdict::Vetoed {
+                reason: VetoReason::ClockUnavailable,
+            },
+            VetoVerdict::Vetoed {
+                reason: VetoReason::InputOverflow,
+            },
+            VetoVerdict::Vetoed {
+                reason: VetoReason::DecisionOverflow,
+            },
+            input_veto(10.0),
+        ];
+        let candidates: Vec<CalibrationInput> = inputs.into_iter().filter(is_candidate).collect();
+        assert_eq!(candidates.len(), vetoes.len());
+        for (input, veto) in candidates.into_iter().zip(vetoes) {
+            let fb = s.on_input(with_veto(input, veto)).expect("on_input");
+            assert_eq!(fb, TapFeedback::AmbientDisturbance, "{veto:?}");
+        }
+        assert_eq!(s.negatives.len(), vetoes.len());
+        assert!(s
+            .negatives
+            .iter()
+            .all(|n| n.source == NegativeSource::EnvironmentOnset));
+    }
+
+    /// Rule 1's excluded range is the closed interval [onset − 50 ms, onset + 300 ms]; its
+    /// consumers read the tuple as half-open, so the frame at onset + 300 ms must be inside it.
+    #[test]
+    fn ambient_exclusion_is_closed_at_both_ends() {
+        let mut rig = Rig::new(0xA3B2, Mics::Stereo);
+        let mut s = CalibrationSession::new(plan(2, 5, 0xA3)).expect("session");
+        s.start_ambient().expect("start_ambient");
+        let click = rig.tap(1, TAP_FORCE);
+        let (start, x, inputs) = rig.play(3000.0, &[(1500.0, click)]);
+        let onsets: Vec<u64> = inputs
+            .iter()
+            .filter_map(|i| {
+                let CalibrationInput::Candidate { candidate, .. } = i else {
+                    return None;
+                };
+                Some(candidate.onset.0 - start.0)
+            })
+            .collect();
+        assert_eq!(onsets.len(), 1);
+        feed(&mut s, inputs);
+        for (i, chunk) in x.chunks(BLOCK * 2).enumerate() {
+            let at = SampleIndex(start.0 + (i * BLOCK) as u64);
+            let block =
+                AudioBlock::new(stereo(), at, chunk, BlockTime::Untimed, false).expect("block");
+            s.push_ambient(&block).expect("push_ambient");
+        }
+        let recording = s
+            .ambient
+            .as_ref()
+            .and_then(|a| a.recording.as_ref())
+            .expect("one click leaves the recording usable");
+        let at = onsets[0];
+        assert_eq!(
+            recording.exclude,
+            vec![(at - frames(50.0) as u64, at + frames(300.0) as u64 + 1)]
+        );
     }
 }
