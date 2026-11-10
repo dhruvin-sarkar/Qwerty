@@ -1194,31 +1194,49 @@ mod tests {
         // fills and each further candidate finalizes the oldest as DecisionOverflow.
         let x = storm(3_300.0, STORM_SPACING_MS);
         let (out, fe) = calibrate(&x, 160, true);
-        let overflowed = out
+        // The detector alone on the same blocks gives the candidates, independently of the queue.
+        let mut detector = Detector::new(
+            format(),
+            &layout(),
+            &DetectorParams::DEFAULT,
+            DetectorMode::CalibrationClips,
+        )
+        .expect("valid detector");
+        let mut detected = Vec::new();
+        let mut candidates = Vec::new();
+        blocks(&x, 0, 160, |b, _| {
+            detect(&mut detector, b, &mut detected).expect("matching format");
+            candidates.extend(detected.iter().filter_map(|o| match o {
+                DetectorOutput::Candidate(c) => Some(c.onset.0),
+                DetectorOutput::Rejected(_) | DetectorOutput::InputFault(_) => None,
+            }));
+        });
+        let kept = candidates.len() - MAX_PENDING_DECISIONS;
+        // Every finalized candidate is overflow: a described one leaves as
+        // Vetoed{DecisionOverflow}, one whose extraction failed as Invalid (§1.15 flow step 2).
+        let mut finalized = Vec::new();
+        for c in &out {
+            match c {
+                CalibrationInput::Candidate {
+                    candidate, veto, ..
+                } => {
+                    assert_eq!(*veto, OVERFLOW, "onset {}", candidate.onset.0);
+                    finalized.push(candidate.onset.0);
+                }
+                CalibrationInput::Invalid { candidate, .. } => finalized.push(candidate.onset.0),
+                CalibrationInput::Rejected { .. } | CalibrationInput::InputFault { .. } => {}
+            }
+        }
+        // None is lost or reordered: all but the newest MAX_PENDING_DECISIONS have left, in onset
+        // order, and those are the ones still pending.
+        assert!(kept > 50, "{kept}");
+        assert_eq!(finalized, candidates[..kept]);
+        assert!(finalized.windows(2).all(|w| w[0] < w[1]));
+        assert!(out
             .iter()
-            .filter(|c| {
-                matches!(
-                    c,
-                    CalibrationInput::Candidate {
-                        veto: VetoVerdict::Vetoed {
-                            reason: VetoReason::DecisionOverflow
-                        },
-                        ..
-                    } | CalibrationInput::Invalid { .. }
-                )
-            })
-            .count();
-        assert!(overflowed > 50, "{overflowed}");
-        assert_eq!(fe.pending.items.len(), MAX_PENDING_DECISIONS);
-        let onsets: Vec<u64> = out
-            .iter()
-            .filter_map(|c| match c {
-                CalibrationInput::Candidate { candidate, .. }
-                | CalibrationInput::Invalid { candidate, .. } => Some(candidate.onset.0),
-                CalibrationInput::Rejected { .. } | CalibrationInput::InputFault { .. } => None,
-            })
-            .collect();
-        assert!(onsets.windows(2).all(|w| w[0] < w[1]));
+            .any(|c| matches!(c, CalibrationInput::Candidate { veto, .. } if *veto == OVERFLOW)));
+        let pending: Vec<u64> = fe.pending.items.iter().map(|q| q.onset.0).collect();
+        assert_eq!(pending, candidates[kept..]);
     }
 
     #[test]
