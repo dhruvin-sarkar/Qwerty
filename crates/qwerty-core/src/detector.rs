@@ -437,6 +437,9 @@ pub struct Detector {
     // Triggers and candidates.
     triggers: VecDeque<TriggerRecord>,
     pending: VecDeque<Pending>,
+    /// Noise snapshots for new triggers, so a trigger allocates nothing (§0.9): together with
+    /// the pending candidates' snapshots there are always MAX_PENDING of them.
+    spare: Vec<NoiseSnapshot>,
     next_id: u64,
     // Health.
     health_flags: Vec<u8>, // ring of per-frame flags: bit 0 frozen, bit 1 trigger
@@ -532,7 +535,10 @@ impl Detector {
         let health_len = rate.samples_in(HEALTH_WINDOW).div_ceil(geometry.hop);
         let flux_len = (params.peak_mean_frames + 1).max(params.peak_local_max_frames);
         let aic_len = (spans.aic_before + spans.aic_after) as usize;
-        let (tracker, noise) = match fixed {
+        // A trigger record lives at most max(freeze, spacing) past its frame, one trigger per frame.
+        let trigger_cap =
+            (spans.freeze.max(spans.spacing) as usize).div_ceil(geometry.hop) + MAX_PENDING + 2;
+        let (tracker, noise): (Tracker, NoiseSnapshot) = match fixed {
             Some(noise) => (Tracker::Fixed, noise),
             None => (
                 Tracker::Warming {
@@ -545,6 +551,8 @@ impl Detector {
                 },
             ),
         };
+        let mut spare = Vec::with_capacity(MAX_PENDING + 1);
+        spare.resize(MAX_PENDING, noise.clone());
         Ok(Detector {
             format,
             params: *params,
@@ -574,8 +582,9 @@ impl Detector {
             yhat: vec![[0.0; BAND_COUNT]; params.flux_lag_frames + 1],
             flux: vec![0.0; flux_len],
             low_ratio_run: 0,
-            triggers: VecDeque::with_capacity(16),
+            triggers: VecDeque::with_capacity(trigger_cap),
             pending: VecDeque::with_capacity(MAX_PENDING + 1),
+            spare,
             next_id: 0,
             health_flags: vec![0; health_len],
             health_next: 0,
@@ -773,6 +782,7 @@ impl Detector {
                 reason: RejectReason::SpanCrossesDiscontinuity,
                 gates: None,
             }));
+            self.spare.push(p.noise);
         }
         self.clock.reset();
     }
@@ -953,6 +963,7 @@ impl Detector {
                             reason: RejectReason::Superseded,
                             gates: None,
                         }));
+                        self.spare.push(p.noise);
                     }
                     Some(_) | None => return false,
                 }
@@ -968,7 +979,15 @@ impl Detector {
                     reason: RejectReason::PendingOverflow,
                     gates: None,
                 }));
+                self.spare.push(p.noise);
             }
+        }
+        // INVARIANT: pending < MAX_PENDING here (an overflow was just rejected), and every snapshot
+        // not held by a pending candidate is spare, so at least one is spare.
+        let mut noise = self.spare.pop().expect("a spare noise snapshot");
+        noise.pooled = self.noise.pooled;
+        for (dst, src) in noise.chosen.iter_mut().zip(&self.noise.chosen) {
+            *dst = *src;
         }
         let id = CandidateId(self.next_id);
         self.next_id += 1;
@@ -984,7 +1003,7 @@ impl Detector {
             id,
             trigger: centre,
             flux: d,
-            noise: self.noise.clone(),
+            noise,
             stage: Stage::Aic {
                 ready: centre + self.spans.aic_after,
             },
@@ -1082,6 +1101,7 @@ impl Detector {
                 reason,
                 gates: None,
             }));
+            this.spare.push(p.noise);
             false
         };
         if !self.filtered.covers(start, end) {
@@ -1143,6 +1163,7 @@ impl Detector {
                 reason: RejectReason::SpanCrossesDiscontinuity,
                 gates: None,
             }));
+            self.spare.push(p.noise);
             return;
         };
 
@@ -1173,6 +1194,7 @@ impl Detector {
                 reason,
                 gates: Some(gates),
             }));
+            self.spare.push(p.noise);
             return;
         }
 
@@ -1212,7 +1234,10 @@ impl Detector {
                 layout: self.descriptor_layout,
                 pooled,
                 chosen,
-                noise: p.noise,
+                noise: {
+                    self.spare.push(p.noise.clone());
+                    p.noise
+                },
                 span,
                 span_onset: self.spans.span_before as usize,
             },
@@ -2471,6 +2496,45 @@ mod tests {
         let s = clip.start.0 as usize * 2;
         assert_eq!(clip.samples, x[s..s + (pre + post) * 2].to_vec());
         assert!(c.emitted_at.0 >= c.onset.0 + post as u64 - 1);
+    }
+
+    #[test]
+    fn pending_overflow_rejects_the_oldest_and_every_trigger_resolves_once() {
+        // No spacing, no δ and a one-frame local max: almost every frame of noise triggers, and
+        // CalibrationClips keeps each candidate pending for 60 ms, far more than MAX_PENDING.
+        let params = DetectorParams {
+            min_trigger_spacing: Milliseconds::new(0.0),
+            peak_delta: 0.0,
+            peak_local_max_frames: 1,
+            ..P
+        };
+        let hz = 48_000;
+        let fmt = format(hz, 1);
+        let (x, _) = scene(hz, 1, 0x0F10, 3000.0, &[(1500.0, TapKind::Partials, 40.0)]);
+        let mut det = Detector::new(fmt, &all_real(1), &params, DetectorMode::CalibrationClips)
+            .expect("detector");
+        let mut out = Vec::new();
+        push_all(&mut det, fmt, &x, 0, 480, &mut out);
+        let overflow = rejections(&out)
+            .iter()
+            .filter(|r| r.reason == RejectReason::PendingOverflow)
+            .count();
+        assert!(overflow > 0, "no overflow");
+        assert_eq!(det.health().pending_overflow, overflow as u64);
+        let mut ids: Vec<u64> = out
+            .iter()
+            .filter_map(|o| match o {
+                DetectorOutput::Candidate(c) => Some(c.id.0),
+                DetectorOutput::Rejected(r) => Some(r.id.0),
+                DetectorOutput::InputFault(_) => None,
+            })
+            .collect();
+        let resolved = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), resolved, "a trigger resolved twice");
+        assert_eq!(resolved as u64 + det.pending.len() as u64, det.next_id);
+        assert_eq!(det.spare.len() + det.pending.len(), MAX_PENDING);
     }
 
     #[test]
