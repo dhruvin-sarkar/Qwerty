@@ -14,7 +14,9 @@ use crate::profile::ZoneId;
 use crate::units::{SampleRate, TapIndex, ZoneIndex};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 pub const MIN_ZONES: usize = 2;
 pub const MIN_TAPS_PER_ZONE: usize = 5;
@@ -1001,9 +1003,17 @@ fn score_all(
         .collect()
 }
 
+/// One fold as a helper reports it: the fold index, and the fold's result or its panic payload.
+type FoldReport<T> = (usize, std::thread::Result<Result<T, TrainingError>>);
+
 /// Runs `fold(i)` for i in 0..total in chunks of `workers` inside `std::thread::scope`, slot
 /// i holding fold i, so the output is bit-identical for any worker count. Progress is reported
 /// and `cancel` checked by the coordinating thread after every chunk.
+///
+/// The coordinating thread folds the first index of every chunk itself and `workers − 1`
+/// helpers, spawned once per call, fold the rest. A thread spawn and join measured 7-13 ms on
+/// the Windows dev machine: one spawn per fold made a d = 48, G = 80 training take ~485 ms with
+/// 2 or 8 workers against 26 ms with 1 (`G:/DeveloperData/Evidence/Qwerty/wp-a2/`).
 fn run_folds<T: Send>(
     total: usize,
     workers: usize,
@@ -1012,34 +1022,62 @@ fn run_folds<T: Send>(
     event: fn(u32, u32) -> TrainingProgress,
     fold: &(dyn Fn(usize) -> Result<T, TrainingError> + Sync),
 ) -> Result<Vec<T>, TrainingError> {
-    let mut out = Vec::with_capacity(total);
-    let mut start = 0;
-    while start < total {
-        let end = (start + workers.max(1)).min(total);
-        let chunk: Vec<Result<T, TrainingError>> = if end - start == 1 {
-            vec![fold(start)]
-        } else {
-            std::thread::scope(|s| {
-                let handles: Vec<_> = (start..end).map(|i| s.spawn(move || fold(i))).collect();
-                handles
-                    .into_iter()
-                    .map(|h| match h.join() {
-                        Ok(r) => r,
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    })
-                    .collect()
+    let workers = workers.clamp(1, total.max(1));
+    std::thread::scope(|s| {
+        let (report_tx, report_rx) = mpsc::channel::<FoldReport<T>>();
+        let helpers: Vec<mpsc::Sender<usize>> = (1..workers)
+            .map(|_| {
+                let (job_tx, job_rx) = mpsc::channel::<usize>();
+                let report_tx = report_tx.clone();
+                s.spawn(move || {
+                    for i in job_rx {
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| fold(i)));
+                        if report_tx.send((i, result)).is_err() {
+                            return;
+                        }
+                    }
+                });
+                job_tx
             })
-        };
-        for r in chunk {
-            out.push(r?);
+            .collect();
+        drop(report_tx);
+
+        let mut out = Vec::with_capacity(total);
+        let mut start = 0;
+        while start < total {
+            let end = (start + workers).min(total);
+            for (job, i) in helpers.iter().zip(start + 1..end) {
+                // INVARIANT: a helper runs until its job channel closes (`helpers` lives to the
+                // end of this closure) and catches a fold's panic, so its receiver is alive.
+                job.send(i)
+                    .expect("a fold helper runs until its job channel closes");
+            }
+            let mut chunk: Vec<Option<Result<T, TrainingError>>> =
+                (start..end).map(|_| None).collect();
+            chunk[0] = Some(fold(start));
+            for _ in start + 1..end {
+                // INVARIANT: every helper holds a report sender until its job channel closes,
+                // and each job sent above is answered exactly once.
+                let (i, report) = report_rx
+                    .recv()
+                    .expect("a fold helper answers every job it receives");
+                match report {
+                    Ok(result) => chunk[i - start] = Some(result),
+                    Err(payload) => panic::resume_unwind(payload),
+                }
+            }
+            for result in chunk {
+                // INVARIANT: the loop above filled one slot per fold of the chunk.
+                out.push(result.expect("every fold of the chunk reported")?);
+            }
+            progress(event(count_u32(end), count_u32(total)));
+            if cancel.load(Ordering::Relaxed) {
+                return Err(TrainingError::Cancelled);
+            }
+            start = end;
         }
-        progress(event(count_u32(end), count_u32(total)));
-        if cancel.load(Ordering::Relaxed) {
-            return Err(TrainingError::Cancelled);
-        }
-        start = end;
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// §1.10.5: pooled nearest-rank thresholds. `negative_llr` is `Some` in the Negatives regime.
@@ -1899,9 +1937,15 @@ mod tests {
             variant_sd: 0.5,
         };
         set.negatives = negatives(&mut rng, &units, STEREO, spec);
-        let started = std::time::Instant::now();
         let model = train_ok(&set);
-        let train_ms = started.elapsed().as_secs_f64() * 1e3;
+        // Training time per worker count (G = 80, V = 8, 30 negative clips of 8).
+        let mut train_ms = Vec::new();
+        for n in [1u8, 2, 8] {
+            let started = std::time::Instant::now();
+            let again = train_with(&set, &params(exactly(n))).expect("trains");
+            train_ms.push((n, started.elapsed().as_secs_f64() * 1e3));
+            assert_eq!(again, model, "{n} workers changed the model");
+        }
         let probes: Vec<Descriptor> = (0..1000)
             .map(|i| {
                 let z = noisy(&mut rng, &model.zone_means[i % 8], 1.0);
@@ -1924,8 +1968,13 @@ mod tests {
         let t = model.thresholds;
         println!(
             "M7 decide d=48 K=8: {per_us:.2} us per call over {calls} calls (budget 50 us), \
-             {accepted} accepted; train G=80 V=8 + 30 negative clips: {train_ms:.1} ms (2 workers)"
+             {accepted} accepted"
         );
+        for (n, ms) in train_ms {
+            println!(
+                "M7 train d=48 K=8 G=80 V=8 + 30 negative clips x 8: {ms:.1} ms ({n} workers)"
+            );
+        }
         println!(
             "M7 thresholds d=48 K=8: tau_in {:.2} tau_bg {:.2} lambda_w {:.3} lambda_bg {:.3} \
              regime {:?} clean {:?}",
