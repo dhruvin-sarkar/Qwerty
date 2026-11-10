@@ -444,7 +444,10 @@ impl DescriptorExtractor {
         // SPEC: §1.7.2 names no error for a window from another rate; it is a wiring error, so
         // it fails loudly here rather than producing a descriptor in the wrong units.
         assert_eq!(w.rate, self.rate, "analysis window rate != extractor rate");
-        let channels = self.layout.chosen().len();
+        let channels = match self.layout {
+            DescriptorLayout::Mono { .. } => 1,
+            DescriptorLayout::Stereo { .. } => 2,
+        };
         if w.span.len() != channels
             || w.chosen.len() != channels
             || w.noise.chosen.len() != channels
