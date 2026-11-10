@@ -635,9 +635,11 @@ impl EvaluationSession {
                     }
                 } else if let Some(n) = negatives.get(self.tallies.len()) {
                     let (class, start, end) = (n.class.clone(), n.start, n.end);
-                    let duration = Seconds::try_new(end.since(start).0 as f64 / 1e7)
-                        // INVARIANT: an i64 tick count divided by 10^7 is always finite.
-                        .expect("a tick span in seconds is finite");
+                    let duration = Seconds::try_new(
+                        end.since(start).0 as f64 / HostTime::TICKS_PER_SECOND as f64,
+                    )
+                    // INVARIANT: an i64 tick count divided by 10^7 is always finite.
+                    .expect("a tick span in seconds is finite");
                     self.start_negative(class, start, end, duration, out);
                 } else {
                     self.finish_run(out);
