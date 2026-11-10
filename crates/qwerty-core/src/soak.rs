@@ -608,8 +608,9 @@ impl Soak {
         let mut clips: Vec<(Item, Vec<f32>)> = Vec::new();
         for z in 0..self.zone_count {
             let clip = self.fixture.tap(z, &mut self.taps, TAP_JITTER);
-            // INVARIANT: zone_count ≤ 8 (CleanSignatures and the session plan agree on it).
-            let zone = ZoneIndex(u16::try_from(z).expect("a soak has at most 8 zones"));
+            // INVARIANT: `Soak::new` calibrated these zones, and `CalibrationSession::new` refuses
+            // a plan with more zones than a u16 counts.
+            let zone = ZoneIndex(u16::try_from(z).expect("the session accepted this zone count"));
             clips.push((Item::Tap { zone }, clip));
         }
         // SPEC: §1.20 names no stream for the sustained clips; they come from stream B, as the
