@@ -472,6 +472,18 @@ mod tests {
             assert!(layout.centres.windows(2).all(|c| c[0] < c[1]), "{hz}");
             let expected = (0.45 * f64::from(hz)).min(16_000.0);
             assert_eq!(BandLayout::f_top(r).get(), expected, "{hz}");
+            let bins: Vec<usize> = layout
+                .weights()
+                .iter()
+                .map(|(_, w)| w.iter().filter(|&&v| v > 0.0).count())
+                .collect();
+            println!(
+                "D4 fs={hz:>6} f_top={:>7.1} min_bins={} bins={bins:?} centre0={:.1} centre23={:.1}",
+                BandLayout::f_top(r).get(),
+                bins.iter().fold(usize::MAX, |m, &b| m.min(b)),
+                layout.centres[0].get(),
+                layout.centres[BAND_COUNT - 1].get()
+            );
         }
     }
 

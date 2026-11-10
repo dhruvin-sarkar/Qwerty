@@ -2474,6 +2474,64 @@ mod tests {
     }
 
     #[test]
+    fn t14_frozen_noise_reanalysis_matches_the_live_candidate() {
+        use crate::descriptor::DescriptorExtractor;
+        let events = [
+            (600.0, TapKind::Partials, 35.0),
+            (1300.0, TapKind::Click, 30.0),
+            (2000.0, TapKind::Thud, 40.0),
+        ];
+        for hz in [48_000u32, 44_100, 16_000] {
+            let fmt = format(hz, 1);
+            let (x, _) = scene(hz, 1, 0x7E14 + u64::from(hz), 2600.0, &events);
+            let mut det = Detector::new(fmt, &all_real(1), &P, DetectorMode::CalibrationClips)
+                .expect("detector");
+            let mut out = Vec::new();
+            push_all(&mut det, fmt, &x, 0, 480, &mut out);
+            let cands = candidates(&out);
+            assert_eq!(cands.len(), events.len(), "{hz}: {out:?}");
+            let mut extractor = DescriptorExtractor::new(rate(hz), DescriptorLayout::Mono { a: 0 });
+            for c in cands {
+                let live = extractor.extract(&c.analysis).expect("live descriptor");
+                let clip = c.clip.as_ref().expect("clip in CalibrationClips mode");
+                let hpf = highpass(hz, &clip.samples);
+                let reanalyze = |jitter: i32| -> Candidate {
+                    let mode = DetectorMode::FrozenNoise {
+                        noise: c.analysis.noise.clone(),
+                        anchor_jitter: jitter,
+                    };
+                    let mut det = Detector::new(fmt, &all_real(1), &P, mode).expect("detector");
+                    let mut out = Vec::new();
+                    push_all(&mut det, fmt, &clip.samples, 0, 480, &mut out);
+                    let got = candidates(&out);
+                    assert_eq!(got.len(), 1, "{hz} jitter {jitter}: {out:?}");
+                    got[0].clone()
+                };
+
+                let again = reanalyze(0);
+                assert_eq!(again.onset.0, clip.onset_offset as u64, "{hz}: t0 moved");
+                let d = extractor.extract(&again.analysis).expect("re-analysis");
+                let diff = d.max_abs_diff(&live);
+                assert!(diff <= 1e-3, "{hz}: max |Δ| = {diff}");
+                assert_eq!(again.analysis.pooled, anchored(hz, &hpf, clip.onset_offset));
+
+                // Jitter moves every anchored centre by exactly that many samples.
+                let j = samples(hz, 1.0) as i64;
+                for jitter in [j, -j] {
+                    let shifted = reanalyze(jitter as i32);
+                    let t0 = clip.onset_offset as i64 + jitter;
+                    assert_eq!(shifted.onset.0 as i64, t0, "{hz} jitter {jitter}");
+                    assert_eq!(
+                        shifted.analysis.pooled,
+                        anchored(hz, &hpf, t0 as usize),
+                        "{hz} jitter {jitter}: anchored frames"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn t15_live_tracker_agrees_with_estimate_noise() {
         let mut jobs = Vec::new();
         for hz in [48_000u32, 16_000] {
