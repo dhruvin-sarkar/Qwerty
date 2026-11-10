@@ -1442,3 +1442,1181 @@ fn worker_count(workers: &Workers) -> usize {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::BlockTime;
+    use crate::augment::AMBIENT_MIN_USABLE;
+    use crate::descriptor::{DescriptorExtractor, DescriptorLayout, MONO_DIMS};
+    use crate::desk::{DeskConfig, Distractor, ModalDesk, TapSpec};
+    use crate::detector::{Detector, DetectorMode, DetectorOutput};
+    use crate::rng::Rng64;
+    use crate::units::{ChannelCount, SampleRate};
+    use crate::veto::{InputEvent, InputKind, VetoDecision, VetoParams, VetoTimeline};
+    use std::num::NonZeroU8;
+    use uuid::Uuid;
+
+    const HZ: u32 = 48_000;
+    const BLOCK: usize = 480;
+    /// Zone taps peak about 29 dB below full scale, about 50 dB over the desk floor.
+    const TAP_FORCE: f64 = -30.0;
+
+    fn rate() -> SampleRate {
+        SampleRate::new(HZ).expect("rate")
+    }
+
+    fn stereo() -> AudioFormat {
+        AudioFormat {
+            rate: rate(),
+            channels: ChannelCount::new(2).expect("2 channels"),
+        }
+    }
+
+    fn frames(ms: f64) -> usize {
+        rate().samples_in(Milliseconds::new(ms))
+    }
+
+    fn plan(zones: usize, taps: u32, seed: u64) -> CalibrationPlan {
+        CalibrationPlan {
+            zone_ids: (0..zones)
+                .map(|z| ZoneId::from_uuid(Uuid::from_u128(0x5E55_0000 + z as u128)))
+                .collect(),
+            zone_labels: (0..zones).map(|z| format!("Zone {z}")).collect(),
+            taps_per_zone: taps,
+            format: stereo(),
+            seed,
+            audio_budget_bytes: DEFAULT_AUDIO_BUDGET_BYTES,
+            detector: DetectorParams::DEFAULT,
+            training: TrainingParams::DEFAULT,
+        }
+    }
+
+    /// One stored clip at 48 kHz stereo: [t0 − 150 ms, t0 + 60 ms) × 2 channels × 4 B.
+    fn clip_bytes() -> u64 {
+        ((frames(150.0) + frames(60.0)) * 2 * 4) as u64
+    }
+
+    fn ambient_bytes() -> u64 {
+        (frames(3000.0) * 2 * 4) as u64
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mics {
+        /// the desk's two mics
+        Stereo,
+        /// the desk's first mic on both channels
+        FakeStereo,
+    }
+
+    fn front_end(layout: &ChannelLayout) -> (Detector, DescriptorExtractor) {
+        let detector = Detector::new(
+            stereo(),
+            layout,
+            &DetectorParams::DEFAULT,
+            DetectorMode::CalibrationClips,
+        )
+        .expect("detector");
+        let extractor = DescriptorExtractor::new(rate(), DescriptorLayout::from_channels(layout));
+        (detector, extractor)
+    }
+
+    /// A stand-in for the calibration front end (§1.15, WP-B1): a desk streamed in timestamped
+    /// blocks through Detector(CalibrationClips) and the extractor, every veto `Clear`.
+    struct Rig {
+        desk: ModalDesk,
+        mics: Mics,
+        rng: Rng64,
+        detector: Detector,
+        extractor: DescriptorExtractor,
+        pos: u64,
+    }
+
+    impl Rig {
+        fn new(seed: u64, mics: Mics) -> Rig {
+            let mut config = DeskConfig::default_for(rate(), seed);
+            if mics == Mics::FakeStereo {
+                config.mics.truncate(1);
+            }
+            let (detector, extractor) = front_end(&ChannelLayout::all_real(stereo().channels));
+            let mut rig = Rig {
+                desk: ModalDesk::new(config).expect("desk"),
+                mics,
+                rng: Rng64::new(seed ^ 0x5E55),
+                detector,
+                extractor,
+                pos: 0,
+            };
+            rig.play(300.0, &[]);
+            rig
+        }
+
+        /// Reconfigures the front end for `layout`, as the engine does after accept_ambient.
+        fn set_layout(&mut self, layout: &ChannelLayout) {
+            (self.detector, self.extractor) = front_end(layout);
+            self.play(300.0, &[]);
+        }
+
+        fn interleave(&self, x: Vec<f32>) -> Vec<f32> {
+            match self.mics {
+                Mics::Stereo => x,
+                Mics::FakeStereo => x.iter().flat_map(|&v| [v, v]).collect(),
+            }
+        }
+
+        /// A tap at zone `zone` of 4, its force within ±2 dB of `force_db`, contact 0.8-1.5 ms.
+        fn tap(&mut self, zone: usize, force_db: f64) -> Vec<f32> {
+            let force = force_db + self.rng.range(-2.0, 2.0);
+            let contact = self.rng.range(0.8, 1.5);
+            self.tap_exact(zone, force, contact)
+        }
+
+        fn tap_exact(&mut self, zone: usize, force: f64, contact: f64) -> Vec<f32> {
+            let (x, y) = ModalDesk::zone_centres(4)[zone];
+            let spec = TapSpec {
+                x,
+                y,
+                force: Decibels::try_new(force).expect("finite"),
+                contact: Milliseconds::try_new(contact).expect("finite"),
+                position_jitter_m: 0.02,
+            };
+            let raw = self.desk.tap(&spec, 0);
+            self.interleave(raw)
+        }
+
+        fn distractor(&mut self, d: &Distractor) -> Vec<f32> {
+            let raw = self.desk.distractor(d, 0);
+            self.interleave(raw)
+        }
+
+        fn now(&self) -> HostTime {
+            time_of(self.pos)
+        }
+
+        /// Streams `len_ms` of the floor with each (at ms, interleaved sound) added. Returns the
+        /// first frame's index, the raw audio and the front end's inputs.
+        fn play(
+            &mut self,
+            len_ms: f64,
+            sounds: &[(f64, Vec<f32>)],
+        ) -> (SampleIndex, Vec<f32>, Vec<CalibrationInput>) {
+            let floor = self.desk.floor(frames(len_ms));
+            let mut x = self.interleave(floor);
+            for (at, sound) in sounds {
+                for (v, s) in x[frames(*at) * 2..].iter_mut().zip(sound) {
+                    *v += s;
+                }
+            }
+            let start = SampleIndex(self.pos);
+            let mut outputs = Vec::new();
+            for chunk in x.chunks(BLOCK * 2) {
+                let time = BlockTime::Timestamped {
+                    host_time: time_of(self.pos),
+                };
+                let block = AudioBlock::new(stereo(), SampleIndex(self.pos), chunk, time, false)
+                    .expect("whole frames");
+                self.detector.push(&block, &mut outputs).expect("format");
+                self.pos += (chunk.len() / 2) as u64;
+            }
+            let inputs = outputs.into_iter().map(|o| self.input(o)).collect();
+            (start, x, inputs)
+        }
+
+        fn input(&mut self, output: DetectorOutput) -> CalibrationInput {
+            match output {
+                DetectorOutput::Candidate(candidate) => {
+                    match self.extractor.extract(&candidate.analysis) {
+                        Ok(live) => CalibrationInput::Candidate {
+                            candidate,
+                            live,
+                            veto: VetoVerdict::Clear,
+                        },
+                        Err(error) => CalibrationInput::Invalid { candidate, error },
+                    }
+                }
+                DetectorOutput::Rejected(rejected) => CalibrationInput::Rejected { rejected },
+                DetectorOutput::InputFault(fault) => CalibrationInput::InputFault { fault },
+            }
+        }
+    }
+
+    /// The rig's clock: frame s at s / fs seconds.
+    fn time_of(s: u64) -> HostTime {
+        HostTime((i128::from(s) * i128::from(HostTime::TICKS_PER_SECOND) / i128::from(HZ)) as i64)
+    }
+
+    fn feed(s: &mut CalibrationSession, inputs: Vec<CalibrationInput>) -> Vec<TapFeedback> {
+        inputs
+            .into_iter()
+            .map(|i| s.on_input(i).expect("on_input"))
+            .collect()
+    }
+
+    fn count(feedback: &[TapFeedback], pred: fn(&TapFeedback) -> bool) -> usize {
+        feedback.iter().filter(|f| pred(f)).count()
+    }
+
+    fn is_accepted(f: &TapFeedback) -> bool {
+        matches!(f, TapFeedback::Accepted { .. })
+    }
+
+    fn is_candidate(i: &CalibrationInput) -> bool {
+        matches!(i, CalibrationInput::Candidate { .. })
+    }
+
+    /// The Ambient step: start it, stream 3 s of floor plus `sounds` through the front end,
+    /// feed its inputs, then push the same audio as the ambient recording.
+    fn record_ambient(
+        rig: &mut Rig,
+        s: &mut CalibrationSession,
+        sounds: &[(f64, Vec<f32>)],
+    ) -> Vec<TapFeedback> {
+        s.start_ambient().expect("start_ambient");
+        let (start, x, inputs) = rig.play(3000.0, sounds);
+        let feedback = feed(s, inputs);
+        for (i, chunk) in x.chunks(BLOCK * 2).enumerate() {
+            let at = SampleIndex(start.0 + (i * BLOCK) as u64);
+            let block =
+                AudioBlock::new(stereo(), at, chunk, BlockTime::Untimed, false).expect("block");
+            s.push_ambient(&block).expect("push_ambient");
+        }
+        feedback
+    }
+
+    /// Accepts the ambient and reconfigures the rig for its layout.
+    fn accept(rig: &mut Rig, s: &mut CalibrationSession) -> ChannelLayout {
+        let layout = s.accept_ambient().expect("accept_ambient");
+        rig.set_layout(&layout);
+        layout
+    }
+
+    /// `n` zone taps 300 ms apart.
+    fn tap_zone(
+        rig: &mut Rig,
+        s: &mut CalibrationSession,
+        zone: usize,
+        n: usize,
+    ) -> Vec<TapFeedback> {
+        let mut feedback = Vec::new();
+        for _ in 0..n {
+            let tap = rig.tap(zone, TAP_FORCE);
+            let (_, _, inputs) = rig.play(300.0, &[(50.0, tap)]);
+            feedback.extend(feed(s, inputs));
+        }
+        feedback
+    }
+
+    /// Fills every zone of the plan in order, advancing after each (into Negatives at the end).
+    fn fill_zones(rig: &mut Rig, s: &mut CalibrationSession) {
+        let (zones, target) = (s.plan.zone_ids.len(), s.plan.taps_per_zone as usize);
+        for zone in 0..zones {
+            let feedback = tap_zone(rig, s, zone, target);
+            assert_eq!(
+                count(&feedback, is_accepted),
+                target,
+                "zone {zone}: {feedback:?}"
+            );
+            s.advance(rig.now()).expect("advance");
+        }
+    }
+
+    const NEGATIVE_SOUNDS: [Distractor; 4] = [
+        Distractor::Knock {
+            x: 0.30,
+            y: 0.40,
+            count: 1,
+        },
+        Distractor::ObjectSetDown { x: 0.80, y: 0.45 },
+        Distractor::Knock {
+            x: 0.70,
+            y: 0.20,
+            count: 1,
+        },
+        Distractor::ObjectSetDown { x: 0.40, y: 0.15 },
+    ];
+
+    /// Plays negative sounds until the step leaves Negatives or `max` sounds were played; the
+    /// veto of every candidate is `veto`. Returns the feedbacks.
+    fn play_negatives(
+        rig: &mut Rig,
+        s: &mut CalibrationSession,
+        max: usize,
+        veto: VetoVerdict,
+    ) -> Vec<TapFeedback> {
+        let mut feedback = Vec::new();
+        for i in 0..max {
+            if s.step_kind() != StepKind::Negatives {
+                break;
+            }
+            let sound = rig.distractor(&NEGATIVE_SOUNDS[i % NEGATIVE_SOUNDS.len()]);
+            let (_, _, inputs) = rig.play(700.0, &[(50.0, sound)]);
+            for input in inputs {
+                feedback.push(s.on_input(with_veto(input, veto)).expect("on_input"));
+            }
+        }
+        feedback
+    }
+
+    /// The input with `veto` as a candidate's verdict.
+    fn with_veto(input: CalibrationInput, veto: VetoVerdict) -> CalibrationInput {
+        match input {
+            CalibrationInput::Candidate {
+                candidate, live, ..
+            } => CalibrationInput::Candidate {
+                candidate,
+                live,
+                veto,
+            },
+            input @ (CalibrationInput::Invalid { .. }
+            | CalibrationInput::Rejected { .. }
+            | CalibrationInput::InputFault { .. }) => input,
+        }
+    }
+
+    /// A session at ReadyToBuild: a clean ambient (plus `ambient_sounds`), every zone full and
+    /// up to `negatives` negative sounds.
+    fn ready_to_build(
+        rig: &mut Rig,
+        plan: CalibrationPlan,
+        ambient_sounds: &[(f64, Vec<f32>)],
+        negatives: usize,
+    ) -> CalibrationSession {
+        let mut s = CalibrationSession::new(plan).expect("session");
+        record_ambient(rig, &mut s, ambient_sounds);
+        accept(rig, &mut s);
+        fill_zones(rig, &mut s);
+        play_negatives(rig, &mut s, negatives, VetoVerdict::Clear);
+        if s.step_kind() == StepKind::Negatives {
+            s.finish_negatives().expect("finish_negatives");
+        }
+        assert_eq!(s.step_kind(), StepKind::ReadyToBuild);
+        s
+    }
+
+    fn build(s: &mut CalibrationSession) -> (TrainedModel, Vec<BuildProgress>) {
+        let job = s.take_build_job().expect("take_build_job");
+        let mut progress = Vec::new();
+        let model = job
+            .run(&AtomicBool::new(false), &mut |p| progress.push(p))
+            .expect("the model trains");
+        (model, progress)
+    }
+
+    /// The largest `NegativeRecorded` count in `feedback` (0 if none).
+    fn collected(feedback: &[TapFeedback]) -> u32 {
+        feedback.iter().fold(0, |m, f| {
+            if let TapFeedback::NegativeRecorded { count } = f {
+                m.max(*count)
+            } else {
+                m
+            }
+        })
+    }
+
+    /// A 220 Hz harmonic tone (59 partials at 1/k) switched on abruptly and held for 400 ms.
+    fn tone_onset() -> Vec<f32> {
+        (0..frames(400.0))
+            .flat_map(|i| {
+                let t = i as f64 / f64::from(HZ);
+                let v: f64 = (1..60)
+                    .map(|k| (std::f64::consts::TAU * 220.0 * k as f64 * t).sin() / k as f64)
+                    .sum();
+                let v = (0.05 * v) as f32;
+                [v, v]
+            })
+            .collect()
+    }
+
+    fn input_veto(offset_ms: f64) -> VetoVerdict {
+        VetoVerdict::Vetoed {
+            reason: VetoReason::Input {
+                kind: InputKind::KeyDown,
+                offset: Milliseconds::new(offset_ms),
+            },
+        }
+    }
+
+    #[test]
+    fn s1_full_flow_counts_memory_and_training() {
+        let p = plan(4, 10, 0x51);
+        let mut rig = Rig::new(0x5101, Mics::Stereo);
+        let mut s = CalibrationSession::new(p.clone()).expect("session");
+        assert_eq!(s.step_kind(), StepKind::Ready);
+
+        // Ready: candidates give Ignored and change no count.
+        let tap = rig.tap(0, TAP_FORCE);
+        let (_, _, inputs) = rig.play(400.0, &[(50.0, tap)]);
+        assert!(inputs.iter().any(is_candidate));
+        let before = s.view();
+        assert!(feed(&mut s, inputs)
+            .iter()
+            .all(|f| *f == TapFeedback::Ignored));
+        let after = s.view();
+        assert_eq!(after.step, CalibrationStep::Ready);
+        assert_eq!(after.zones, before.zones);
+        assert_eq!(after.memory_bytes, 0);
+        assert!(after
+            .zones
+            .iter()
+            .all(|z| z.accepted == 0 && z.target == 10));
+
+        // Ambient, with one knock: an EnvironmentOnset negative.
+        let knock = rig.distractor(&NEGATIVE_SOUNDS[0]);
+        let feedback = record_ambient(&mut rig, &mut s, &[(1500.0, knock)]);
+        let disturbances = count(&feedback, |f| *f == TapFeedback::AmbientDisturbance);
+        assert!(disturbances >= 1, "{feedback:?}");
+        let v = s.view();
+        let CalibrationStep::AmbientReview {
+            layout,
+            disturbances: d,
+            mixing,
+            ..
+        } = &v.step
+        else {
+            panic!("not in AmbientReview: {:?}", v.step);
+        };
+        assert_eq!(*d as usize, disturbances);
+        assert_eq!(*mixing, AmbientMixing::Usable);
+        assert_eq!(layout.real(), &[0, 1]);
+        assert_eq!(v.layout.as_ref(), Some(layout));
+        let env = disturbances as u64;
+        assert_eq!(v.memory_bytes, ambient_bytes() + env * clip_bytes());
+        accept(&mut rig, &mut s);
+
+        // Zones: exact counts after every tap.
+        for zone in 0..4u16 {
+            for k in 1..=10 {
+                let tap = rig.tap(usize::from(zone), TAP_FORCE);
+                let (_, _, inputs) = rig.play(300.0, &[(50.0, tap)]);
+                let fb = feed(&mut s, inputs);
+                assert_eq!(count(&fb, is_accepted), 1, "zone {zone} tap {k}: {fb:?}");
+                let v = s.view();
+                let step = CalibrationStep::Zone {
+                    index: ZoneIndex(zone),
+                    accepted: k,
+                    target: 10,
+                };
+                assert_eq!(v.step, step);
+                for (z, progress) in v.zones.iter().enumerate() {
+                    let want = match (z as u16).cmp(&zone) {
+                        std::cmp::Ordering::Less => 10,
+                        std::cmp::Ordering::Equal => k,
+                        std::cmp::Ordering::Greater => 0,
+                    };
+                    assert_eq!(progress.accepted, want, "zone {z}");
+                    assert_eq!(progress.zone, p.zone_ids[z]);
+                }
+            }
+            s.advance(rig.now()).expect("advance");
+        }
+        let ends_at = HostTime(rig.now().0 + 300_000_000);
+        let step = CalibrationStep::Negatives {
+            collected: 0,
+            target: NEGATIVES_TARGET,
+            ends_at,
+        };
+        assert_eq!(s.view().step, step);
+        assert_eq!(s.negatives_deadline(), Some(ends_at));
+        let feedback = play_negatives(&mut rig, &mut s, 60, VetoVerdict::Clear);
+        let negatives = collected(&feedback);
+        assert!(negatives > 0, "{feedback:?}");
+        if s.step_kind() == StepKind::Negatives {
+            s.finish_negatives().expect("finish_negatives");
+        }
+        assert_eq!(s.step_kind(), StepKind::ReadyToBuild);
+        let clips = 40 + env + u64::from(negatives);
+        assert_eq!(
+            s.view().memory_bytes,
+            clips * clip_bytes() + ambient_bytes()
+        );
+
+        // Build.
+        let (model, progress) = build(&mut s);
+        let total = clips as u32;
+        assert_eq!(
+            progress.first(),
+            Some(&BuildProgress::Augmenting { done: 0, total })
+        );
+        assert!(progress.contains(&BuildProgress::Augmenting { done: total, total }));
+        assert!(matches!(
+            progress.last(),
+            Some(BuildProgress::Training { .. })
+        ));
+        assert_eq!(model.zone_ids, p.zone_ids);
+        assert_eq!(model.layout, DescriptorLayout::Stereo { a: 0, c: 1 });
+        assert_eq!(model.summary.seed, p.seed);
+        assert_eq!(model.summary.zones.iter().map(|z| z.taps).sum::<u32>(), 40);
+        let kept: u32 = model.summary.negatives.iter().map(|n| n.clips).sum();
+        assert!(kept + model.summary.variants_dropped >= negatives);
+        println!(
+            "S1: {clips} clips, {} variants dropped, negatives {:?}, quality {:?}",
+            model.summary.variants_dropped, model.summary.negatives, model.summary.quality
+        );
+        let last = progress.last().cloned().expect("progress");
+        s.on_build_progress(last.clone());
+        assert_eq!(s.view().step, CalibrationStep::Building { progress: last });
+        s.finish_build(Ok(model.clone())).expect("finish_build");
+        let summary = model.summary.clone();
+        assert_eq!(s.view().step, CalibrationStep::Review { summary });
+        let result = s.commit().expect("commit");
+        assert_eq!(result.model, model);
+        assert_eq!(result.layout.real(), &[0, 1]);
+    }
+
+    #[test]
+    fn s2_feedback_mapping() {
+        let mut rig = Rig::new(0x5202, Mics::Stereo);
+        let mut s = CalibrationSession::new(plan(2, 5, 0x52)).expect("session");
+        record_ambient(&mut rig, &mut s, &[]);
+        accept(&mut rig, &mut s);
+
+        let weak = rig.tap_exact(0, -62.0, 1.0);
+        let (_, _, inputs) = rig.play(300.0, &[(50.0, weak)]);
+        let fb = feed(&mut s, inputs);
+        assert!(
+            fb.iter().any(|f| matches!(f, TapFeedback::TooWeak { .. })),
+            "{fb:?}"
+        );
+
+        let mut loud = rig.tap_exact(0, TAP_FORCE, 1.0);
+        let peak = loud.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        loud.iter_mut().for_each(|v| *v /= peak);
+        let (_, _, inputs) = rig.play(300.0, &[(50.0, loud)]);
+        let fb = feed(&mut s, inputs);
+        assert!(fb.contains(&TapFeedback::Clipped), "{fb:?}");
+
+        let (_, _, inputs) = rig.play(600.0, &[(50.0, tone_onset())]);
+        let fb = feed(&mut s, inputs);
+        assert!(fb.contains(&TapFeedback::NotDecaying), "{fb:?}");
+        assert_eq!(s.view().zones[0].accepted, 0);
+
+        // The tone's end re-warms the noise tracker (§1.6.3 step 11): let it settle first.
+        let (_, _, inputs) = rig.play(1000.0, &[]);
+        feed(&mut s, inputs);
+        assert_eq!(
+            rig.detector.state(),
+            crate::detector::DetectorState::Running
+        );
+
+        // An input event 10 ms before t0, through the veto timeline.
+        let tap = rig.tap(0, TAP_FORCE);
+        let (_, _, inputs) = rig.play(300.0, &[(50.0, tap)]);
+        let mut veto = VetoTimeline::new(VetoParams::DEFAULT);
+        let mut vetoed = 0;
+        for input in inputs {
+            let CalibrationInput::Candidate { candidate, .. } = &input else {
+                s.on_input(input).expect("on_input");
+                continue;
+            };
+            let t0 = candidate.onset_time.expect("timed blocks");
+            let ten = HostDuration::from_ms(Milliseconds::new(10.0));
+            veto.push_input(InputEvent {
+                time: HostTime(t0.0 - ten.0),
+                kind: InputKind::KeyDown,
+            });
+            let now = HostTime(t0.0 + HostTime::TICKS_PER_SECOND);
+            let VetoDecision::Final { verdict } = veto.decide(t0, now) else {
+                panic!("the decision is final a second later");
+            };
+            assert!(matches!(
+                verdict,
+                VetoVerdict::Vetoed {
+                    reason: VetoReason::Input { .. }
+                }
+            ));
+            let fb = s.on_input(with_veto(input, verdict)).expect("on_input");
+            assert_eq!(fb, TapFeedback::InputActivity);
+            vetoed += 1;
+        }
+        assert_eq!(vetoed, 1);
+        assert_eq!(s.view().zones[0].accepted, 0);
+
+        // It is counted as an OsVetoed negative in the summary.
+        fill_zones(&mut rig, &mut s);
+        s.finish_negatives().expect("finish_negatives");
+        let (model, _) = build(&mut s);
+        let os = model
+            .summary
+            .negatives
+            .iter()
+            .find(|n| n.source == NegativeSource::OsVetoed)
+            .map(|n| n.clips);
+        assert_eq!(os, Some(1), "{:?}", model.summary.negatives);
+    }
+
+    #[test]
+    fn s3_undo_restart_and_redo() {
+        let mut rig = Rig::new(0x5303, Mics::Stereo);
+        let mut s = CalibrationSession::new(plan(3, 5, 0x53)).expect("session");
+        assert_eq!(
+            s.undo_last(),
+            Err(SessionError::NotInStep {
+                expected: StepKind::Zone,
+                actual: StepKind::Ready
+            })
+        );
+        record_ambient(&mut rig, &mut s, &[]);
+        accept(&mut rig, &mut s);
+        let accepted = |s: &CalibrationSession| -> Vec<u32> {
+            s.view().zones.iter().map(|z| z.accepted).collect()
+        };
+        let zone = |index: u16, accepted: u32| CalibrationStep::Zone {
+            index: ZoneIndex(index),
+            accepted,
+            target: 5,
+        };
+
+        // v1: accept two, undo one.
+        tap_zone(&mut rig, &mut s, 0, 2);
+        assert_eq!(accepted(&s), [2, 0, 0]);
+        s.undo_last().expect("undo");
+        assert_eq!(s.view().step, zone(0, 1));
+        // restart clears the zone; with no tap anywhere, undo has nothing to do.
+        s.restart_zone().expect("restart");
+        assert_eq!(s.view().step, zone(0, 0));
+        assert_eq!(s.undo_last(), Err(SessionError::NothingToUndo));
+        assert_eq!(
+            s.advance(rig.now()),
+            Err(SessionError::ZoneIncomplete {
+                zone: ZoneIndex(0),
+                accepted: 0,
+                need: 5
+            })
+        );
+
+        // v1: fill to the target; a further tap is not stored.
+        let fb = tap_zone(&mut rig, &mut s, 0, 6);
+        assert_eq!(count(&fb, is_accepted), 5);
+        assert!(fb.contains(&TapFeedback::ZoneFull { zone: ZoneIndex(0) }));
+        assert_eq!(accepted(&s), [5, 0, 0]);
+        s.advance(rig.now()).expect("advance");
+        tap_zone(&mut rig, &mut s, 1, 5);
+        s.advance(rig.now()).expect("advance");
+        assert_eq!(s.view().step, zone(2, 0));
+
+        // Cross-zone: zone 1 full and zone 2 empty.
+        s.undo_last().expect("undo");
+        assert_eq!(s.view().step, zone(1, 4));
+        s.undo_last().expect("undo");
+        assert_eq!(s.view().step, zone(1, 3));
+        assert_eq!(accepted(&s), [5, 3, 0]);
+        tap_zone(&mut rig, &mut s, 1, 2);
+        s.advance(rig.now()).expect("advance");
+        tap_zone(&mut rig, &mut s, 2, 5);
+        s.advance(rig.now()).expect("advance");
+        assert_eq!(s.step_kind(), StepKind::Negatives);
+        // From Negatives with nothing collected: back into the last zone.
+        s.undo_last().expect("undo");
+        assert_eq!(s.view().step, zone(2, 4));
+        tap_zone(&mut rig, &mut s, 2, 1);
+        s.finish_negatives().expect("skip negatives");
+        assert_eq!(s.step_kind(), StepKind::ReadyToBuild);
+        assert_eq!(
+            s.restart_zone(),
+            Err(SessionError::NotInStep {
+                expected: StepKind::Zone,
+                actual: StepKind::ReadyToBuild
+            })
+        );
+
+        // Redo: clears that zone only and returns to ReadyToBuild when it is full again.
+        s.redo_zone(ZoneIndex(1)).expect("redo");
+        assert_eq!(s.view().step, zone(1, 0));
+        assert_eq!(accepted(&s), [5, 0, 5]);
+        assert_eq!(s.undo_last(), Err(SessionError::NothingToUndo));
+        tap_zone(&mut rig, &mut s, 1, 5);
+        s.advance(rig.now()).expect("advance");
+        assert_eq!(s.step_kind(), StepKind::ReadyToBuild);
+        assert_eq!(accepted(&s), [5, 5, 5]);
+        assert_eq!(
+            s.redo_zone(ZoneIndex(3)),
+            Err(SessionError::ZoneIncomplete {
+                zone: ZoneIndex(3),
+                accepted: 0,
+                need: 5
+            })
+        );
+    }
+
+    #[test]
+    fn s4_audio_budget() {
+        // The ambient alone (1.15 MB at 48 kHz stereo) exceeds 1 MB.
+        let mut rig = Rig::new(0x5404, Mics::Stereo);
+        let mut s = CalibrationSession::new(CalibrationPlan {
+            audio_budget_bytes: 1 << 20,
+            ..plan(2, 5, 0x54)
+        })
+        .expect("session");
+        s.start_ambient().expect("start");
+        let (start, x, _) = rig.play(3000.0, &[]);
+        let mut failed = None;
+        for (i, chunk) in x.chunks(BLOCK * 2).enumerate() {
+            let at = SampleIndex(start.0 + (i * BLOCK) as u64);
+            let block =
+                AudioBlock::new(stereo(), at, chunk, BlockTime::Untimed, false).expect("block");
+            if let Err(e) = s.push_ambient(&block) {
+                failed = Some(e);
+                break;
+            }
+        }
+        let Some(SessionError::AudioBudgetExceeded { bytes, budget }) = failed else {
+            panic!("expected AudioBudgetExceeded, got {failed:?}");
+        };
+        assert_eq!(budget, 1 << 20);
+        assert!(bytes > budget);
+        assert_eq!(
+            s.view().step,
+            CalibrationStep::Failed {
+                error: SessionError::AudioBudgetExceeded { bytes, budget }
+            }
+        );
+
+        // Clips count too: room for the ambient and two and a half clips.
+        let budget = ambient_bytes() + 5 * clip_bytes() / 2;
+        let mut s = CalibrationSession::new(CalibrationPlan {
+            audio_budget_bytes: budget,
+            ..plan(2, 5, 0x54)
+        })
+        .expect("session");
+        record_ambient(&mut rig, &mut s, &[]);
+        accept(&mut rig, &mut s);
+        tap_zone(&mut rig, &mut s, 0, 2);
+        let tap = rig.tap(0, TAP_FORCE);
+        let (_, _, inputs) = rig.play(300.0, &[(50.0, tap)]);
+        let results: Vec<_> = inputs.into_iter().map(|i| s.on_input(i)).collect();
+        let error = SessionError::AudioBudgetExceeded {
+            bytes: ambient_bytes() + 3 * clip_bytes(),
+            budget,
+        };
+        assert!(results.contains(&Err(error.clone())), "{results:?}");
+        assert_eq!(s.view().step, CalibrationStep::Failed { error });
+
+        // R11 (p35 §5.2): memory at 192 kHz × 8 channels, 8 zones × 10 taps and 24 negatives.
+        memory_at_192k_8ch();
+    }
+
+    /// Feeds one real 192 kHz × 8 ch candidate, re-timed 200 ms apart, through a full session
+    /// and prints the memory against the default budget.
+    fn memory_at_192k_8ch() {
+        use crate::detector::testkit::{push_all, scene, TapKind};
+        let (hz, ch) = (192_000u32, 8u16);
+        let r = SampleRate::new(hz).expect("rate");
+        let fmt = AudioFormat {
+            rate: r,
+            channels: ChannelCount::new(ch).expect("8 channels"),
+        };
+        let mut s = CalibrationSession::new(CalibrationPlan {
+            format: fmt,
+            ..plan(8, 10, 0x5480)
+        })
+        .expect("session");
+        s.start_ambient().expect("start");
+        let ambient_ms = 3000.0;
+        let (noise, _) = scene(hz, ch, 0x5481, ambient_ms, &[]);
+        let block =
+            AudioBlock::new(fmt, SampleIndex(0), &noise, BlockTime::Untimed, false).expect("block");
+        s.push_ambient(&block).expect("push_ambient");
+        let layout = s.accept_ambient().expect("accept");
+        let (x, _) = scene(hz, ch, 0x5482, 1500.0, &[(1000.0, TapKind::Partials, 40.0)]);
+        let mut det = Detector::new(
+            fmt,
+            &layout,
+            &DetectorParams::DEFAULT,
+            DetectorMode::CalibrationClips,
+        )
+        .expect("detector");
+        let mut out = Vec::new();
+        push_all(&mut det, fmt, &x, 0, 4096, &mut out);
+        let mut extractor =
+            DescriptorExtractor::new(fmt.rate, DescriptorLayout::from_channels(&layout));
+        let template = out
+            .into_iter()
+            .find_map(|o| match o {
+                DetectorOutput::Candidate(c) => Some(c),
+                DetectorOutput::Rejected(_) | DetectorOutput::InputFault(_) => None,
+            })
+            .expect("a candidate");
+        let live = extractor.extract(&template.analysis).expect("descriptor");
+        let mut next = 0u64;
+        let mut feed_copy = |s: &mut CalibrationSession| {
+            let mut candidate = template.clone();
+            next += u64::from(hz) / 5;
+            candidate.onset = SampleIndex(next);
+            s.on_input(CalibrationInput::Candidate {
+                candidate,
+                live,
+                veto: VetoVerdict::Clear,
+            })
+            .expect("on_input")
+        };
+        for _ in 0..8 {
+            for _ in 0..10 {
+                assert!(is_accepted(&feed_copy(&mut s)));
+            }
+            s.advance(HostTime(0)).expect("advance");
+        }
+        while s.step_kind() == StepKind::Negatives {
+            feed_copy(&mut s);
+        }
+        let clip_frames =
+            r.samples_in(Milliseconds::new(150.0)) + r.samples_in(Milliseconds::new(60.0));
+        let clip = u64::from(ch) * clip_frames as u64 * 4;
+        let ambient = u64::from(hz) * 3 * u64::from(ch) * 4;
+        let memory = s.view().memory_bytes;
+        assert_eq!(memory, 104 * clip + ambient);
+        assert!(memory <= DEFAULT_AUDIO_BUDGET_BYTES);
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+        println!(
+            "S4/R11 192 kHz x 8 ch: clip {:.2} MiB, ambient {:.2} MiB; 8 x 10 taps + 24 negatives = {:.1} MiB of {:.0} MiB",
+            mib(clip),
+            mib(ambient),
+            mib(memory),
+            mib(DEFAULT_AUDIO_BUDGET_BYTES)
+        );
+        for (channels, taps) in [(2u64, 10u64), (2, 20), (8, 10), (8, 20)] {
+            let clip = channels * clip_frames as u64 * 4;
+            let total = (8 * taps + 24) * clip + u64::from(hz) * 3 * channels * 4;
+            println!(
+                "S4/R11 192 kHz x {channels} ch, 8 x {taps} taps + 24 negatives: {:.1} MiB ({})",
+                mib(total),
+                if total <= DEFAULT_AUDIO_BUDGET_BYTES {
+                    "within budget"
+                } else {
+                    "OVER budget"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn s5_fake_stereo_is_mono_throughout() {
+        let mut rig = Rig::new(0x5505, Mics::FakeStereo);
+        let mut s = CalibrationSession::new(plan(2, 5, 0x55)).expect("session");
+        let knock = rig.distractor(&NEGATIVE_SOUNDS[2]);
+        let feedback = record_ambient(&mut rig, &mut s, &[(1200.0, knock)]);
+        assert!(
+            feedback.contains(&TapFeedback::AmbientDisturbance),
+            "{feedback:?}"
+        );
+        let layout = accept(&mut rig, &mut s);
+        assert_eq!(layout.real(), &[0]);
+        assert_eq!(
+            DescriptorLayout::from_channels(&layout),
+            DescriptorLayout::Mono { a: 0 }
+        );
+        for zone in 0..2 {
+            for _ in 0..5 {
+                let tap = rig.tap(zone, TAP_FORCE);
+                let (_, _, inputs) = rig.play(300.0, &[(50.0, tap)]);
+                for input in &inputs {
+                    if let CalibrationInput::Candidate { live, .. } = input {
+                        assert_eq!(live.layout.dims(), MONO_DIMS);
+                    }
+                }
+                assert_eq!(count(&feed(&mut s, inputs), is_accepted), 1);
+            }
+            s.advance(rig.now()).expect("advance");
+        }
+        play_negatives(&mut rig, &mut s, 6, VetoVerdict::Clear);
+        s.finish_negatives().expect("finish_negatives");
+        let job = s.take_build_job().expect("job");
+        // The EnvironmentOnset clip was captured as stereo; its re-analysis is mono.
+        let mut augmenter =
+            Augmenter::new(job.format, &job.layout, &job.detector).expect("augmenter");
+        let env = job.taps.len()
+            + job
+                .negatives
+                .iter()
+                .position(|n| n.0 == NegativeSource::EnvironmentOnset)
+                .expect("an EnvironmentOnset negative");
+        let item = job.augment_item(&mut augmenter, env).expect("augment");
+        assert!(!item.variants.is_empty());
+        assert!(item.variants.iter().all(|d| d.layout.dims() == MONO_DIMS));
+        let model = job
+            .run(&AtomicBool::new(false), &mut |_| {})
+            .expect("the model trains");
+        assert_eq!(model.layout, DescriptorLayout::Mono { a: 0 });
+        assert_eq!(model.standardization.offset.len(), MONO_DIMS);
+        assert!(model.zone_means.iter().all(|m| m.len() == MONO_DIMS));
+    }
+
+    #[test]
+    fn s6_environment_at_the_thresholds() {
+        let quiet_floor = Decibels::new(-60.0);
+        for (rate, want) in [
+            (ROOM_TOO_NOISY_RATE + 0.01, EnvironmentQuality::TooNoisy),
+            (ROOM_TOO_NOISY_RATE - 0.01, EnvironmentQuality::Moderate),
+            (ROOM_MODERATE_RATE + 0.01, EnvironmentQuality::Moderate),
+            (ROOM_MODERATE_RATE - 0.01, EnvironmentQuality::Quiet),
+            (ROOM_TOO_NOISY_RATE, EnvironmentQuality::Moderate),
+            (ROOM_MODERATE_RATE, EnvironmentQuality::Quiet),
+        ] {
+            assert_eq!(classify_environment(rate, quiet_floor), want, "rate {rate}");
+        }
+        let floor = |db: f64| Decibels::new(db);
+        for (db, want) in [
+            (
+                ROOM_TOO_NOISY_FLOOR.get() + 0.5,
+                EnvironmentQuality::TooNoisy,
+            ),
+            (
+                ROOM_TOO_NOISY_FLOOR.get() - 0.5,
+                EnvironmentQuality::Moderate,
+            ),
+            (
+                ROOM_MODERATE_FLOOR.get() + 0.5,
+                EnvironmentQuality::Moderate,
+            ),
+            (ROOM_MODERATE_FLOOR.get() - 0.5, EnvironmentQuality::Quiet),
+        ] {
+            assert_eq!(classify_environment(0.0, floor(db)), want, "floor {db}");
+        }
+        // Either cause alone raises the verdict.
+        assert_eq!(
+            classify_environment(ROOM_TOO_NOISY_RATE + 0.01, floor(-90.0)),
+            EnvironmentQuality::TooNoisy
+        );
+        assert_eq!(
+            classify_environment(0.0, floor(ROOM_TOO_NOISY_FLOOR.get() + 0.5)),
+            EnvironmentQuality::TooNoisy
+        );
+    }
+
+    #[test]
+    fn s7_same_seed_and_inputs_give_a_bit_identical_model() {
+        let run = |workers: Workers| {
+            let mut rig = Rig::new(0x5707, Mics::Stereo);
+            let p = CalibrationPlan {
+                training: TrainingParams {
+                    workers,
+                    ..TrainingParams::DEFAULT
+                },
+                ..plan(3, 6, 0x57)
+            };
+            let knock = rig.distractor(&NEGATIVE_SOUNDS[1]);
+            let mut s = ready_to_build(&mut rig, p, &[(1000.0, knock)], 8);
+            build(&mut s).0
+        };
+        let a = run(Workers::Auto);
+        let b = run(Workers::Exactly {
+            n: NonZeroU8::new(1).expect("1"),
+        });
+        assert_eq!(a, b);
+        let json = |m: &TrainedModel| serde_json::to_string(m).expect("serialize");
+        assert_eq!(json(&a), json(&b));
+    }
+
+    #[test]
+    fn s8_a_failed_save_keeps_the_review() {
+        let mut rig = Rig::new(0x5808, Mics::Stereo);
+        let mut s = ready_to_build(&mut rig, plan(2, 5, 0x58), &[], 4);
+        let (model, _) = build(&mut s);
+        s.finish_build(Ok(model)).expect("finish_build");
+        let mut attempts = 0;
+        let mut save = |r: &CalibrationResult| -> Result<(), String> {
+            attempts += 1;
+            assert!(r.model.validate().is_ok());
+            if attempts == 1 {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        };
+        let first = s.result().expect("result").clone();
+        assert!(save(&first).is_err());
+        assert_eq!(s.step_kind(), StepKind::Review);
+        assert_eq!(s.result().expect("result after a failed save"), &first);
+        assert!(s.view().memory_bytes > 0, "the audio is kept for a retry");
+        save(s.result().expect("result")).expect("the retry saves");
+        let committed = s.commit().expect("commit");
+        assert_eq!(committed, first);
+    }
+
+    #[test]
+    fn s9_typing_cap_in_negatives() {
+        let mut rig = Rig::new(0x5909, Mics::Stereo);
+        let mut s = CalibrationSession::new(plan(2, 5, 0x59)).expect("session");
+        record_ambient(&mut rig, &mut s, &[]);
+        accept(&mut rig, &mut s);
+        fill_zones(&mut rig, &mut s);
+        assert_eq!(s.step_kind(), StepKind::Negatives);
+        let mut feedback = Vec::new();
+        for _ in 0..200 {
+            if feedback.len() >= 40 {
+                break;
+            }
+            let more = play_negatives(&mut rig, &mut s, 1, input_veto(10.0));
+            feedback.extend(more.into_iter().filter(|f| *f != TapFeedback::Ignored));
+        }
+        assert!(feedback.len() >= 40, "{} candidates", feedback.len());
+        feedback.truncate(40);
+        let max = MAX_INPUT_NEGATIVES as usize;
+        let recorded: Vec<TapFeedback> = (1..=MAX_INPUT_NEGATIVES)
+            .map(|count| TapFeedback::NegativeRecorded { count })
+            .collect();
+        assert_eq!(&feedback[..max], &recorded[..]);
+        assert!(feedback[max..]
+            .iter()
+            .all(|f| *f == TapFeedback::InputActivity));
+        let CalibrationStep::Negatives {
+            collected: kept, ..
+        } = s.view().step
+        else {
+            panic!("left Negatives");
+        };
+        assert_eq!(kept, MAX_INPUT_NEGATIVES);
+        assert_eq!(s.os_vetoed_negatives(), MAX_INPUT_NEGATIVES);
+        // Clear candidates are still collected past the cap.
+        let fb = play_negatives(&mut rig, &mut s, 4, VetoVerdict::Clear);
+        assert!(collected(&fb) > MAX_INPUT_NEGATIVES, "{fb:?}");
+    }
+
+    #[test]
+    fn s10_auto_advance() {
+        let mut rig = Rig::new(0x5A10, Mics::Stereo);
+        let mut s = CalibrationSession::new(plan(4, 5, 0x5A)).expect("session");
+        record_ambient(&mut rig, &mut s, &[]);
+        accept(&mut rig, &mut s);
+        assert!(!s.auto_advances());
+        tap_zone(&mut rig, &mut s, 0, 4);
+        assert!(!s.auto_advances(), "zone 0 is not full yet");
+        tap_zone(&mut rig, &mut s, 0, 1);
+        assert!(s.auto_advances(), "a full zone 0 of 4");
+        s.advance(rig.now()).expect("advance");
+        for zone in 1..3 {
+            tap_zone(&mut rig, &mut s, zone, 5);
+            assert!(s.auto_advances());
+            s.advance(rig.now()).expect("advance");
+        }
+        tap_zone(&mut rig, &mut s, 3, 5);
+        assert!(!s.auto_advances(), "the full last zone waits for the user");
+        s.finish_negatives().expect("skip negatives");
+        assert_eq!(s.step_kind(), StepKind::ReadyToBuild);
+        assert_eq!(s.view().memory_bytes, 20 * clip_bytes() + ambient_bytes());
+        s.redo_zone(ZoneIndex(1)).expect("redo");
+        tap_zone(&mut rig, &mut s, 1, 5);
+        assert!(!s.auto_advances(), "a full redo zone");
+        assert_eq!(
+            s.finish_negatives(),
+            Err(SessionError::NotInStep {
+                expected: StepKind::Negatives,
+                actual: StepKind::Zone
+            })
+        );
+        s.advance(rig.now()).expect("advance");
+        assert_eq!(s.step_kind(), StepKind::ReadyToBuild);
+        let job = s.take_build_job().expect("job");
+        assert!(job.negatives.is_empty());
+        assert_eq!(job.taps.len(), 20);
+    }
+
+    #[test]
+    fn s11_disturbed_ambient_must_be_recorded_again() {
+        let mut rig = Rig::new(0x5B11, Mics::Stereo);
+        let mut s = CalibrationSession::new(plan(2, 5, 0x5B)).expect("session");
+        let sounds: Vec<(f64, Vec<f32>)> = (0..7)
+            .map(|k| (200.0 + 400.0 * f64::from(k), rig.tap(2, TAP_FORCE)))
+            .collect();
+        let feedback = record_ambient(&mut rig, &mut s, &sounds);
+        assert!(
+            count(&feedback, |f| *f == TapFeedback::AmbientDisturbance) >= 6,
+            "{feedback:?}"
+        );
+        let CalibrationStep::AmbientReview {
+            mixing,
+            environment,
+            ..
+        } = s.view().step
+        else {
+            panic!("not in AmbientReview");
+        };
+        let AmbientMixing::TooDisturbed { usable, needed } = mixing else {
+            panic!("mixing is {mixing:?}");
+        };
+        assert_eq!(needed, AMBIENT_MIN_USABLE);
+        assert!(usable.get() < needed.get());
+        assert_eq!(environment, EnvironmentQuality::TooNoisy);
+        assert_eq!(
+            s.accept_ambient(),
+            Err(SessionError::AmbientTooDisturbed { usable, needed })
+        );
+        assert_eq!(s.step_kind(), StepKind::AmbientReview);
+        s.retry_ambient().expect("retry");
+        assert_eq!(
+            s.view().step,
+            CalibrationStep::Ambient {
+                elapsed: Milliseconds::new(0.0),
+                needed: AMBIENT_DURATION
+            }
+        );
+        assert_eq!(
+            s.view().memory_bytes,
+            0,
+            "the disturbed recording is discarded"
+        );
+
+        // A clean recording is usable.
+        let (start, x, inputs) = rig.play(3000.0, &[]);
+        feed(&mut s, inputs);
+        for (i, chunk) in x.chunks(BLOCK * 2).enumerate() {
+            let at = SampleIndex(start.0 + (i * BLOCK) as u64);
+            let block =
+                AudioBlock::new(stereo(), at, chunk, BlockTime::Untimed, false).expect("block");
+            s.push_ambient(&block).expect("push_ambient");
+        }
+        let CalibrationStep::AmbientReview { mixing, .. } = s.view().step else {
+            panic!("not in AmbientReview");
+        };
+        assert_eq!(mixing, AmbientMixing::Usable);
+        s.accept_ambient().expect("accept");
+    }
+
+    #[test]
+    fn s12_finish_build_outside_building_changes_nothing() {
+        let mut s = CalibrationSession::new(plan(2, 5, 0x5C)).expect("session");
+        let before = s.view();
+        assert_eq!(
+            s.finish_build(Err(SessionError::BuildCancelled)),
+            Err(SessionError::NotInStep {
+                expected: StepKind::Building,
+                actual: StepKind::Ready
+            })
+        );
+        assert_eq!(s.view(), before);
+
+        let mut rig = Rig::new(0x5C12, Mics::Stereo);
+        let mut s = ready_to_build(&mut rig, plan(2, 5, 0x5C), &[], 0);
+        let before = s.view();
+        assert_eq!(
+            s.finish_build(Err(SessionError::BuildCancelled)),
+            Err(SessionError::NotInStep {
+                expected: StepKind::Building,
+                actual: StepKind::ReadyToBuild
+            })
+        );
+        assert_eq!(s.view(), before);
+
+        // A cancelled build fails the step; its late result is refused.
+        let job = s.take_build_job().expect("job");
+        let result = job.run(&AtomicBool::new(true), &mut |_| {});
+        assert_eq!(result, Err(SessionError::BuildCancelled));
+        s.finish_build(result).expect("finish_build");
+        let failed = s.view();
+        assert_eq!(
+            failed.step,
+            CalibrationStep::Failed {
+                error: SessionError::BuildCancelled
+            }
+        );
+        assert_eq!(
+            s.finish_build(Err(SessionError::BuildPanicked {
+                message: "stale".into()
+            })),
+            Err(SessionError::NotInStep {
+                expected: StepKind::Building,
+                actual: StepKind::Failed
+            })
+        );
+        assert_eq!(s.view(), failed);
+    }
+}
