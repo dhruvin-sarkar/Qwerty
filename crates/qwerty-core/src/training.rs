@@ -143,6 +143,11 @@ pub enum TrainingProgress {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TrainingError {
+    // SPEC: §1.10.1 names no error for a `TrainingParams` field out of range; `train` checks the
+    // params before the set and reports the first bad field (see `validate_params`).
+    InvalidParam {
+        param: TrainingParam,
+    },
     NotEnoughZones {
         have: u32,
     },
@@ -170,6 +175,17 @@ pub enum TrainingError {
         stage: FactorStage,
     },
     Cancelled,
+}
+
+/// The `TrainingParams` field an `InvalidParam` names. The value is not carried: it may be
+/// non-finite, which a persisted float must never be (§0.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TrainingParam {
+    AlphaIn,
+    TauMargin,
+    BgPositiveQuantile,
+    BgNegativeQuantile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +347,7 @@ pub fn train(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(TrainingProgress),
 ) -> Result<TrainedModel, TrainingError> {
+    validate_params(params)?;
     validate_set(set)?;
     let d = set.layout.dims();
     let k = set.zone_ids.len();
@@ -599,6 +616,34 @@ fn count_u32(n: usize) -> u32 {
 fn dim_u16(i: usize) -> u16 {
     // INVARIANT: every index and count passed here is ≤ DESCRIPTOR_DIMS (48).
     u16::try_from(i).expect("descriptor dims fit in u16")
+}
+
+/// The ranges `train` needs, first bad field first: the quantile levels 1 − α_in, q_bg+ and q_bg−
+/// lie in (0, 1] (nearest rank, §1.10.5), and τ_m is finite because the model stores it (§0.5).
+// SPEC: §1.10.2 checks only the set. Unchecked, a level outside (0, 1] tripped
+// `quantile_nearest_rank`'s debug assertion and was clamped to an end of the list in release,
+// and a non-finite τ_m gave a model that its own `validate` rejects.
+fn validate_params(params: &TrainingParams) -> Result<(), TrainingError> {
+    let level = |p: f64| p > 0.0 && p <= 1.0;
+    let in_range = [
+        (
+            TrainingParam::AlphaIn,
+            (0.0..1.0).contains(&params.alpha_in),
+        ),
+        (TrainingParam::TauMargin, params.tau_margin.is_finite()),
+        (
+            TrainingParam::BgPositiveQuantile,
+            level(params.bg_positive_quantile),
+        ),
+        (
+            TrainingParam::BgNegativeQuantile,
+            level(params.bg_negative_quantile),
+        ),
+    ];
+    match in_range.iter().find(|&&(_, ok)| !ok) {
+        Some(&(param, _)) => Err(TrainingError::InvalidParam { param }),
+        None => Ok(()),
+    }
 }
 
 /// §1.10.2, in order, fail fast.
@@ -1867,6 +1912,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn train_rejects_out_of_range_params() {
+        let mut rng = Rng64::new(0xA2F1);
+        let means = random_means(&mut rng, 2, 38, 3.0);
+        let set = make_set(&mut rng, &Units::identity(38), MONO, &means, 5, 2);
+        use TrainingParam::{AlphaIn, BgNegativeQuantile, BgPositiveQuantile, TauMargin};
+        // Each bad value is rejected up front, before any quantile is taken (no debug panic)
+        // and before a model with a non-finite τ_m is built. The set has no negatives, so
+        // q_bg− would never be used: it is still checked.
+        type Case = (TrainingParam, fn(&mut TrainingParams));
+        let cases: [Case; 11] = [
+            (AlphaIn, |p| p.alpha_in = 1.0),
+            (AlphaIn, |p| p.alpha_in = -0.01),
+            (AlphaIn, |p| p.alpha_in = f64::NAN),
+            (TauMargin, |p| p.tau_margin = f64::NAN),
+            (TauMargin, |p| p.tau_margin = f64::INFINITY),
+            (BgPositiveQuantile, |p| p.bg_positive_quantile = 0.0),
+            (BgPositiveQuantile, |p| p.bg_positive_quantile = 1.5),
+            (BgPositiveQuantile, |p| p.bg_positive_quantile = f64::NAN),
+            (BgNegativeQuantile, |p| p.bg_negative_quantile = 0.0),
+            (BgNegativeQuantile, |p| p.bg_negative_quantile = f64::NAN),
+            // The first bad field is the one reported.
+            (AlphaIn, |p| {
+                p.alpha_in = 2.0;
+                p.bg_negative_quantile = 2.0;
+            }),
+        ];
+        for (i, (param, defect)) in cases.iter().enumerate() {
+            let mut p = params(exactly(1));
+            defect(&mut p);
+            assert_eq!(
+                train_with(&set, &p).err(),
+                Some(TrainingError::InvalidParam { param: *param }),
+                "case {i}"
+            );
+        }
+        // The params are checked before the set.
+        let mut one_zone = set.clone();
+        one_zone.zone_ids.truncate(1);
+        let p = TrainingParams {
+            alpha_in: 1.0,
+            ..params(exactly(1))
+        };
+        assert_eq!(
+            train_with(&one_zone, &p).err(),
+            Some(TrainingError::InvalidParam { param: AlphaIn })
+        );
+        // The range ends are valid: α_in = 0 and level 1 take the largest held-out value.
+        let ends = TrainingParams {
+            alpha_in: 0.0,
+            bg_positive_quantile: 1.0,
+            bg_negative_quantile: 1.0,
+            ..params(exactly(1))
+        };
+        let model = train_with(&set, &ends).expect("the range ends train");
+        model
+            .validate()
+            .expect("a model trained at the range ends validates");
     }
 
     #[test]
