@@ -901,7 +901,9 @@ fn evaluate_v2(
     let mut decided: Vec<(SampleIndex, Option<ZoneId>)> = Vec::new();
     while let Some(piece) = pieces.next()? {
         let (block, end) = audio_block(rec.format, &piece);
-        feed.apply_until(clock.at(SampleIndex(end.0 - 1)), &mut veto);
+        let last = clock.at(SampleIndex(end.0 - 1));
+        feed.apply_until(last, &mut veto);
+        assessor.tick(last);
         for segment in cursor.enter(piece.start) {
             if segment.reconfigured || pipeline.is_none() {
                 pipeline = if runs_pipeline(&segment.kind) {
@@ -1351,6 +1353,7 @@ fn evaluate_v1(
     let mut candidates = 0u64;
     while let Some(piece) = pieces.next()? {
         let (block, end) = audio_block(rec.format, &piece);
+        assessor.tick(clock.at(SampleIndex(end.0 - 1)));
         for segment in cursor.enter(piece.start) {
             if segment.reconfigured || feed.is_none() {
                 feed = runs_pipeline(&segment.kind).then(MonoFeed::new);
