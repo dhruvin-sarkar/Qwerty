@@ -75,18 +75,19 @@ pub enum SegmentKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SidecarEvent {
-    /// Contiguous; each ends where the next starts. Pushed by the engine's controller (p2 §2.13).
-    /// With `reconfigured`, `start` is the first sample processed under the new setup (processing
-    /// reports it), so every detector/pipeline rebuild is a boundary; without it (a calibration
-    /// step change and no re-Configure), the last onset the session consumed + 1 (RUST-RT-13,
-    /// X01-06).
+    /// Contiguous; each ends where the next starts. Pushed by the engine's processing thread
+    /// (p2 §2.5, §2.13). With `reconfigured`, `start` is the first sample processed under the new
+    /// setup, so every detector/pipeline rebuild is a boundary; without it (a calibration step
+    /// change and no re-Configure), the last onset the session consumed + 1 (RUST-RT-13, X01-06).
+    /// The engine re-Configures at every segment change, so it only writes `reconfigured: true`.
     Segment {
         start: SampleIndex,
         kind: SegmentKind,
         reconfigured: bool,
     },
     /// A calibration run's plan, so replay rebuilds the same augmentation. A later run replaces an
-    /// earlier one in the same recording.
+    /// earlier one in the same recording. Pushed by the processing thread just before that run's
+    /// first Segment, with the same `start`.
     CalibrationStarted {
         start: SampleIndex,
         seed: u64,
