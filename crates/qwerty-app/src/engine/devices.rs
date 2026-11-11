@@ -42,6 +42,7 @@ const E_NOTFOUND: HRESULT = ERROR_NOT_FOUND.to_hresult();
 pub fn list_capture_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
     // Balanced with the caller's own MTA init (S_FALSE is success and is uninitialized too), so the
     // listing also works from a thread that never initialized COM (the CLI).
+    // SPEC: §2.4 lists ComInit among the listing's errors, so the listing enters COM itself.
     let _com = ComApartment::enter()?;
     // SAFETY: plain COM activation of the system enumerator on an MTA thread.
     let enumerator: IMMDeviceEnumerator =

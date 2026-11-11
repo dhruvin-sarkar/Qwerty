@@ -545,6 +545,7 @@ fn open_stream(endpoint_id: &str) -> Result<(Stream, StreamFacts, RingReader), C
         .client
         .get_audiocaptureclient()
         .map_err(|e| map_wasapi(CaptureStage::CaptureClient, e))?;
+    // SPEC: §2.3 names no stage for GetBufferSize or GetDevicePeriod; both are Initialize.
     let buffer_frames = mix
         .client
         .get_buffer_size()
