@@ -434,6 +434,11 @@ impl Live {
                 Ok(())
             })
             .expect("the pipeline takes every block");
+        assert_eq!(
+            next,
+            inputs.len(),
+            "every input event falls inside its audio"
+        );
     }
 
     /// Plays each sound after a floor gap drawn from `gap_ms`, its onset at grid phase
