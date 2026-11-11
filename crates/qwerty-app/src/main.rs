@@ -11,7 +11,6 @@ mod app_state;
 mod audio_thread;
 mod capture_worker;
 mod hotkeys;
-mod platform;
 mod tray;
 mod ui;
 

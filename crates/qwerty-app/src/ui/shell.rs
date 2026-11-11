@@ -20,7 +20,6 @@ use crate::ui::motion::AnimState;
 use crate::app_state::{AppState, ListeningState, ProfileSummary, Screen};
 use crate::capture_worker::{CaptureDetail, CaptureEvent, LiveCapture};
 use crate::hotkeys::Hotkeys;
-use crate::platform::{platform_for_this_os, PlatformActions};
 use crate::tray::{Tray, TrayCommand};
 use crate::ui::action_editor::ActionEditor;
 use crate::ui::diagnostics::DiagnosticsScreen;
@@ -31,6 +30,7 @@ use crate::ui::style::{self, radius, space, text};
 use crate::ui::theme::{on_color, tokens_for, Color, Tokens};
 use crate::ui::wizard::{Wizard, WizardOutcome};
 use egui_phosphor::regular as icon;
+use qwerty_app::platform::{platform_for_this_os, PlatformActions};
 
 /// Live input status while listening, drained from the capture worker.
 #[derive(Default)]
@@ -201,7 +201,7 @@ impl QwertyApp {
         let mut state = AppState::load(system_dark);
         // Cache the OS "reduced motion" preference once at startup; every
         // animation site consults this one value (Part 7 / `ACCEPTANCE.md`).
-        state.reduced_motion = crate::platform::os_prefers_reduced_motion();
+        state.reduced_motion = qwerty_app::platform::os_prefers_reduced_motion();
         // Paint the correct theme on the very first frame — no flash of the
         // egui default palette (`PERFORMANCE.md`: no flash of unstyled content).
         let tokens = tokens_for(state.config.theme, system_dark);
@@ -440,7 +440,9 @@ impl QwertyApp {
                                                 let wake = ctx.clone();
                                                 std::thread::spawn(move || {
                                                     if let Err((step, e)) =
-                                                        crate::platform::run_action_chain(&actions)
+                                                        qwerty_app::platform::run_action_chain(
+                                                            &actions,
+                                                        )
                                                     {
                                                         let _ = errors.send(format!(
                                                             "“{label}” — action {} failed: {e}",
@@ -1656,7 +1658,7 @@ impl QwertyApp {
                 .inner;
             if startup_changed {
                 let desired = self.state.config.start_with_windows;
-                match crate::platform::set_start_with_windows(desired) {
+                match qwerty_app::platform::set_start_with_windows(desired) {
                     Ok(()) => {
                         if let Err(e) = self.state.save_config() {
                             self.save_error = Some(e);

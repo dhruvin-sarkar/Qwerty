@@ -10,10 +10,10 @@ use egui::{Button, ComboBox, RichText};
 
 use qwerty_core::profile::{ActionSpec, Modifier, ScreenshotMode, SystemSound, ZoneId};
 
-use crate::platform::{dispatch, PlatformActions};
 use crate::ui::shell::{card, Palette};
 use crate::ui::style::{space, text};
 use egui_phosphor::regular as icon;
+use qwerty_app::platform::{dispatch, PlatformActions};
 
 /// Transient editor state: the last Test result, scoped to the zone + row it
 /// was run on so it never bleeds onto a different zone's row.
@@ -86,7 +86,7 @@ impl Kind {
         }
     }
 
-    /// What a synchronous `Ok` from [`dispatch`](crate::platform::dispatch)
+    /// What a synchronous `Ok` from [`dispatch`](qwerty_app::platform::dispatch)
     /// actually proves for this kind.
     ///
     /// Most actions complete inline, so `Ok` means the effect happened. But a

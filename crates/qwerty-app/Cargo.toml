@@ -21,9 +21,17 @@ chrono = { workspace = true }
 # ones are under the target table below so a future Linux build still compiles.
 arboard = { workspace = true }
 tts = { workspace = true }
+# v2 engine (p2 §2.1, WP-C0).
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+# v2 engine capture (p2 §2.1, WP-C0).
+wasapi = { workspace = true }
 winrt-toast = { workspace = true }
 # Phase 3 — GUI shell, tray icon, global hotkey (ROADMAP.md).
 eframe = { workspace = true }

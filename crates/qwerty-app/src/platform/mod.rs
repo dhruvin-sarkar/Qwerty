@@ -20,6 +20,19 @@ mod region_select;
 use std::path::Path;
 
 use qwerty_core::profile::{ActionSpec, KeyCombo, ScreenshotMode, SystemSound};
+use qwerty_core::veto::{OutputId, SelfOutputKind};
+use serde::{Deserialize, Serialize};
+
+/// The platform's report of its own audible or visible output, so the engine's self-output veto
+/// can suppress taps its own actions caused (p2 §2.6). The engine's implementation is
+/// `engine::messages::SelfOutputLink`.
+pub trait OutputObserver: Send + Sync {
+    /// An output began; may block briefly.
+    fn output_started(&self, kind: SelfOutputKind) -> OutputId;
+    fn output_ended(&self, id: OutputId);
+    /// Wait-free; called inside tts's locks; never unwinds.
+    fn speech_finished(&self);
+}
 
 /// A toast notification to surface to the user. Platform-neutral; the concrete
 /// WinRT toast XML is built inside the Windows implementation.
@@ -31,41 +44,73 @@ pub struct ToastSpec {
 
 /// Why an action failed. A real enum (not a stringly-typed catch-all) so the UI
 /// can tell the user *why* — a missing target reads differently from a denied
-/// permission (`ARCHITECTURE.md` → Error handling policy).
-#[derive(Debug)]
+/// permission (`ARCHITECTURE.md` → Error handling policy). Struct variants: it crosses
+/// the engine boundary (p2 §2.6, PARITY-17); `detail` is the OS error's text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum ActionError {
     /// The app/file/URL to open does not exist or could not be resolved.
-    TargetNotFound(String),
+    TargetNotFound { target: String },
     /// Launching an app/path/URL or running a command failed at the OS level.
     LaunchFailed { target: String, reason: String },
     /// Reading or writing the system clipboard failed.
-    Clipboard(String),
+    Clipboard { detail: String },
     /// Text-to-speech was unavailable or failed (from the `tts` backend).
-    Speech(String),
+    Speech { detail: String },
+    /// No speech start was reported within `SPEECH_START_TIMEOUT`.
+    SpeechTimeout,
     /// Synthesizing a keystroke failed (e.g. an unrecognized key name).
-    Keystroke(String),
+    Keystroke { detail: String },
+    /// SendKeystroke refused: Qwerty's own window has focus (PARITY-16).
+    ForegroundIsQwerty,
     /// Capturing the screen failed.
-    Screenshot(String),
+    Screenshot { detail: String },
     /// Showing a toast notification failed, or this app's notification identity
     /// (AUMID) could not be registered with Windows.
-    Notification(String),
+    Notification { detail: String },
     /// Playing a system sound failed.
-    Sound(String),
+    Sound { detail: String },
+    /// The action panicked; set by the dispatch thread, never by the platform.
+    Panicked { message: String },
+}
+
+impl ActionError {
+    /// The variant name, e.g. "LaunchFailed": what logs carry instead of the fields (p2 §2.9.4).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ActionError::TargetNotFound { .. } => "TargetNotFound",
+            ActionError::LaunchFailed { .. } => "LaunchFailed",
+            ActionError::Clipboard { .. } => "Clipboard",
+            ActionError::Speech { .. } => "Speech",
+            ActionError::SpeechTimeout => "SpeechTimeout",
+            ActionError::Keystroke { .. } => "Keystroke",
+            ActionError::ForegroundIsQwerty => "ForegroundIsQwerty",
+            ActionError::Screenshot { .. } => "Screenshot",
+            ActionError::Notification { .. } => "Notification",
+            ActionError::Sound { .. } => "Sound",
+            ActionError::Panicked { .. } => "Panicked",
+        }
+    }
 }
 
 impl std::fmt::Display for ActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ActionError::TargetNotFound(t) => write!(f, "could not find \"{t}\""),
+            ActionError::TargetNotFound { target } => write!(f, "could not find \"{target}\""),
             ActionError::LaunchFailed { target, reason } => {
                 write!(f, "could not launch \"{target}\": {reason}")
             }
-            ActionError::Clipboard(e) => write!(f, "clipboard error: {e}"),
-            ActionError::Speech(e) => write!(f, "text-to-speech error: {e}"),
-            ActionError::Keystroke(e) => write!(f, "keystroke error: {e}"),
-            ActionError::Screenshot(e) => write!(f, "screenshot error: {e}"),
-            ActionError::Notification(e) => write!(f, "notification error: {e}"),
-            ActionError::Sound(e) => write!(f, "sound error: {e}"),
+            ActionError::Clipboard { detail } => write!(f, "clipboard error: {detail}"),
+            ActionError::Speech { detail } => write!(f, "text-to-speech error: {detail}"),
+            ActionError::SpeechTimeout => write!(f, "text-to-speech did not start in time"),
+            ActionError::Keystroke { detail } => write!(f, "keystroke error: {detail}"),
+            ActionError::ForegroundIsQwerty => {
+                write!(f, "keystroke not sent: Qwerty's own window has focus")
+            }
+            ActionError::Screenshot { detail } => write!(f, "screenshot error: {detail}"),
+            ActionError::Notification { detail } => write!(f, "notification error: {detail}"),
+            ActionError::Sound { detail } => write!(f, "sound error: {detail}"),
+            ActionError::Panicked { message } => write!(f, "the action panicked: {message}"),
         }
     }
 }

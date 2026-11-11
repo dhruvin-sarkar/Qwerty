@@ -54,6 +54,18 @@ windows = { version = "0.62", features = [
     # COM apartment init for off-UI-thread action dispatch (ShellExecuteW / WinRT
     # toast need a COM apartment on the worker thread — see platform::windows).
     "Win32_System_Com",
+    # v2 engine (p2 §2.1, WP-C0).
+    "Win32_Media_Audio",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_Input",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_FunctionDiscovery",
 ] }
 arboard = "3"
 # Speech + toast, the last two ActionSpec variants. These were stubbed as
@@ -62,3 +74,11 @@ arboard = "3"
 # other portable action crates; `winrt-toast` is Windows-only (target table).
 tts = "0.26"
 winrt-toast = "0.1"
+# v2 engine (p2 §2.1, WP-C0). wasapi 0.26.0 depends on windows 0.62.2, the version
+# above, so `wasapi::Device::as_immdevice()` returns our own IMMDevice type.
+wasapi = "=0.26.0"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+# tracing-log stays off and nothing installs a `log` logger, so wasapi's per-packet
+# `log::trace!` is a single relaxed atomic load (p2 §2.3).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }

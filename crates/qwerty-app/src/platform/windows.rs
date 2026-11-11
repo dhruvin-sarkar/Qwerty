@@ -192,12 +192,16 @@ pub(crate) fn set_start_with_windows(enabled: bool) -> Result<(), String> {
 /// with one internal `unsafe` block, like the code it was extracted from.
 fn capture_rect_to_clipboard(src_x: i32, src_y: i32, w: i32, h: i32) -> Result<(), ActionError> {
     if w <= 0 || h <= 0 {
-        return Err(ActionError::Screenshot("capture rectangle is empty".into()));
+        return Err(ActionError::Screenshot {
+            detail: "capture rectangle is empty".into(),
+        });
     }
     unsafe {
         let screen = GetDC(None);
         if screen.is_invalid() {
-            return Err(ActionError::Screenshot("GetDC(NULL) returned null".into()));
+            return Err(ActionError::Screenshot {
+                detail: "GetDC(NULL) returned null".into(),
+            });
         }
 
         let grab = || -> Result<(usize, usize, Vec<u8>), ActionError> {
@@ -235,7 +239,9 @@ fn capture_rect_to_clipboard(src_x: i32, src_y: i32, w: i32, h: i32) -> Result<(
             let _ = DeleteObject(bmp.into());
             let _ = DeleteDC(mem);
             if !ok {
-                return Err(ActionError::Screenshot("BitBlt/GetDIBits failed".into()));
+                return Err(ActionError::Screenshot {
+                    detail: "BitBlt/GetDIBits failed".into(),
+                });
             }
             // BGRX -> RGBA (arboard wants meaningful RGBA; force opaque alpha).
             for px in buf.chunks_exact_mut(4) {
@@ -247,13 +253,17 @@ fn capture_rect_to_clipboard(src_x: i32, src_y: i32, w: i32, h: i32) -> Result<(
         let result = grab();
         let _ = ReleaseDC(None, screen);
         let (wi, hi, rgba) = result?;
-        let mut cb = Clipboard::new().map_err(|e| ActionError::Screenshot(e.to_string()))?;
+        let mut cb = Clipboard::new().map_err(|e| ActionError::Screenshot {
+            detail: e.to_string(),
+        })?;
         cb.set_image(ImageData {
             width: wi,
             height: hi,
             bytes: rgba.into(),
         })
-        .map_err(|e| ActionError::Screenshot(e.to_string()))
+        .map_err(|e| ActionError::Screenshot {
+            detail: e.to_string(),
+        })
     }
 }
 
@@ -310,9 +320,11 @@ impl WindowsPlatform {
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    return Err(ActionError::Notification(format!(
-                        "could not register the notification identity ({AUM_ID}): {e}"
-                    )))
+                    return Err(ActionError::Notification {
+                        detail: format!(
+                            "could not register the notification identity ({AUM_ID}): {e}"
+                        ),
+                    })
                 }
                 Err(payload) => {
                     // Keep the assertion text (e.g. "assertion failed:
@@ -323,10 +335,12 @@ impl WindowsPlatform {
                         .map(|s| s.to_string())
                         .or_else(|| payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown panic".to_string());
-                    return Err(ActionError::Notification(format!(
-                        "registering the notification identity ({AUM_ID}) panicked \
+                    return Err(ActionError::Notification {
+                        detail: format!(
+                            "registering the notification identity ({AUM_ID}) panicked \
                          inside winrt-toast: {detail}"
-                    )));
+                        ),
+                    });
                 }
             }
             *slot = Some(ToastManager::new(AUM_ID));
@@ -354,7 +368,9 @@ impl WindowsPlatform {
             return Ok(());
         }
         match code {
-            2 | 3 => Err(ActionError::TargetNotFound(target.to_string())),
+            2 | 3 => Err(ActionError::TargetNotFound {
+                target: target.to_string(),
+            }),
             other => Err(ActionError::LaunchFailed {
                 target: target.to_string(),
                 reason: format!("shell refused to open target (SE_ERR {other})"),
@@ -391,9 +407,9 @@ fn vk_of(name: &str) -> Result<(VIRTUAL_KEY, bool), ActionError> {
         "right" => (0x27, true),
         "down" => (0x28, true),
         other => {
-            return Err(ActionError::Keystroke(format!(
-                "unrecognized key \"{other}\""
-            )))
+            return Err(ActionError::Keystroke {
+                detail: format!("unrecognized key \"{other}\""),
+            })
         }
     };
     Ok((VIRTUAL_KEY(vk), ext))
@@ -436,9 +452,9 @@ impl PlatformActions for WindowsPlatform {
     }
 
     fn open_path(&self, path: &Path) -> Result<(), ActionError> {
-        let target = path
-            .to_str()
-            .ok_or_else(|| ActionError::TargetNotFound(path.display().to_string()))?;
+        let target = path.to_str().ok_or_else(|| ActionError::TargetNotFound {
+            target: path.display().to_string(),
+        })?;
         Self::shell_open(target)
     }
 
@@ -450,7 +466,9 @@ impl PlatformActions for WindowsPlatform {
         {
             Ok(_child) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(ActionError::TargetNotFound(cmd.to_string()))
+                Err(ActionError::TargetNotFound {
+                    target: cmd.to_string(),
+                })
             }
             Err(e) => Err(ActionError::LaunchFailed {
                 target: cmd.to_string(),
@@ -460,9 +478,12 @@ impl PlatformActions for WindowsPlatform {
     }
 
     fn copy_to_clipboard(&self, text: &str) -> Result<(), ActionError> {
-        let mut cb = Clipboard::new().map_err(|e| ActionError::Clipboard(e.to_string()))?;
-        cb.set_text(text)
-            .map_err(|e| ActionError::Clipboard(e.to_string()))
+        let mut cb = Clipboard::new().map_err(|e| ActionError::Clipboard {
+            detail: e.to_string(),
+        })?;
+        cb.set_text(text).map_err(|e| ActionError::Clipboard {
+            detail: e.to_string(),
+        })
     }
 
     fn play_sound(&self, sound: SystemSound) -> Result<(), ActionError> {
@@ -472,7 +493,9 @@ impl PlatformActions for WindowsPlatform {
             SystemSound::Error => MB_ICONHAND,
             SystemSound::Notification => MB_ICONEXCLAMATION,
         };
-        unsafe { MessageBeep(flag) }.map_err(|e| ActionError::Sound(e.to_string()))
+        unsafe { MessageBeep(flag) }.map_err(|e| ActionError::Sound {
+            detail: e.to_string(),
+        })
     }
 
     fn send_keystroke(&self, combo: &KeyCombo) -> Result<(), ActionError> {
@@ -498,11 +521,13 @@ impl PlatformActions for WindowsPlatform {
                 release.push(key_event(modifier_vk(m), false, false));
             }
             unsafe { SendInput(&release, std::mem::size_of::<INPUT>() as i32) };
-            return Err(ActionError::Keystroke(format!(
-                "SendInput injected {sent}/{} (GetLastError {:#x})",
-                inputs.len(),
-                e.0
-            )));
+            return Err(ActionError::Keystroke {
+                detail: format!(
+                    "SendInput injected {sent}/{} (GetLastError {:#x})",
+                    inputs.len(),
+                    e.0
+                ),
+            });
         }
         Ok(())
     }
@@ -519,7 +544,9 @@ impl PlatformActions for WindowsPlatform {
             )
         };
         if vw <= 0 || vh <= 0 {
-            return Err(ActionError::Screenshot("virtual screen size is 0".into()));
+            return Err(ActionError::Screenshot {
+                detail: "virtual screen size is 0".into(),
+            });
         }
 
         let (x, y, w, h) = match mode {
@@ -570,7 +597,9 @@ impl PlatformActions for WindowsPlatform {
                     eprintln!("warning: Windows failed to display the toast: {e}");
                 })),
             )
-            .map_err(|e| ActionError::Notification(e.to_string()))
+            .map_err(|e| ActionError::Notification {
+                detail: e.to_string(),
+            })
     }
 }
 
@@ -631,6 +660,8 @@ impl SpeechWorker {
     fn speak(&self, text: &str) -> Result<(), ActionError> {
         self.tx
             .send(text.to_string())
-            .map_err(|_| ActionError::Speech("the speech engine is unavailable".into()))
+            .map_err(|_| ActionError::Speech {
+                detail: "the speech engine is unavailable".into(),
+            })
     }
 }
