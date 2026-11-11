@@ -330,6 +330,23 @@ mod tests {
         );
     }
 
+    /// Hardware: wasapi's notification registration succeeds and unregisters on drop.
+    #[test]
+    #[ignore = "hardware: registers device notifications with the system enumerator"]
+    fn hardware_watch_registers_and_unregisters() {
+        let _com = ComApartment::enter().expect("COM");
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let watch = watch(tx, Arc::clone(&dropped)).expect("registration");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(watch);
+        println!(
+            "messages while watching: {:?}",
+            rx.try_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
     /// Hardware evidence (WP-C1): the full capture-device listing of this machine, one JSON line.
     /// Opens each Active endpoint briefly to probe it; no audio is read.
     #[test]

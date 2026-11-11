@@ -1053,4 +1053,115 @@ mod tests {
             Err(CaptureError::UnsupportedChannelCount { channels: 33 })
         );
     }
+
+    /// One mix format, as GetMixFormat reported it, for the OQ-1 evidence.
+    fn describe(wave: &WaveFormat) -> serde_json::Value {
+        let tag = wave.wave_fmt.Format.wFormatTag;
+        let subformat = wave.wave_fmt.SubFormat;
+        serde_json::json!({
+            "rate": wave.get_samplespersec(),
+            "channels": wave.get_nchannels(),
+            "bits": wave.get_bitspersample(),
+            "tag": format!("{tag:#06x}"),
+            "subformat_data1": format!("{:#010x}", subformat.data1),
+            "channel_mask": format!("{:#x}", wave.get_dwchannelmask()),
+            "validated": format!("{:?}", validate_mix_format(wave)),
+        })
+    }
+
+    /// GetMixFormat after set_properties (RAW or Default), then Initialize as capture would.
+    fn measure(device: &Device, raw: bool) -> serde_json::Value {
+        let mut mix = match mix_format(device, raw) {
+            Ok(mix) => mix,
+            Err(error) => return serde_json::json!({ "error": format!("{error:?}") }),
+        };
+        let initialize = device_period(&mix.client).and_then(|period| {
+            mix.client
+                .initialize_client(&mix.wave, &Direction::Capture, &events_shared(period))
+                .map_err(|e| map_wasapi(CaptureStage::Initialize, e))
+                .map(|()| period)
+        });
+        serde_json::json!({
+            "mix_format": describe(&mix.wave),
+            "initialize": format!("{initialize:?}"),
+        })
+    }
+
+    /// Hardware evidence (OQ-1): for every Active capture endpoint, GetMixFormat after RAW
+    /// set_properties vs after Default set_properties, and whether Initialize accepts each. Opens
+    /// each endpoint briefly; never starts a stream and reads no audio.
+    #[test]
+    #[ignore = "hardware: opens every active capture endpoint briefly (OQ-1)"]
+    fn hardware_oq1_raw_vs_default_mix_format() {
+        let _com = ComApartment::enter().expect("COM");
+        let enumerator = DeviceEnumerator::new().expect("enumerator");
+        let active = enumerator
+            .get_device_collection(&Direction::Capture)
+            .expect("active capture endpoints");
+        let count = active.get_nbr_devices().expect("count");
+        for index in 0..count {
+            let device = active.get_device_at_index(index).expect("device");
+            let raw_supported = devices::raw_processing_supported(device.as_immdevice());
+            let line = serde_json::json!({
+                "endpoint_id": device.get_id().expect("id"),
+                "name": devices::friendly_name(device.as_immdevice()).expect("name"),
+                "raw_supported": format!("{raw_supported:?}"),
+                "raw": measure(&device, true),
+                "default": measure(&device, false),
+            });
+            println!("{line}");
+        }
+    }
+
+    /// Hardware smoke test: opens the default microphone through `open`, drains the ring for 5 s,
+    /// stops, and prints the stream facts and counters. No audio is kept.
+    #[test]
+    #[ignore = "hardware: captures 5 s from the default microphone; no audio is kept"]
+    fn hardware_capture_default_microphone() {
+        let devices = devices::list_capture_devices().expect("listing");
+        let default = devices
+            .iter()
+            .find(|d| d.is_default)
+            .expect("a default capture endpoint");
+        let (exits_tx, exits_rx) = crossbeam_channel::bounded(16);
+        let (worker, mut opened) = open(CaptureRequest {
+            worker: crate::engine::messages::WorkerId(1),
+            endpoint_id: default.endpoint_id.clone(),
+            wake: std::thread::current(),
+            exits: exits_tx,
+        })
+        .expect("open");
+        let mut samples = Vec::new();
+        let (mut packets, mut frames, mut discontinuities) = (0u64, 0u64, 0u64);
+        let mut last: Option<PacketMeta> = None;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            std::thread::park_timeout(Duration::from_millis(50));
+            while let Some(meta) = opened.ring.pop(&mut samples) {
+                if let Some(previous) = last {
+                    assert!(meta.start.0 >= previous.start.0 + u64::from(previous.frames));
+                }
+                assert!(samples.iter().all(|s| s.is_finite()));
+                packets += 1;
+                frames += u64::from(meta.frames);
+                discontinuities += u64::from(meta.discontinuity);
+                last = Some(meta);
+            }
+        }
+        worker.stop(Duration::from_secs(2)).expect("joined");
+        let exit = exits_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("thread exit");
+        let ThreadEnd::Capture { exit } = exit.end else {
+            panic!("the capture thread ended with {:?}", exit.end);
+        };
+        let line = serde_json::json!({
+            "stream": opened.stream,
+            "popped": { "packets": packets, "frames": frames, "discontinuities": discontinuities },
+            "exit": exit,
+        });
+        println!("{line}");
+        assert_eq!(exit.error, None);
+        assert!(packets > 0);
+    }
 }
