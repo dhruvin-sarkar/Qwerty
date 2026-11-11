@@ -235,9 +235,10 @@ impl Recorder {
         }
     }
 
-    /// A feed event belongs to the recording its feed was set for. A command that arrived after
-    /// the last command drain was sent before the event's feed existed if it is a Start, so it is
-    /// applied first; a Stop already queued ends the recording this event was recorded for.
+    /// Records a feed event into the recording its feed belongs to. Commands that arrived since the
+    /// last drain are applied first, because a Start always precedes its feed's events (the
+    /// controller sends Start before SetRecorder); a queued Stop is applied after the event, which
+    /// was already in the feed when the recorder reached that Stop.
     // SPEC: the feed events of every recording share one channel (`spawn`'s `feed_events`) with no
     // per-recording mark, so a recorder that lags processing by a whole Stop → Start → SetRecorder
     // cycle would put the new recording's first events into the stopped one. Commands are applied
@@ -250,7 +251,9 @@ impl Recorder {
                     self.stop(reason);
                     return Flow::Continue;
                 }
-                Ok(cmd) => self.on_cmd(cmd),
+                Ok(cmd @ (RecorderCmd::Start { .. } | RecorderCmd::Event { .. })) => {
+                    self.on_cmd(cmd)
+                }
                 Err(TryRecvError::Empty) => {
                     self.record(event);
                     return Flow::Continue;
