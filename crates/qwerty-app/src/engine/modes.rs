@@ -703,6 +703,9 @@ mod tests {
         }
 
         // ---- Totality and determinism: every combination of representative inputs ----
+        // SPEC: §2.10 asks for "a proptest"; proptest is not among §2.1's dependencies and p35
+        // wants one function per ID, so the property runs here as an exhaustive sweep over
+        // representative values of every input (a superset of what random sampling would cover).
         let faults = [None, Some((ThreadName::Processing, "p"))];
         let activities = [
             Activity::None,
