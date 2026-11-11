@@ -245,8 +245,9 @@ fn read_reg_text(
             )
         };
         if read == ERROR_MORE_DATA {
-            // The value grew between the two calls: size again.
-            size = got;
+            // The value grew between the two calls: retry with the size it reported, always
+            // larger than this buffer, so the loop cannot spin on one size.
+            size = got.max(size + 2);
             continue;
         }
         if read == ERROR_FILE_NOT_FOUND {
