@@ -86,14 +86,25 @@ fn ri6_a_gap_follows_a_freed_slot_without_further_input() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(inputs.slots(), RING, "the full ring took a record");
 
-    assert_eq!(inputs.pop(), Ok(filler(0)));
+    // The clock starts before the pop and is read only after the gap is seen, so `waited` never
+    // understates the delay; yielding instead of sleeping keeps the overshoot to microseconds.
     let popped = Instant::now();
-    while inputs.slots() < RING && popped.elapsed() < Duration::from_millis(50) {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let waited = popped.elapsed();
-    assert_eq!(inputs.slots(), RING, "no gap within 50 ms of the pop");
+    assert_eq!(inputs.pop(), Ok(filler(0)));
+    let waited = loop {
+        if inputs.slots() == RING {
+            break popped.elapsed();
+        }
+        assert!(
+            popped.elapsed() < Duration::from_secs(1),
+            "no gap within 1 s of the pop"
+        );
+        std::thread::yield_now();
+    };
     println!("RI6: the gap arrived {waited:?} after the pop");
+    assert!(
+        waited <= Duration::from_millis(50),
+        "the gap arrived {waited:?} after the pop, over the 50 ms bound"
+    );
 
     for n in 1..RING as i64 {
         assert_eq!(inputs.pop(), Ok(filler(n)));
