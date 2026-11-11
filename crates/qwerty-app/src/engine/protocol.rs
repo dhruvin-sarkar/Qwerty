@@ -1339,10 +1339,11 @@ pub enum TelemetryFrame {
         noise: Decibels,
     },
     Spectrum {
-        // SPEC: §2.1.1's boxing rule (large_enum_variant) boxes both arrays, so a Spectrum frame
-        // makes two small allocations, where §2.5 calls Spectrum frames "fixed arrays".
+        // SPEC: §2.1.1's boxing rule (large_enum_variant) boxes the largest payload, `bands`; one
+        // Box clears the lint, so a Spectrum frame makes one small allocation where §2.5 calls
+        // Spectrum frames "fixed arrays". `noise` stays inline.
         bands: Box<[Decibels; BAND_COUNT]>,
-        noise: Box<[Decibels; BAND_COUNT]>,
+        noise: [Decibels; BAND_COUNT],
         flux: f32,
         threshold: f32,
     },
@@ -3046,7 +3047,7 @@ mod tests {
             ],
             4,
         );
-        let floor = || Box::new([TELEMETRY_DB_FLOOR; BAND_COUNT]);
+        let floor = [TELEMETRY_DB_FLOOR; BAND_COUNT];
         rt_variants(
             &[
                 TelemetryFrame::Meter {
@@ -3055,8 +3056,8 @@ mod tests {
                     noise: Decibels::new(-90.0),
                 },
                 TelemetryFrame::Spectrum {
-                    bands: floor(),
-                    noise: floor(),
+                    bands: Box::new(floor),
+                    noise: floor,
                     flux: 0.5,
                     threshold: 1.25,
                 },
