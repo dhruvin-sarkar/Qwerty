@@ -1642,16 +1642,17 @@ pub fn render_desk_recording(
     r.segment(SegmentKind::CalibrationNegatives);
     let set_downs = (0..8)
         .map(|i| {
-            let d = match i % 2 {
-                0 => Distractor::Knock {
+            let d = if i % 2 == 0 {
+                Distractor::Knock {
                     x: 0.30 + 0.05 * i as f64,
                     y: 0.40,
                     count: 1,
-                },
-                _ => Distractor::ObjectSetDown {
+                }
+            } else {
+                Distractor::ObjectSetDown {
                     x: 0.80 - 0.05 * i as f64,
                     y: 0.45,
-                },
+                }
             };
             (SEGMENT_LEAD_MS + i as f64 * 700.0, r.desk.distractor(&d, 0))
         })
