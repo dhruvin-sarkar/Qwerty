@@ -8,8 +8,8 @@
 
 use crate::assessment::{
     AssessmentError, ConfusionMatrix, EvaluationEvent, EvaluationReport, EvaluationSession,
-    LatencyStats, NegativeClassResult, OverallMetrics, PromptOutcome, PromptSchedule, ReportMeta,
-    ScriptedNegative, ScriptedPrompt, ZoneMetrics, ZoneRef,
+    LatencyStats, NegativeClassResult, OverallMetrics, PromptOutcome, PromptSchedule,
+    RejectionBreakdown, ReportMeta, ScriptedNegative, ScriptedPrompt, ZoneMetrics, ZoneRef,
 };
 use crate::audio::{
     AudioBlock, AudioFormat, BlockTime, CaptureMode, ChannelLayout, ClockMap, DeviceIdentity,
@@ -654,16 +654,19 @@ fn calibrate(rec: &Recording, options: &ReplayOptions) -> Result<Model, ReplayEr
     let run_end = last.end;
     let zones = rec.calibration_zones(run.start);
     let zone_ids: Vec<ZoneId> = zones.iter().map(|z| z.id).collect();
-    let mut session = CalibrationSession::new(CalibrationPlan {
-        zone_ids: zone_ids.clone(),
-        zone_labels: zones.iter().map(|z| z.label.clone()).collect(),
-        taps_per_zone: run.taps_per_zone,
-        format: rec.format,
-        seed: run.seed,
-        audio_budget_bytes: DEFAULT_AUDIO_BUDGET_BYTES,
-        detector: options.detector,
-        training: options.training.clone(),
-    })?;
+    let mut steps = Steering {
+        session: CalibrationSession::new(CalibrationPlan {
+            zone_ids: zone_ids.clone(),
+            zone_labels: zones.iter().map(|z| z.label.clone()).collect(),
+            taps_per_zone: run.taps_per_zone,
+            format: rec.format,
+            seed: run.seed,
+            audio_budget_bytes: DEFAULT_AUDIO_BUDGET_BYTES,
+            detector: options.detector,
+            training: options.training.clone(),
+        })?,
+        redo: None,
+    };
     let clock = rec.clock();
     let mut pieces = rec.pieces(options.block)?;
     let mut cursor = SegmentCursor {
@@ -688,19 +691,19 @@ fn calibrate(rec: &Recording, options: &ReplayOptions) -> Result<Model, ReplayEr
         for segment in cursor.enter(piece.start) {
             let prev = current.map(|s| &s.kind);
             current = Some(segment);
-            if segment.start < run.start || !is_calibration(&segment.kind) {
+            let in_run = segment.start >= run.start;
+            if !in_run || !is_calibration(&segment.kind) {
+                if in_run {
+                    steps.leave(clock.at(segment.start))?;
+                }
                 if segment.reconfigured {
                     front_end = None;
                 }
                 continue;
             }
-            if let Some(accepted) = steer(
-                &mut session,
-                &segment.kind,
-                prev,
-                &zone_ids,
-                clock.at(segment.start),
-            )? {
+            if let Some(accepted) =
+                steps.steer(&segment.kind, prev, &zone_ids, clock.at(segment.start))?
+            {
                 layout = Some(accepted);
             }
             if segment.reconfigured || front_end.is_none() {
@@ -724,23 +727,20 @@ fn calibrate(rec: &Recording, options: &ReplayOptions) -> Result<Model, ReplayEr
         fe.push_block(&block, clock.at(end), &mut veto, &mut inputs)
             .map_err(|error| SessionError::Detector { error })?;
         for input in inputs.drain(..) {
-            session.on_input(session_input(input))?;
+            steps.session.on_input(session_input(input))?;
         }
         let ambient = matches!(segment.kind, SegmentKind::Ambient);
-        if ambient && session.step_kind() == StepKind::Ambient {
-            session.push_ambient(&block)?;
+        if ambient && steps.session.step_kind() == StepKind::Ambient {
+            steps.session.push_ambient(&block)?;
         }
     }
-    match session.step_kind() {
-        StepKind::Negatives | StepKind::Zone => session.finish_negatives()?,
-        StepKind::Ready
-        | StepKind::Ambient
-        | StepKind::AmbientReview
-        | StepKind::ReadyToBuild
-        | StepKind::Building
-        | StepKind::Review
-        | StepKind::Failed => {}
-    }
+    // The segment after the run's last calibration segment is never entered above.
+    let run_end_time = match run_end {
+        Some(end) => clock.at(end),
+        None => clock.at(rec.end),
+    };
+    steps.leave(run_end_time)?;
+    let mut session = steps.session;
     let job = session.take_build_job()?;
     let model = job.run(&AtomicBool::new(false), &mut |_| {})?;
     session.finish_build(Ok(model))?;
@@ -754,95 +754,133 @@ fn calibrate(rec: &Recording, options: &ReplayOptions) -> Result<Model, ReplayEr
     })
 }
 
-/// Moves the session to the step a calibration segment stands for, with the calls live made: the
-/// Ambient segment starts (or retries) the ambient; the first zone segment accepts it; a later
-/// zone advances to it, walks back to it with undo, redoes it after the build step, or (the same
-/// zone again: live re-Configured after `restart_zone`) restarts it; the Negatives segment
-/// advances past the last zone. Returns the layout when the ambient is accepted.
-// SPEC: §1.18.3 forces the session's current zone to the segment's zone, but the session has no
-// call that sets a zone; replay reaches it with the session's own navigation, as live did. A
-// session error here means the replayed taps did not fill a zone that live advanced past.
-fn steer(
-    session: &mut CalibrationSession,
-    kind: &SegmentKind,
-    prev: Option<&SegmentKind>,
-    zone_ids: &[ZoneId],
-    now: HostTime,
-) -> Result<Option<ChannelLayout>, SessionError> {
-    match kind {
-        SegmentKind::Ambient => {
-            match session.step_kind() {
-                StepKind::AmbientReview => session.retry_ambient()?,
-                StepKind::Ambient => {}
-                StepKind::Ready
-                | StepKind::Zone
-                | StepKind::Negatives
-                | StepKind::ReadyToBuild
-                | StepKind::Building
-                | StepKind::Review
-                | StepKind::Failed => session.start_ambient()?,
+/// The calibration session replay drives as live did, and the zone it is redoing (the session
+/// keeps its own record of that private).
+struct Steering {
+    session: CalibrationSession,
+    redo: Option<ZoneIndex>,
+}
+
+impl Steering {
+    /// Moves the session to the step a calibration segment stands for, with the calls live made:
+    /// the Ambient segment starts (or retries) the ambient; the first zone segment accepts it; a
+    /// later zone advances to it or walks back to it with undo; a zone after the run left the zone
+    /// and negatives steps (`leave`) is redone; the same zone again (live re-Configured after
+    /// `restart_zone`) is restarted; the Negatives segment advances past the last zone. Returns
+    /// the layout when the ambient is accepted.
+    // SPEC: §1.18.3 forces the session's current zone to the segment's zone, but the session has
+    // no call that sets a zone; replay reaches it with the session's own navigation, as live did.
+    // A session error here means the replayed taps did not fill a zone that live advanced past.
+    fn steer(
+        &mut self,
+        kind: &SegmentKind,
+        prev: Option<&SegmentKind>,
+        zone_ids: &[ZoneId],
+        now: HostTime,
+    ) -> Result<Option<ChannelLayout>, SessionError> {
+        let session = &mut self.session;
+        match kind {
+            SegmentKind::Ambient => {
+                match session.step_kind() {
+                    StepKind::AmbientReview => session.retry_ambient()?,
+                    StepKind::Ambient => {}
+                    StepKind::Ready
+                    | StepKind::Zone
+                    | StepKind::Negatives
+                    | StepKind::ReadyToBuild
+                    | StepKind::Building
+                    | StepKind::Review
+                    | StepKind::Failed => session.start_ambient()?,
+                }
+                Ok(None)
             }
-            Ok(None)
-        }
-        SegmentKind::CalibrationZone { zone, .. } => {
-            let target = ZoneIndex(
-                zone_ids
-                    .iter()
-                    .position(|id| id == zone)
-                    // INVARIANT: the plan's zones are the run's zone segments' zones.
-                    .expect("every zone segment's zone is in the plan") as u16,
-            );
-            let mut accepted = None;
-            let restart = prev == Some(kind);
-            loop {
-                match session.view().step {
-                    CalibrationStep::AmbientReview { .. } => {
-                        accepted = Some(session.accept_ambient()?);
-                    }
-                    CalibrationStep::ReadyToBuild | CalibrationStep::Review { .. } => {
-                        session.redo_zone(target)?;
-                    }
-                    CalibrationStep::Zone { index, .. } if index.0 < target.0 => {
-                        session.advance(now)?;
-                    }
-                    CalibrationStep::Zone { index, .. } if index.0 > target.0 => {
-                        session.undo_last()?;
-                    }
-                    CalibrationStep::Zone { .. } => break,
-                    CalibrationStep::Negatives { .. } => session.undo_last()?,
-                    CalibrationStep::Ready
-                    | CalibrationStep::Ambient { .. }
-                    | CalibrationStep::Building { .. }
-                    | CalibrationStep::Failed { .. } => {
-                        // accept_ambient names the step the session is in.
-                        session.accept_ambient()?;
+            SegmentKind::CalibrationZone { zone, .. } => {
+                let target = ZoneIndex(
+                    zone_ids
+                        .iter()
+                        .position(|id| id == zone)
+                        // INVARIANT: the plan's zones are the run's zone segments' zones.
+                        .expect("every zone segment's zone is in the plan")
+                        as u16,
+                );
+                let mut accepted = None;
+                let restart = prev == Some(kind);
+                loop {
+                    match session.view().step {
+                        CalibrationStep::AmbientReview { .. } => {
+                            accepted = Some(session.accept_ambient()?);
+                        }
+                        CalibrationStep::ReadyToBuild | CalibrationStep::Review { .. } => {
+                            session.redo_zone(target)?;
+                            self.redo = Some(target);
+                        }
+                        CalibrationStep::Zone { index, .. } if index.0 < target.0 => {
+                            session.advance(now)?;
+                        }
+                        CalibrationStep::Zone { index, .. } if index.0 > target.0 => {
+                            session.undo_last()?;
+                        }
+                        CalibrationStep::Zone { .. } => break,
+                        CalibrationStep::Negatives { .. } => session.undo_last()?,
+                        CalibrationStep::Ready
+                        | CalibrationStep::Ambient { .. }
+                        | CalibrationStep::Building { .. }
+                        | CalibrationStep::Failed { .. } => {
+                            // accept_ambient names the step the session is in.
+                            session.accept_ambient()?;
+                        }
                     }
                 }
+                if restart {
+                    session.restart_zone()?;
+                }
+                Ok(accepted)
             }
-            if restart {
-                session.restart_zone()?;
+            SegmentKind::CalibrationNegatives => {
+                match session.step_kind() {
+                    StepKind::Negatives => {}
+                    StepKind::Ready
+                    | StepKind::Ambient
+                    | StepKind::AmbientReview
+                    | StepKind::Zone
+                    | StepKind::ReadyToBuild
+                    | StepKind::Building
+                    | StepKind::Review
+                    | StepKind::Failed => session.advance(now)?,
+                }
+                Ok(None)
             }
-            Ok(accepted)
+            SegmentKind::Idle
+            | SegmentKind::Listening
+            | SegmentKind::EvaluationPrompts
+            | SegmentKind::EvaluationNegative { .. }
+            | SegmentKind::Corpus { .. } => Ok(None),
         }
-        SegmentKind::CalibrationNegatives => {
-            match session.step_kind() {
-                StepKind::Negatives => {}
-                StepKind::Ready
-                | StepKind::Ambient
-                | StepKind::AmbientReview
-                | StepKind::Zone
-                | StepKind::ReadyToBuild
-                | StepKind::Building
-                | StepKind::Review
-                | StepKind::Failed => session.advance(now)?,
+    }
+
+    /// A segment of the run that is not a calibration segment: under the setup rule (p2 §2.8)
+    /// live left the zone or negatives step for ReadyToBuild, with `advance` out of a redone zone
+    /// and `finish_negatives` out of the negatives or (skipping them) the full last zone. Called
+    /// also at the run's end. Every other step has nothing to leave (Ready, AmbientReview).
+    // SPEC: live built at every ReadyToBuild and showed Review; replay builds once, after the run.
+    // A build depends only on the session's taps, negatives and seed, so the last build is the
+    // model live committed, and redo_zone takes ReadyToBuild as it takes Review.
+    fn leave(&mut self, now: HostTime) -> Result<(), SessionError> {
+        match self.session.step_kind() {
+            StepKind::Zone if self.redo.is_some() => {
+                self.session.advance(now)?;
+                self.redo = None;
             }
-            Ok(None)
+            StepKind::Zone | StepKind::Negatives => self.session.finish_negatives()?,
+            StepKind::Ready
+            | StepKind::Ambient
+            | StepKind::AmbientReview
+            | StepKind::ReadyToBuild
+            | StepKind::Building
+            | StepKind::Review
+            | StepKind::Failed => {}
         }
-        SegmentKind::Idle
-        | SegmentKind::Listening
-        | SegmentKind::EvaluationPrompts
-        | SegmentKind::EvaluationNegative { .. }
-        | SegmentKind::Corpus { .. } => Ok(None),
+        Ok(())
     }
 }
 
@@ -952,14 +990,13 @@ fn evaluate_v2(
         background_regime: model.model.background.regime.clone(),
         input_veto_enabled: true,
     };
-    let (report, errors) = assessor.finish(meta, rec.sidecar.created_at)?;
+    let evaluation = assessor.finish(meta, rec.sidecar.created_at)?;
     let agreement = live_agreement(rec, &decided);
     Ok(engine_replay(
         ReplayEngine::V2,
         Some(summary.clone()),
-        report,
+        evaluation,
         Some(agreement),
-        errors,
     ))
 }
 
@@ -1024,24 +1061,27 @@ fn live_agreement(rec: &Recording, replay: &[(SampleIndex, Option<ZoneId>)]) -> 
 fn engine_replay(
     engine: ReplayEngine,
     training: Option<TrainingSummary>,
-    report: EvaluationReport,
+    evaluation: Evaluation,
     live_agreement: Option<LiveAgreement>,
-    errors: Vec<ErrorDump>,
 ) -> EngineReplay {
     EngineReplay {
         engine,
         training,
-        confusion: report.confusion,
-        per_zone: report.per_zone,
-        overall: report.overall,
-        negatives: report.negatives,
-        algorithmic_latency: report.decision_latency,
+        confusion: evaluation.confusion,
+        per_zone: evaluation.per_zone,
+        overall: evaluation.overall,
+        negatives: evaluation.negatives,
+        algorithmic_latency: evaluation.latency,
         live_agreement,
-        errors,
+        errors: evaluation.errors,
     }
 }
 
 // ---- Evaluation shared by both engines ----
+
+/// The confusion matrix's columns after the K zone columns: Rejected, Vetoed, DetectorRejected,
+/// Invalid and Missed (`ConfusionMatrix`).
+const OUTCOME_COLUMNS: usize = 5;
 
 /// What a prompt was resolved by, for its error dump.
 #[derive(Debug, Clone, PartialEq)]
@@ -1052,17 +1092,69 @@ struct Evidence {
     v1_features: Option<Vec<f32>>,
 }
 
-/// The evaluation session on the recorded prompts and negative phases, and the evidence of each
-/// prompt's resolution.
-struct Assessor {
-    session: EvaluationSession,
-    events: Vec<EvaluationEvent>,
-    evidence: Vec<Option<Evidence>>,
+/// An engine's evaluation: `EngineReplay`'s fields from the evaluation, and the error dumps.
+struct Evaluation {
+    confusion: ConfusionMatrix,
+    per_zone: Vec<ZoneMetrics>,
+    overall: OverallMetrics,
+    negatives: Vec<NegativeClassResult>,
+    latency: LatencyStats,
+    errors: Vec<ErrorDump>,
+}
+
+/// A negative phase of a recording without prompts, and the decisions placed in it.
+struct NegativeTally {
+    phase: ScriptedNegative,
+    candidates: u32,
+    false_accepts: u32,
+    by_zone: Vec<u32>,
+}
+
+impl NegativeTally {
+    /// The phase's result, as the evaluation report gives a negative phase's.
+    fn result(self) -> NegativeClassResult {
+        let ticks = self.phase.end.since(self.phase.start).0;
+        let duration = Seconds::try_new(ticks as f64 / HostTime::TICKS_PER_SECOND as f64)
+            // INVARIANT: an i64 tick count divided by 10^7 is always finite.
+            .expect("a tick span in seconds is finite");
+        NegativeClassResult {
+            class: self.phase.class,
+            duration,
+            candidates: self.candidates,
+            false_accepts: self.false_accepts,
+            false_accepts_per_hour: if self.false_accepts == 0 {
+                0.0
+            } else {
+                f64::from(self.false_accepts) * 3600.0 / duration.get()
+            },
+            false_accepts_by_zone: self.by_zone,
+        }
+    }
+}
+
+/// How a replay scores the decisions (§1.18.3 step 4).
+enum Assessor {
+    /// The evaluation session on a `Scripted` schedule of the recorded prompts and negative
+    /// phases, and the evidence of each prompt's resolution.
+    Prompted {
+        session: Box<EvaluationSession>,
+        events: Vec<EvaluationEvent>,
+        evidence: Vec<Option<Evidence>>,
+    },
+    /// A recording without prompts (a calibration then Listening, as EN2 records for RP2; a
+    /// `--v2-corpus` recording): only its negative phases are scored.
+    // SPEC: `EvaluationSession::new` refuses a Scripted schedule without prompts (ZeroPrompts),
+    // which §1.17 leaves undefined, yet §1.18.3 replays such recordings and reports their Corpus
+    // false accepts. Replay tallies the phases by the session's rule (`on_decision`), and the
+    // prompt metrics are those of no prompts.
+    Unprompted {
+        zones: Vec<ZoneId>,
+        phases: Vec<NegativeTally>,
+    },
 }
 
 impl Assessor {
-    /// A `Scripted` schedule (§1.18.3 step 4): the recorded prompts, and a negative phase per
-    /// EvaluationNegative or Corpus segment.
+    /// The recorded prompts, and a negative phase per EvaluationNegative or Corpus segment.
     // SPEC: a prompt for a zone the model does not have cannot be scripted; no AssessmentError
     // names it, so it is `ScriptUnordered`, the error for a script that cannot be replayed (as
     // assessment.rs reports a zone index out of range).
@@ -1080,7 +1172,7 @@ impl Assessor {
                 reopened: p.reopened,
             });
         }
-        let negatives = rec
+        let negatives: Vec<ScriptedNegative> = rec
             .segments
             .iter()
             .filter_map(|s| {
@@ -1094,55 +1186,97 @@ impl Assessor {
                 })
             })
             .collect();
+        if prompts.is_empty() {
+            return Ok(Assessor::Unprompted {
+                zones: zones.iter().map(|z| z.id).collect(),
+                phases: negatives
+                    .into_iter()
+                    .map(|phase| NegativeTally {
+                        phase,
+                        candidates: 0,
+                        false_accepts: 0,
+                        by_zone: vec![0; zones.len()],
+                    })
+                    .collect(),
+            });
+        }
         let count = prompts.len();
         let session = EvaluationSession::new(
             zones.to_vec(),
             PromptSchedule::Scripted { prompts, negatives },
             clock.at(SampleIndex(0)),
         )?;
-        Ok(Assessor {
-            session,
+        Ok(Assessor::Prompted {
+            session: Box::new(session),
             events: Vec::new(),
             evidence: vec![None; count],
         })
     }
 
     fn decision(&mut self, d: &TapDecision, evidence: Evidence) {
-        self.session.on_decision(d, &mut self.events);
-        self.absorb(Some(evidence));
-    }
-
-    fn rejected(&mut self, r: &RejectedCandidate, at: HostTime) {
-        self.session.on_detector_rejected(r, at, &mut self.events);
-        let evidence = Evidence {
-            onset: rejected_onset(r),
-            descriptor: None,
-            scores: None,
-            v1_features: None,
-        };
-        self.absorb(Some(evidence));
-    }
-
-    fn tick(&mut self, now: HostTime) {
-        self.session.tick(now, &mut self.events);
-        self.absorb(None);
-    }
-
-    /// Records `evidence` for every prompt the last call resolved; a reopened prompt loses its.
-    fn absorb(&mut self, evidence: Option<Evidence>) {
-        for event in self.events.drain(..) {
-            match event {
-                EvaluationEvent::PromptResolved { index, .. } => {
-                    self.evidence[index as usize] = evidence.clone();
-                }
-                EvaluationEvent::PromptReopened { index, .. } => {
-                    self.evidence[index as usize] = None;
-                }
-                EvaluationEvent::PromptOpened { .. }
-                | EvaluationEvent::NegativeStarted { .. }
-                | EvaluationEvent::NegativeEnded { .. }
-                | EvaluationEvent::Finished => {}
+        match self {
+            Assessor::Prompted {
+                session,
+                events,
+                evidence: dumps,
+            } => {
+                session.on_decision(d, events);
+                absorb(events, dumps, Some(evidence));
             }
+            Assessor::Unprompted { phases, .. } => {
+                // `EvaluationSession::on_decision`'s rule: a decision counts for the phase that
+                // holds its onset time (its decision time when untimed).
+                let t = match d.onset_time {
+                    Some(t0) => t0,
+                    None => d.decided_at,
+                };
+                if let Some(tally) = phases
+                    .iter_mut()
+                    .find(|n| n.phase.start <= t && t < n.phase.end)
+                {
+                    tally.candidates += 1;
+                    if let DecisionOutcome::Accepted { zone, .. } = d.outcome {
+                        tally.false_accepts += 1;
+                        tally.by_zone[usize::from(zone.0)] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A detector rejection only ever resolves a prompt.
+    fn rejected(&mut self, r: &RejectedCandidate, at: HostTime) {
+        match self {
+            Assessor::Prompted {
+                session,
+                events,
+                evidence,
+            } => {
+                session.on_detector_rejected(r, at, events);
+                let resolved_by = Evidence {
+                    onset: rejected_onset(r),
+                    descriptor: None,
+                    scores: None,
+                    v1_features: None,
+                };
+                absorb(events, evidence, Some(resolved_by));
+            }
+            Assessor::Unprompted { .. } => {}
+        }
+    }
+
+    /// The schedule's clock: prompts open and expire with it; unprompted phases need none.
+    fn tick(&mut self, now: HostTime) {
+        match self {
+            Assessor::Prompted {
+                session,
+                events,
+                evidence,
+            } => {
+                session.tick(now, events);
+                absorb(events, evidence, None);
+            }
+            Assessor::Unprompted { .. } => {}
         }
     }
 
@@ -1152,33 +1286,108 @@ impl Assessor {
         mut self,
         meta: ReportMeta,
         run_at: DateTime<Utc>,
-    ) -> Result<(EvaluationReport, Vec<ErrorDump>), ReplayError> {
+    ) -> Result<Evaluation, ReplayError> {
         self.tick(HostTime(i64::MAX));
-        let report = self.session.finish(meta, run_at)?;
-        let errors = report
-            .prompts
-            .iter()
-            .zip(self.evidence)
-            .enumerate()
-            .filter(|(_, (p, _))| !matches!(p.outcome, PromptOutcome::Correct { .. }))
-            .map(|(i, (p, evidence))| {
-                let (onset, descriptor, scores, v1_features) = match evidence {
-                    Some(e) => (Some(e.onset), e.descriptor, e.scores, e.v1_features),
-                    None => (None, None, None, None),
-                };
-                ErrorDump {
-                    prompt: i as u32,
-                    expected: p.zone,
-                    outcome: p.outcome.clone(),
-                    onset,
-                    descriptor,
-                    scores,
-                    v1_features,
-                }
-            })
-            .collect();
-        Ok((report, errors))
+        match self {
+            Assessor::Prompted {
+                session, evidence, ..
+            } => {
+                let report = session.finish(meta, run_at)?;
+                let errors = error_dumps(&report, evidence);
+                Ok(Evaluation {
+                    confusion: report.confusion,
+                    per_zone: report.per_zone,
+                    overall: report.overall,
+                    negatives: report.negatives,
+                    latency: report.decision_latency,
+                    errors,
+                })
+            }
+            Assessor::Unprompted { zones, phases } => {
+                let k = zones.len();
+                Ok(Evaluation {
+                    confusion: ConfusionMatrix {
+                        zones: k as u32,
+                        counts: vec![vec![0; k + OUTCOME_COLUMNS]; k],
+                    },
+                    per_zone: zones
+                        .into_iter()
+                        .map(|zone| ZoneMetrics {
+                            zone,
+                            prompts: 0,
+                            correct: 0,
+                            wrong: 0,
+                            rejected: RejectionBreakdown::default(),
+                            missed: 0,
+                            recall: 0.0,
+                        })
+                        .collect(),
+                    overall: OverallMetrics {
+                        prompts: 0,
+                        correct: 0,
+                        wrong: 0,
+                        rejected: 0,
+                        missed: 0,
+                        accuracy: 0.0,
+                        wrong_action_rate: 0.0,
+                        rejection_rate: 0.0,
+                    },
+                    negatives: phases.into_iter().map(NegativeTally::result).collect(),
+                    latency: LatencyStats::from_samples(&[], 0),
+                    errors: Vec::new(),
+                })
+            }
+        }
     }
+}
+
+/// Records `evidence` for every prompt the session's last call resolved; a reopened prompt loses
+/// its.
+fn absorb(
+    events: &mut Vec<EvaluationEvent>,
+    dumps: &mut [Option<Evidence>],
+    evidence: Option<Evidence>,
+) {
+    for event in events.drain(..) {
+        match event {
+            EvaluationEvent::PromptResolved { index, .. } => {
+                dumps[index as usize] = evidence.clone();
+            }
+            EvaluationEvent::PromptReopened { index, .. } => {
+                dumps[index as usize] = None;
+            }
+            EvaluationEvent::PromptOpened { .. }
+            | EvaluationEvent::NegativeStarted { .. }
+            | EvaluationEvent::NegativeEnded { .. }
+            | EvaluationEvent::Finished => {}
+        }
+    }
+}
+
+/// An error dump for every prompt the report does not give Correct, in prompt order.
+fn error_dumps(report: &EvaluationReport, evidence: Vec<Option<Evidence>>) -> Vec<ErrorDump> {
+    report
+        .prompts
+        .iter()
+        .zip(evidence)
+        .enumerate()
+        .filter(|(_, (p, _))| !matches!(p.outcome, PromptOutcome::Correct { .. }))
+        .map(|(i, (p, evidence))| {
+            let (onset, descriptor, scores, v1_features) = match evidence {
+                Some(e) => (Some(e.onset), e.descriptor, e.scores, e.v1_features),
+                None => (None, None, None, None),
+            };
+            ErrorDump {
+                prompt: i as u32,
+                expected: p.zone,
+                outcome: p.outcome.clone(),
+                onset,
+                descriptor,
+                scores,
+                v1_features,
+            }
+        })
+        .collect()
 }
 
 // ---- V1 ----
@@ -1307,6 +1516,17 @@ fn replay_v1(rec: &Recording, options: &ReplayOptions) -> Result<EngineReplay, R
             }
         }
     }
+    // `ClassifierParams::train` takes its zones from the samples, so a zone without a tap would
+    // be missing from the classifier the evaluation scores every zone with.
+    if let Some(empty) = (0..zones.len()).find(|&z| session.zone_sample_count(z) == 0) {
+        return Err(ReplayError::V1 {
+            detail: format!(
+                "the v1 detector found no tap in zone {}'s calibration segments, so the v1 \
+                 classifier cannot be trained on it",
+                zones[empty].label
+            ),
+        });
+    }
     let samples: Vec<(ZoneId, FeatureVector)> = session
         .per_zone_samples()
         .iter()
@@ -1403,8 +1623,8 @@ fn evaluate_v1(
         },
         input_veto_enabled: false,
     };
-    let (report, errors) = assessor.finish(meta, rec.sidecar.created_at)?;
-    Ok(engine_replay(ReplayEngine::V1, None, report, None, errors))
+    let evaluation = assessor.finish(meta, rec.sidecar.created_at)?;
+    Ok(engine_replay(ReplayEngine::V1, None, evaluation, None))
 }
 
 /// A v1 classification as the `TapDecision` the evaluation session scores: Accepted for the
@@ -1451,7 +1671,8 @@ fn v1_decision(
                         .iter()
                         .find(|d| d.zone_id == z.id)
                         .map(|d| f64::from(d.centroid_distance))
-                        // INVARIANT: the classifier was trained on exactly these zones.
+                        // INVARIANT: replay_v1 trains only when every zone has a tap, and train
+                        // gives every zone of its samples a centroid.
                         .expect("every zone has a centroid");
                     distance * distance
                 })
@@ -2152,6 +2373,149 @@ mod tests {
         assert_eq!(
             run_replay(&dir, &options),
             Err(ReplayError::NoCalibrationAndNoProfile)
+        );
+    }
+
+    /// The rendered recording's CalibrationZone segment kinds, in stream order.
+    fn zone_segments(sidecar: &Sidecar) -> Vec<SegmentKind> {
+        sidecar
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                SidecarEvent::Segment { kind, .. } => {
+                    matches!(kind, SegmentKind::CalibrationZone { .. }).then(|| kind.clone())
+                }
+                SidecarEvent::CalibrationStarted { .. }
+                | SidecarEvent::Prompt { .. }
+                | SidecarEvent::Input { .. }
+                | SidecarEvent::SelfOutput { .. }
+                | SidecarEvent::Decision { .. } => None,
+            })
+            .collect()
+    }
+
+    /// A recording without Prompt events (a calibration then Listening, as EN2 records for RP2;
+    /// a `--v2-corpus` recording) replays on both engines: no prompt is scored, and the Corpus
+    /// phases give the false accepts the same phases give in an evaluation.
+    #[test]
+    fn a_recording_without_prompts_replays() {
+        let (_tmp, dir) = render("no-prompts", DeskScene::Negatives, 0xA5);
+        let options = options(vec![ReplayEngine::V2, ReplayEngine::V1]);
+        let evaluated = run_replay(&dir, &options).expect("the evaluation replays");
+
+        let mut sidecar = read_sidecar(&dir);
+        sidecar
+            .events
+            .retain(|e| !matches!(e, SidecarEvent::Prompt { .. }));
+        for e in &mut sidecar.events {
+            if let SidecarEvent::Segment { kind, .. } = e {
+                if *kind == SegmentKind::EvaluationPrompts {
+                    *kind = SegmentKind::Listening;
+                } else if let SegmentKind::EvaluationNegative { class } = kind {
+                    *kind = SegmentKind::Corpus {
+                        class: class.clone(),
+                    };
+                }
+            }
+        }
+        write_sidecar(&dir, &sidecar);
+        let unprompted = run_replay(&dir, &options).expect("the unprompted recording replays");
+
+        assert_eq!(unprompted.results.len(), 2);
+        let shape = |c: &ConfusionMatrix| c.counts.iter().map(Vec::len).collect::<Vec<_>>();
+        for (r, e) in unprompted.results.iter().zip(&evaluated.results) {
+            assert_eq!(r.engine, e.engine);
+            assert_eq!(r.training, e.training, "{:?}: one calibration", r.engine);
+            assert_eq!(r.overall.prompts, 0, "{:?}", r.engine);
+            assert_eq!((r.overall.accuracy, r.overall.rejection_rate), (0.0, 0.0));
+            assert!(r.per_zone.iter().all(|z| z.prompts == 0 && z.recall == 0.0));
+            assert_eq!(
+                shape(&r.confusion),
+                shape(&e.confusion),
+                "the evaluation's shape"
+            );
+            assert!(r.confusion.counts.iter().flatten().all(|&n| n == 0));
+            assert_eq!(r.algorithmic_latency.count, 0);
+            assert!(r.errors.is_empty());
+            // The pipeline ran over the same segments, so it decided the same taps, and the
+            // Corpus phases tally them as the evaluation's negative phases did.
+            assert_eq!(r.live_agreement, e.live_agreement, "{:?}", r.engine);
+            assert_eq!(r.negatives.len(), 6);
+            assert_eq!(r.negatives, e.negatives, "{:?}", r.engine);
+        }
+    }
+
+    /// A zone redone after the build (live: Review, then redo_zone, then the redone zone's
+    /// segment) replaces that zone's taps and keeps the negatives collected before the build.
+    #[test]
+    fn a_zone_redone_after_the_build_replaces_its_taps() {
+        let (_tmp, dir) = render("redo", DeskScene::CalibrateEvaluate, 0xA6);
+        let options = options(vec![ReplayEngine::V2]);
+        let rendered = read_sidecar(&dir);
+        let base = run_replay(&dir, &options).expect("the rendered run replays");
+        let base = base.results[0].training.clone().expect("a V2 summary");
+        assert!(!base.negatives.is_empty(), "the run collected negatives");
+
+        let zones = zone_segments(&rendered);
+        for redone in [zones[0].clone(), zones[zones.len() - 1].clone()] {
+            // The prompts' segment (after CalibrationNegatives and the build's Idle) becomes the
+            // redone zone's segment: its taps fill the zone again.
+            let mut redo = rendered.clone();
+            for e in &mut redo.events {
+                if let SidecarEvent::Segment { kind, .. } = e {
+                    if *kind == SegmentKind::EvaluationPrompts {
+                        *kind = redone.clone();
+                    }
+                }
+            }
+            write_sidecar(&dir, &redo);
+            let report = run_replay(&dir, &options).expect("the redo replays");
+            let training = report.results[0].training.clone().expect("a V2 summary");
+            let ids = |t: &TrainingSummary| t.zones.iter().map(|z| z.zone).collect::<Vec<_>>();
+            assert_eq!(ids(&training), ids(&base), "{redone:?}: the plan's zones");
+            assert!(
+                training
+                    .zones
+                    .iter()
+                    .all(|z| z.taps == RENDER_TAPS_PER_ZONE),
+                "{redone:?}: {:?}",
+                training.zones
+            );
+            assert_eq!(training.negatives, base.negatives, "{redone:?}");
+            assert_ne!(training, base, "{redone:?}: the redone zone's taps changed");
+        }
+    }
+
+    /// A zone in which the v1 detector finds no tap leaves the v1 classifier without that zone:
+    /// the V1 replay fails with a V1 error, never a panic.
+    #[test]
+    fn v1_refuses_a_zone_without_v1_taps() {
+        let (_tmp, dir) = render("v1-empty-zone", DeskScene::CalibrateEvaluate, 0xA7);
+        let mut sidecar = read_sidecar(&dir);
+        // The trailing Idle segment holds only the desk's floor: it becomes a third zone's.
+        let last = sidecar
+            .events
+            .iter_mut()
+            .filter_map(|e| match e {
+                SidecarEvent::Segment { start, kind, .. } => Some((*start, kind)),
+                SidecarEvent::CalibrationStarted { .. }
+                | SidecarEvent::Prompt { .. }
+                | SidecarEvent::Input { .. }
+                | SidecarEvent::SelfOutput { .. }
+                | SidecarEvent::Decision { .. } => None,
+            })
+            .max_by_key(|(start, _)| *start)
+            .expect("the recording has segments");
+        assert_eq!(*last.1, SegmentKind::Idle);
+        *last.1 = SegmentKind::CalibrationZone {
+            zone: ZoneId::from_uuid(Uuid::from_u128(0xE3)),
+            label: "Zone 3".into(),
+        };
+        write_sidecar(&dir, &sidecar);
+        let result = run_replay(&dir, &options(vec![ReplayEngine::V1]));
+        assert!(
+            matches!(&result, Err(ReplayError::V1 { detail }) if detail.contains("Zone 3")),
+            "{result:?}"
         );
     }
 }
