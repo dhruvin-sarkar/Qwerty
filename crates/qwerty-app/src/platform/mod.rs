@@ -18,6 +18,7 @@ pub mod windows;
 mod region_select;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use qwerty_core::profile::{ActionSpec, KeyCombo, ScreenshotMode, SystemSound};
 use qwerty_core::veto::{OutputId, SelfOutputKind};
@@ -119,41 +120,95 @@ impl std::error::Error for ActionError {}
 
 /// One trait, one implementation per OS. Windows is the only implementation
 /// today; the signatures stay platform-neutral so Linux can follow without
-/// touching the DSP core (`ARCHITECTURE.md`). The UI thread is the only caller
-/// (`ARCHITECTURE.md` → Threading model).
+/// touching the DSP core (`ARCHITECTURE.md`). v1 calls it from the UI thread and
+/// its per-tap worker threads; v2 from the engine's one dispatch thread (p2 §2.6).
 pub trait PlatformActions {
     fn open_uri(&self, uri: &str) -> Result<(), ActionError>;
     fn open_path(&self, path: &Path) -> Result<(), ActionError>;
-    fn run_command(&self, cmd: &str, args: &[String]) -> Result<(), ActionError>;
+    /// The started child: v2 watches it (p2 §2.6); v1 drops it, which neither waits on nor kills it.
+    fn run_command(&self, cmd: &str, args: &[String]) -> Result<std::process::Child, ActionError>;
     fn copy_to_clipboard(&self, text: &str) -> Result<(), ActionError>;
     fn speak(&self, text: &str) -> Result<(), ActionError>;
     fn send_keystroke(&self, combo: &KeyCombo) -> Result<(), ActionError>;
     fn play_sound(&self, sound: SystemSound) -> Result<(), ActionError>;
-    fn screenshot_to_clipboard(&self, mode: ScreenshotMode) -> Result<(), ActionError>;
+    fn screenshot_to_clipboard(&self, mode: ScreenshotMode) -> Result<Screenshot, ActionError>;
     fn notify(&self, toast: &ToastSpec) -> Result<(), ActionError>;
+    /// Registers the engine's observer of this platform's own output (p2 §2.6). Without one (v1)
+    /// the observer calls are skipped: there is simply no consumer.
+    fn set_output_observer(&self, observer: Arc<dyn OutputObserver>);
+    /// Ends all queued speech: each queued utterance gets exactly one `speech_finished`, in order. A
+    /// no-op when nothing is queued or no SpeechWorker exists. Returns within 1 s.
+    fn stop_speech(&self);
 }
 
-/// Route one [`ActionSpec`] to the matching platform call. `VisualOnly` is a
-/// no-op here — it produces only in-app visual feedback, no side effect.
-pub fn dispatch(action: &ActionSpec, platform: &dyn PlatformActions) -> Result<(), ActionError> {
+/// What a screenshot action did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screenshot {
+    Copied,
+    /// The user dismissed the region selection (Escape): a deliberate no-capture, not a failure.
+    Canceled,
+}
+
+/// What one dispatched action did (p2 §2.6).
+#[derive(Debug)]
+pub enum Dispatched {
+    Done,
+    /// RunCommand: the child runs; the dispatch thread watches it.
+    Spawned(std::process::Child),
+    /// The user cancelled (screenshot region selection); the chain stops.
+    Canceled,
+}
+
+/// What `reconcile_start_with_windows` changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKeyChange {
+    Unchanged,
+    Written,
+    Deleted,
+}
+
+/// Route one [`ActionSpec`] to the matching platform call. Argument order and return type change
+/// from v1's `dispatch(action, platform) -> Result<(), ActionError>` (p2 §2.6).
+/// `ActionSpec::VisualOnly => Ok(Dispatched::Done)`, as v1's arm does, until WP-D1 deletes the
+/// variant (XR-P01-14): v1's action editor and `dispatch_chain` still reach it; a v2 profile cannot
+/// hold it (ProfileError::UnsupportedAction).
+pub fn dispatch(
+    platform: &dyn PlatformActions,
+    action: &ActionSpec,
+) -> Result<Dispatched, ActionError> {
     match action {
         // Launching an executable and opening a file/folder both go through the
         // shell open verb on Windows; the distinction is intent, not mechanism.
-        ActionSpec::OpenApp { path } | ActionSpec::OpenPath { path } => {
-            platform.open_path(Path::new(path))
+        ActionSpec::OpenApp { path } | ActionSpec::OpenPath { path } => platform
+            .open_path(Path::new(path))
+            .map(|()| Dispatched::Done),
+        ActionSpec::OpenUrl { url } => platform.open_uri(url).map(|()| Dispatched::Done),
+        ActionSpec::RunCommand { command, args } => {
+            platform.run_command(command, args).map(Dispatched::Spawned)
         }
-        ActionSpec::OpenUrl { url } => platform.open_uri(url),
-        ActionSpec::RunCommand { command, args } => platform.run_command(command, args),
-        ActionSpec::CopyToClipboard { text } => platform.copy_to_clipboard(text),
-        ActionSpec::Speak { text } => platform.speak(text),
-        ActionSpec::PlaySound { sound } => platform.play_sound(*sound),
-        ActionSpec::ShowToast { title, body } => platform.notify(&ToastSpec {
-            title: title.clone(),
-            body: body.clone(),
-        }),
-        ActionSpec::SendKeystroke { combo } => platform.send_keystroke(combo),
-        ActionSpec::Screenshot { mode } => platform.screenshot_to_clipboard(*mode),
-        ActionSpec::VisualOnly => Ok(()),
+        ActionSpec::CopyToClipboard { text } => {
+            platform.copy_to_clipboard(text).map(|()| Dispatched::Done)
+        }
+        ActionSpec::Speak { text } => platform.speak(text).map(|()| Dispatched::Done),
+        ActionSpec::PlaySound { sound } => platform.play_sound(*sound).map(|()| Dispatched::Done),
+        ActionSpec::ShowToast { title, body } => platform
+            .notify(&ToastSpec {
+                title: title.clone(),
+                body: body.clone(),
+            })
+            .map(|()| Dispatched::Done),
+        ActionSpec::SendKeystroke { combo } => {
+            platform.send_keystroke(combo).map(|()| Dispatched::Done)
+        }
+        ActionSpec::Screenshot { mode } => {
+            platform
+                .screenshot_to_clipboard(*mode)
+                .map(|shot| match shot {
+                    Screenshot::Copied => Dispatched::Done,
+                    Screenshot::Canceled => Dispatched::Canceled,
+                })
+        }
+        ActionSpec::VisualOnly => Ok(Dispatched::Done),
     }
 }
 
@@ -161,13 +216,13 @@ pub fn dispatch(action: &ActionSpec, platform: &dyn PlatformActions) -> Result<(
 /// → macro chains). Returns the index of the failing action alongside its error
 /// so the UI can point at exactly which step failed. Called live from the Home
 /// listening loop when an accepted tap classifies to a zone (`shell.rs` →
-/// `reconcile_capture`), and from the per-action Test button.
+/// `reconcile_capture`). A spawned child is dropped and a cancelled screenshot is `Ok`, as in v1.
 pub fn dispatch_chain(
     actions: &[ActionSpec],
     platform: &dyn PlatformActions,
 ) -> Result<(), (usize, ActionError)> {
     for (i, action) in actions.iter().enumerate() {
-        dispatch(action, platform).map_err(|e| (i, e))?;
+        dispatch(platform, action).map(|_| ()).map_err(|e| (i, e))?;
     }
     Ok(())
 }
@@ -237,6 +292,19 @@ pub fn set_start_with_windows(_enabled: bool) -> Result<(), String> {
     Err("Start with Windows is only available on Windows.".to_string())
 }
 
+/// The HKCU Run value "Qwerty": read it; when `enabled`, write `"<exe path>" <args>` if it is
+/// missing or different; when not, delete it if present; otherwise change nothing (p2 §2.6,
+/// XR-UI-18). v1's `set_start_with_windows(enabled)` is untouched; WP-D1 deletes it.
+#[cfg(windows)]
+pub fn reconcile_start_with_windows(enabled: bool, args: &str) -> Result<RunKeyChange, String> {
+    windows::reconcile_start_with_windows(enabled, args)
+}
+
+#[cfg(not(windows))]
+pub fn reconcile_start_with_windows(_enabled: bool, _args: &str) -> Result<RunKeyChange, String> {
+    Err("Start with Windows is only available on Windows.".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,8 +349,16 @@ mod tests {
         fn open_path(&self, _: &Path) -> Result<(), ActionError> {
             self.record("open_path")
         }
-        fn run_command(&self, _: &str, _: &[String]) -> Result<(), ActionError> {
-            self.record("run_command")
+        fn run_command(&self, _: &str, _: &[String]) -> Result<std::process::Child, ActionError> {
+            self.record("run_command")?;
+            // A real, immediately exiting child: `Child` has no public constructor.
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+                .map_err(|e| ActionError::LaunchFailed {
+                    target: "cmd".into(),
+                    reason: e.to_string(),
+                })
         }
         fn copy_to_clipboard(&self, _: &str) -> Result<(), ActionError> {
             self.record("copy_to_clipboard")
@@ -296,11 +372,90 @@ mod tests {
         fn play_sound(&self, _: SystemSound) -> Result<(), ActionError> {
             self.record("play_sound")
         }
-        fn screenshot_to_clipboard(&self, _: ScreenshotMode) -> Result<(), ActionError> {
+        fn screenshot_to_clipboard(&self, _: ScreenshotMode) -> Result<Screenshot, ActionError> {
             self.record("screenshot_to_clipboard")
+                .map(|()| Screenshot::Copied)
         }
         fn notify(&self, _: &ToastSpec) -> Result<(), ActionError> {
             self.record("notify")
+        }
+        fn set_output_observer(&self, _: Arc<dyn OutputObserver>) {
+            self.calls
+                .borrow_mut()
+                .push("set_output_observer".to_string());
+        }
+        fn stop_speech(&self) {
+            self.calls.borrow_mut().push("stop_speech".to_string());
+        }
+    }
+
+    /// A screenshot the user cancels is a `Canceled` dispatch, and a chain treats it as v1 did.
+    struct CancelingScreenshots;
+
+    impl PlatformActions for CancelingScreenshots {
+        fn open_uri(&self, _: &str) -> Result<(), ActionError> {
+            Ok(())
+        }
+        fn open_path(&self, _: &Path) -> Result<(), ActionError> {
+            Ok(())
+        }
+        fn run_command(&self, cmd: &str, _: &[String]) -> Result<std::process::Child, ActionError> {
+            Err(ActionError::TargetNotFound { target: cmd.into() })
+        }
+        fn copy_to_clipboard(&self, _: &str) -> Result<(), ActionError> {
+            Ok(())
+        }
+        fn speak(&self, _: &str) -> Result<(), ActionError> {
+            Ok(())
+        }
+        fn send_keystroke(&self, _: &KeyCombo) -> Result<(), ActionError> {
+            Ok(())
+        }
+        fn play_sound(&self, _: SystemSound) -> Result<(), ActionError> {
+            Ok(())
+        }
+        fn screenshot_to_clipboard(&self, _: ScreenshotMode) -> Result<Screenshot, ActionError> {
+            Ok(Screenshot::Canceled)
+        }
+        fn notify(&self, _: &ToastSpec) -> Result<(), ActionError> {
+            Ok(())
+        }
+        fn set_output_observer(&self, _: Arc<dyn OutputObserver>) {}
+        fn stop_speech(&self) {}
+    }
+
+    #[test]
+    fn a_cancelled_screenshot_dispatches_canceled_and_a_v1_chain_goes_on() {
+        let shot = ActionSpec::Screenshot {
+            mode: ScreenshotMode::RegionSelect,
+        };
+        assert!(matches!(
+            dispatch(&CancelingScreenshots, &shot),
+            Ok(Dispatched::Canceled)
+        ));
+        let chain = vec![
+            shot,
+            ActionSpec::RunCommand {
+                command: "missing".into(),
+                args: vec![],
+            },
+        ];
+        let err = dispatch_chain(&chain, &CancelingScreenshots).unwrap_err();
+        assert_eq!(err.0, 1);
+    }
+
+    #[test]
+    fn run_command_dispatches_the_spawned_child() {
+        let mock = MockPlatform::new();
+        let spec = ActionSpec::RunCommand {
+            command: "c".into(),
+            args: vec![],
+        };
+        match dispatch(&mock, &spec) {
+            Ok(Dispatched::Spawned(mut child)) => {
+                child.wait().expect("the child exits");
+            }
+            other => panic!("expected Spawned, got {other:?}"),
         }
     }
 
@@ -344,7 +499,7 @@ mod tests {
         ];
         for (spec, expected) in cases {
             let mock = MockPlatform::new();
-            dispatch(&spec, &mock).unwrap();
+            dispatch(&mock, &spec).unwrap();
             assert_eq!(mock.calls.borrow().as_slice(), &[expected.to_string()]);
         }
     }
@@ -352,7 +507,7 @@ mod tests {
     #[test]
     fn visual_only_is_a_no_op() {
         let mock = MockPlatform::new();
-        dispatch(&ActionSpec::VisualOnly, &mock).unwrap();
+        dispatch(&mock, &ActionSpec::VisualOnly).unwrap();
         assert!(mock.calls.borrow().is_empty());
     }
 

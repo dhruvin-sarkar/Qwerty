@@ -288,7 +288,9 @@ impl ActionEditor {
         }
         if let Some(i) = test_req {
             if let Some(spec) = actions.get(i) {
-                let res = dispatch(spec, platform).map_err(|e| e.to_string());
+                let res = dispatch(platform, spec)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
                 self.last_test = Some((zone_id, i, res));
             }
         }
