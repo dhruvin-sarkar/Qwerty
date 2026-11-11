@@ -39,8 +39,10 @@ use qwerty_core::veto::{InputEvent, InputKind, VetoParams, VetoTimeline};
 /// INV2: accuracy drop (percentage points) from nominal taps to 0.5-3 ms contacts at 15-25 dB
 /// peak SNR. Measured 80.0 (nominal 1.000, varied 0.200).
 const BASELINE_INV2_DROP: f64 = 80.0;
-/// DEC1: fraction of light-desk taps the detector rejects `NotDecaying`. Measured 0.485 (97/200).
-const BASELINE_NOT_DECAYING_LIGHT: f64 = 0.485;
+/// DEC1: fraction of light-desk taps whose own trigger the detector rejects `NotDecaying`.
+/// Measured 0.46 (92/200; the 5 further `NotDecaying` outputs are tail retriggers of taps that
+/// passed).
+const BASELINE_NOT_DECAYING_LIGHT: f64 = 0.46;
 /// FA2: Fire count per distractor class, each measured at the value it is set to.
 const BASELINE_KEYSTROKE_PAIR: usize = 0;
 const BASELINE_MOUSE_CLICK: usize = 0;
@@ -969,27 +971,61 @@ fn dec1_light_damping_not_decaying_fraction_stays_within_its_baseline() {
     let mut rng = Rng64::derive(DESK_SEED, STREAM_DEC1, 0);
     let taps = 50 * ZONES;
     let mut x = desk.floor(frames(hz, LEAD_MS));
+    // Each tap's frame 0: its sound starts there, its onset one path delay later.
+    let mut starts = Vec::with_capacity(taps);
     for i in 0..taps {
         let tap = desk.tap(&nominal(i % ZONES, &mut rng), 0);
         let gap = frames(hz, rng.range(TAP_GAP_MS.0, TAP_GAP_MS.1));
+        starts.push((x.len() / ch + gap) as u64);
         x.extend(on_floor(&mut desk, gap, &tap));
     }
     x.extend(desk.floor(frames(hz, 500.0)));
     assert_eq!(x.len() % ch, 0);
     let outputs = detect(format, &x);
-    let not_decaying = outputs
-        .iter()
-        .filter(|o| match o {
-            DetectorOutput::Rejected(r) => r.reason == RejectReason::NotDecaying,
-            DetectorOutput::Candidate(_) | DetectorOutput::InputFault(_) => false,
-        })
-        .count();
-    let passed = outputs
-        .iter()
-        .filter(|o| matches!(o, DetectorOutput::Candidate(_)))
-        .count();
+
+    // The fraction counts taps, not outputs: a tap that passes can retrigger in its ringing
+    // tail, and the decay gate is right to reject that retrigger. Each output goes to the tap
+    // whose span holds its trigger; a trigger is the centre of a frame holding the tap's sound,
+    // so it lies less than one hop (half a frame) before the tap's frame 0, and each span starts
+    // one hop early. A tap's verdict is its earliest output, skipping `Superseded` ones (a
+    // superseded trigger hands the tap on to a stronger one); the rest are tail retriggers.
+    // The earliest trigger and, when rejected, the reason (None: a candidate).
+    type Verdict = (SampleIndex, Option<RejectReason>);
+    let h = hop(hz) as u64;
+    let mut verdicts: Vec<Option<Verdict>> = vec![None; taps];
+    let mut not_decaying_outputs = 0usize;
+    for o in &outputs {
+        let (trigger, reason) = match o {
+            DetectorOutput::Candidate(c) => (c.trigger, None),
+            DetectorOutput::Rejected(r) => (r.trigger, Some(r.reason)),
+            DetectorOutput::InputFault(f) => panic!("DEC1: input fault {f:?} on a clean stream"),
+        };
+        not_decaying_outputs += usize::from(reason == Some(RejectReason::NotDecaying));
+        if reason == Some(RejectReason::Superseded) {
+            continue;
+        }
+        let i = starts.partition_point(|&s| s <= trigger.0 + h);
+        assert!(
+            i > 0,
+            "DEC1: a trigger at frame {} before the first tap",
+            trigger.0
+        );
+        let verdict = &mut verdicts[i - 1];
+        if verdict.is_none_or(|(first, _)| trigger < first) {
+            *verdict = Some((trigger, reason));
+        }
+    }
+    let count = |want: fn(&Option<Verdict>) -> bool| verdicts.iter().filter(|v| want(v)).count();
+    let not_decaying = count(|v| matches!(v, Some((_, Some(RejectReason::NotDecaying)))));
+    let passed = count(|v| matches!(v, Some((_, None))));
+    let silent = count(Option::is_none);
     let fraction = not_decaying as f64 / taps as f64;
-    println!("DEC1: {taps} light-desk taps: {passed} candidates, {not_decaying} NotDecaying ({fraction:.3})");
+    println!(
+        "DEC1: {taps} light-desk taps: {passed} passed, {not_decaying} rejected NotDecaying \
+         ({fraction:.3}), {} rejected otherwise, {silent} without a trigger; \
+         {not_decaying_outputs} NotDecaying outputs in all, tail retriggers included",
+        taps - passed - not_decaying - silent
+    );
     assert!(
         fraction <= BASELINE_NOT_DECAYING_LIGHT,
         "DEC1: NotDecaying fraction {fraction} > {BASELINE_NOT_DECAYING_LIGHT}"
