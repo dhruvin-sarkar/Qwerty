@@ -542,9 +542,20 @@ fn by_sound<'a>(onsets: &[u64], events: &'a [PipelineEvent]) -> Vec<Vec<&'a TapD
     grouped
 }
 
-/// Fraction of taps whose first decision is Accepted for their own zone.
-fn accuracy(zones: &[usize], grouped: &[Vec<&TapDecision>]) -> f64 {
-    breakdown(zones, grouped)[0] as f64 / zones.len() as f64
+/// Taps whose first decision is Accepted for their own zone.
+fn correct(zones: &[usize], grouped: &[Vec<&TapDecision>]) -> usize {
+    breakdown(zones, grouped)[0]
+}
+
+/// Whether accuracies of `a` and `b` correct taps out of `n` each are at most `points`
+/// percentage points apart. Compared in integers, 100·|a − b| ≤ points·n, so a difference of
+/// exactly `points` passes: as f64 fractions, 1.00 − 0.98 is 0.020000000000000018 > 0.02.
+fn within_points(a: usize, b: usize, n: usize, points: usize) -> bool {
+    100 * a.abs_diff(b) <= points * n
+}
+
+fn fraction(correct: usize, n: usize) -> f64 {
+    correct as f64 / n as f64
 }
 
 /// Each tap's first outcome, counted: (correct, wrong zone, model-rejected, vetoed or invalid,
@@ -836,6 +847,16 @@ fn p1_desk_end_to_end_fires_once_per_accepted_tap_45_to_56_ms_after_onset() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
+fn accuracy_bounds_are_inclusive_at_a_whole_number_of_points() {
+    // INV1's "≤ 2 points" and INV3's "≤ 3 points" pass at exactly the bound.
+    assert!(within_points(100, 98, 100, 2));
+    assert!(within_points(97, 99, 100, 2));
+    assert!(!within_points(100, 97, 100, 2));
+    assert!(within_points(100, 97, 100, 3));
+    assert!(!within_points(100, 96, 100, 3));
+}
+
+#[test]
 fn inv1_hop_phase_moves_held_out_accuracy_at_most_2_points() {
     let mut live = Live::new(HZ, calibration());
     let mut rng = Rng64::derive(DESK_SEED, STREAM_INV1, 0);
@@ -850,10 +871,15 @@ fn inv1_hop_phase_moves_held_out_accuracy_at_most_2_points() {
     let events0 = live.take_events();
     let onsets_r = live.play(&sounds, &random, TAP_GAP_MS, &mut rng);
     let events_r = live.take_events();
-    let a0 = accuracy(&zones, &by_sound(&onsets0, &events0));
-    let ar = accuracy(&zones, &by_sound(&onsets_r, &events_r));
-    println!("INV1: phase-0 accuracy {a0:.3}, random-phase accuracy {ar:.3}");
-    assert!((a0 - ar).abs() <= 0.02, "INV1: {a0} vs {ar}");
+    let n = zones.len();
+    let c0 = correct(&zones, &by_sound(&onsets0, &events0));
+    let cr = correct(&zones, &by_sound(&onsets_r, &events_r));
+    println!(
+        "INV1: phase-0 accuracy {:.3}, random-phase accuracy {:.3}",
+        fraction(c0, n),
+        fraction(cr, n)
+    );
+    assert!(within_points(c0, cr, n, 2), "INV1: {c0}/{n} vs {cr}/{n}");
 }
 
 #[test]
@@ -886,10 +912,15 @@ fn inv2_tap_strength_drop_stays_within_its_baseline() {
         by_sound(&onsets_n, &events_n),
         by_sound(&onsets_v, &events_v),
     );
-    let an = accuracy(&zones, &grouped_n);
-    let av = accuracy(&zones, &grouped_v);
-    let drop = (an - av) * 100.0;
-    println!("INV2: nominal accuracy {an:.3}, varied strength {av:.3}, drop {drop:.1} points");
+    let n = zones.len();
+    let (cn, cv) = (correct(&zones, &grouped_n), correct(&zones, &grouped_v));
+    // From the counts, so a whole number of points is exact (no f64 fraction subtraction).
+    let drop = 100.0 * (cn as f64 - cv as f64) / n as f64;
+    println!(
+        "INV2: nominal accuracy {:.3}, varied strength {:.3}, drop {drop:.1} points",
+        fraction(cn, n),
+        fraction(cv, n)
+    );
     println!(
         "INV2: [correct, wrong zone, model-rejected, vetoed/invalid, no decision] nominal {:?}, varied {:?}",
         breakdown(&zones, &grouped_n),
@@ -903,7 +934,7 @@ fn inv2_tap_strength_drop_stays_within_its_baseline() {
 
 #[test]
 fn inv3_the_same_scene_at_44_1_and_48_khz_differs_at_most_3_points() {
-    let mut accuracies = Vec::new();
+    let mut counts = Vec::new();
     for hz in [44_100u32, HZ] {
         let calibrated;
         let result = if hz == HZ {
@@ -917,12 +948,16 @@ fn inv3_the_same_scene_at_44_1_and_48_khz_differs_at_most_3_points() {
         let (zones, sounds) = tap_set(&mut live.desk, SET_TAPS_PER_ZONE, &mut rng, nominal_tap);
         let onsets = live.play_anywhere(&sounds, TAP_GAP_MS, &mut rng);
         let events = live.take_events();
-        let a = accuracy(&zones, &by_sound(&onsets, &events));
-        println!("INV3: {hz} Hz accuracy {a:.3}");
-        accuracies.push(a);
+        let c = correct(&zones, &by_sound(&onsets, &events));
+        println!("INV3: {hz} Hz accuracy {:.3}", fraction(c, zones.len()));
+        counts.push((c, zones.len()));
     }
-    let diff = (accuracies[0] - accuracies[1]).abs();
-    assert!(diff <= 0.03, "INV3: {accuracies:?}");
+    let ((c44, n), (c48, n48)) = (counts[0], counts[1]);
+    assert_eq!(n, n48, "the same scene at both rates");
+    assert!(
+        within_points(c44, c48, n, 3),
+        "INV3: 44.1 kHz {c44}/{n} vs 48 kHz {c48}/{n}"
+    );
 }
 
 #[test]
