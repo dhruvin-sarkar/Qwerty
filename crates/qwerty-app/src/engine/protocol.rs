@@ -1706,3 +1706,1948 @@ pub enum CommandOutcome {
     StillRunning,
     WaitFailed { detail: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::fmt::Debug;
+
+    use serde::de::DeserializeOwned;
+
+    use qwerty_core::assessment::{
+        ConfusionMatrix, EvaluationStep, PromptOutcome, ReportMeta, ZoneRef,
+    };
+    use qwerty_core::audio::{CaptureMode, ChannelLayout, DefaultModeReason};
+    use qwerty_core::gesture::Trigger;
+    use qwerty_core::model::{BackgroundRegime, MapPoint, Thresholds};
+    use qwerty_core::pipeline::Incompatibility;
+    use qwerty_core::profile::{ActionSpec, Modifier, SystemSound};
+    use qwerty_core::recording::NegativeClass;
+    use qwerty_core::session::{CalibrationStep, ZoneProgress};
+    use qwerty_core::training::{
+        ModelQuality, NegativeCount, NegativeSource, OutcomeCounts, TrainingProgress,
+        ZoneTrainingStats,
+    };
+    use qwerty_core::units::{ChannelCount, SampleRate, TapIndex, ZoneIndex};
+    use qwerty_core::veto::SelfOutputKind;
+
+    /// serde round trip: the value comes back equal, and re-serializes to the same JSON.
+    fn rt<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) -> serde_json::Value {
+        let json = serde_json::to_string(value).expect("serializes");
+        let back: T = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(&back, value, "round trip of {json}");
+        assert_eq!(serde_json::to_string(&back).expect("serializes"), json);
+        serde_json::from_str(&json).expect("valid JSON")
+    }
+
+    /// Round-trips every value of an enum and checks that `count` distinct variants were covered.
+    fn rt_variants<T: Serialize + DeserializeOwned + PartialEq + Debug>(
+        values: &[T],
+        count: usize,
+    ) {
+        let tags: BTreeSet<String> = values
+            .iter()
+            .map(|v| match rt(v) {
+                serde_json::Value::Object(map) => match map.get("type") {
+                    Some(serde_json::Value::String(tag)) => tag.clone(),
+                    other => panic!("no string type tag: {other:?}"),
+                },
+                other => panic!("an enum serializes as an object: {other}"),
+            })
+            .collect();
+        assert_eq!(tags.len(), count, "variants covered: {tags:?}");
+    }
+
+    fn at(text: &str) -> DateTime<Utc> {
+        text.parse().expect("an RFC 3339 time")
+    }
+
+    fn profile_id(n: u8) -> ProfileId {
+        let text = format!("\"00000000-0000-0000-0000-0000000001{n:02x}\"");
+        serde_json::from_str(&text).expect("a valid uuid string")
+    }
+
+    fn zone_id(n: u8) -> ZoneId {
+        let text = format!("\"00000000-0000-0000-0000-0000000002{n:02x}\"");
+        serde_json::from_str(&text).expect("a valid uuid string")
+    }
+
+    fn format() -> AudioFormat {
+        AudioFormat {
+            rate: SampleRate::new(48_000).expect("valid rate"),
+            channels: ChannelCount::new(2).expect("valid channels"),
+        }
+    }
+
+    fn identity() -> DeviceIdentity {
+        DeviceIdentity {
+            endpoint_id: "{0.0.1.00000000}.{mic-1}".to_string(),
+            name: "Desk mic".to_string(),
+            format: format(),
+            capture_mode: CaptureMode::Raw,
+        }
+    }
+
+    fn fingerprint() -> DeviceFingerprint {
+        DeviceFingerprint {
+            identity: DeviceIdentity {
+                capture_mode: CaptureMode::Default {
+                    reason: DefaultModeReason::RawRejected {
+                        hresult: -2_004_287_478,
+                    },
+                },
+                ..identity()
+            },
+            layout: ChannelLayout::all_real(ChannelCount::new(2).expect("valid channels")),
+        }
+    }
+
+    fn layout() -> ZoneLayout {
+        ZoneLayout {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        }
+    }
+
+    fn zone() -> Zone {
+        Zone {
+            id: zone_id(1),
+            label: "Left".to_string(),
+            layout: layout(),
+            trigger: Trigger::Single,
+            actions: vec![ActionSpec::PlaySound {
+                sound: SystemSound::Success,
+            }],
+        }
+    }
+
+    fn failure() -> PersistenceFailure {
+        PersistenceFailure {
+            file: "Profiles/x.json".to_string(),
+            kind: PersistenceFailureKind::Json,
+            detail: "expected value at line 1 column 1".to_string(),
+        }
+    }
+
+    fn overall() -> OverallMetrics {
+        OverallMetrics {
+            prompts: 40,
+            correct: 38,
+            wrong: 0,
+            rejected: 2,
+            missed: 0,
+            accuracy: 0.95,
+            wrong_action_rate: 0.0,
+            rejection_rate: 0.05,
+        }
+    }
+
+    fn latency_stats() -> LatencyStats {
+        LatencyStats {
+            count: 2,
+            untimed: 0,
+            p50: Milliseconds::new(51.5),
+            p95: Milliseconds::new(56.0),
+            p99: Milliseconds::new(56.0),
+            max: Milliseconds::new(56.0),
+            histogram: vec![0, 1, 1],
+        }
+    }
+
+    fn report_summary() -> ReportSummary {
+        ReportSummary {
+            report: ReportId("20261111T084500000Z".to_string()),
+            content: ReportContent::Readable {
+                run_at: at("2026-11-11T08:45:00Z"),
+                model_trained_at: at("2026-11-10T18:00:00Z"),
+                target: 0.92,
+                overall: overall(),
+            },
+        }
+    }
+
+    fn training_summary() -> TrainingSummary {
+        let counts = OutcomeCounts {
+            total: 20,
+            correct: 19,
+            wrong: 0,
+            rejected_ood: 1,
+            rejected_bg: 0,
+            rejected_ambiguous: 0,
+        };
+        TrainingSummary {
+            seed: 42,
+            zones: vec![ZoneTrainingStats {
+                zone: zone_id(1),
+                taps: 10,
+                vectors: 80,
+                clean_accuracy: 1.0,
+                clean_rejected: 0.0,
+            }],
+            negatives: vec![NegativeCount {
+                source: NegativeSource::EnvironmentOnset,
+                clips: 6,
+            }],
+            negative_vectors: 48,
+            variants_dropped: 0,
+            within_lambda: 0.125,
+            background_lambda: 0.25,
+            background_regime: BackgroundRegime::Negatives {
+                clips: 6,
+                vectors: 48,
+            },
+            thresholds: Thresholds {
+                alpha_in: 0.02,
+                tau_in: 40.5,
+                tau_bg: 1.5,
+                tau_margin: 4.0,
+            },
+            held_out_clean: counts,
+            held_out_all: counts,
+            confusion_clean: vec![vec![10, 0]],
+            negatives_held_out: 6,
+            negatives_held_out_accepted: 0,
+            quality: ModelQuality::Good,
+        }
+    }
+
+    fn calibration_view() -> CalibrationView {
+        CalibrationView {
+            step: CalibrationStep::Ambient {
+                elapsed: Milliseconds::new(1500.0),
+                needed: Milliseconds::new(5000.0),
+            },
+            zones: vec![ZoneProgress {
+                zone: zone_id(1),
+                label: "Left".to_string(),
+                accepted: 0,
+                target: 10,
+            }],
+            last_feedback: Some(TapFeedback::Ignored),
+            memory_bytes: 1024,
+            layout: None,
+        }
+    }
+
+    fn evaluation_view() -> EvaluationView {
+        EvaluationView {
+            step: EvaluationStep::Prompt {
+                index: 1,
+                total: 40,
+                zone: ZoneIndex(0),
+                deadline: HostTime(123_456_789),
+            },
+            resolved: 1,
+            total_prompts: 40,
+            correct: 1,
+            last: Some(PromptOutcome::Correct {
+                latency: Some(Milliseconds::new(52.0)),
+            }),
+        }
+    }
+
+    fn evaluation_report() -> EvaluationReport {
+        EvaluationReport {
+            schema_version: 2,
+            profile_id: profile_id(1),
+            run_at: at("2026-11-11T08:45:00Z"),
+            meta: ReportMeta {
+                profile_id: profile_id(1),
+                device: identity(),
+                front_end_version: 1,
+                model_trained_at: at("2026-11-10T18:00:00Z"),
+                zone_taps: vec![10],
+                negatives: vec![],
+                background_regime: BackgroundRegime::PooledAll {
+                    negative_clips: 0,
+                    needed: 4,
+                },
+                input_veto_enabled: true,
+            },
+            zones: vec![ZoneRef {
+                id: zone_id(1),
+                label: "Left".to_string(),
+            }],
+            prompts_per_zone: 40,
+            target: 0.92,
+            undone: 0,
+            confusion: ConfusionMatrix {
+                zones: 1,
+                counts: vec![vec![38, 2]],
+            },
+            per_zone: vec![],
+            overall: overall(),
+            negatives: vec![],
+            decision_latency: latency_stats(),
+            prompts: vec![],
+            margin_histogram: vec![],
+        }
+    }
+
+    fn calibration_run() -> CalibrationRun {
+        CalibrationRun {
+            target: CalibrationTarget::New {
+                name: "Desk".to_string(),
+            },
+            zones: vec![ZoneDraft {
+                label: "Left".to_string(),
+                layout: layout(),
+            }],
+            device: identity(),
+            taps_per_zone: 10,
+            session: RunSession::Active {
+                view: Box::new(calibration_view()),
+            },
+        }
+    }
+
+    fn opened() -> OpenedStream {
+        OpenedStream {
+            identity: identity(),
+            period: Milliseconds::new(10.0),
+            buffer_frames: 960,
+            mmcss: MmcssStatus::Active,
+        }
+    }
+
+    fn tap_ref() -> TapRef {
+        TapRef {
+            candidate: CandidateId(7),
+            t0: HostTime(1_000_000),
+            decided_at: HostTime(1_510_000),
+            fired_at: HostTime(1_520_000),
+        }
+    }
+
+    fn action_result() -> ActionResult {
+        ActionResult {
+            started_at: HostTime(1_530_000),
+            finished_at: HostTime(1_540_000),
+            steps: vec![StepOutcome::Done],
+        }
+    }
+
+    fn scores() -> ModelScores {
+        ModelScores {
+            d2: vec![1.5, 9.0],
+            best: ZoneIndex(0),
+            second: ZoneIndex(1),
+            d2_min: 1.5,
+            margin: 7.5,
+            llr_bg: 3.25,
+            posterior_best: 0.75,
+        }
+    }
+
+    fn trace_entry() -> TraceEntry {
+        let row = |gate, unit, value, limit| GateRow {
+            gate,
+            value,
+            limit,
+            unit,
+            passed: true,
+        };
+        TraceEntry {
+            at: HostTime(1_510_000),
+            onset: Some(SampleIndex(4800)),
+            gates: Some([
+                row(Gate::Snr, GateUnit::Decibels, 18.5, 10.0),
+                row(Gate::BroadbandFraction, GateUnit::Fraction, 0.75, 0.5),
+                row(Gate::ValidBands, GateUnit::Count, 20.0, 12.0),
+                row(Gate::DecayFraction, GateUnit::Fraction, 0.5, 0.25),
+            ]),
+            outcome: TraceOutcome::Decided {
+                outcome: Box::new(DecisionOutcome::Invalid {
+                    error: DescriptorError::SpanTooShort {
+                        needed: 4096,
+                        got: 2048,
+                    },
+                }),
+                scores: Some(scores()),
+            },
+            map_point: Some([0.5, -0.25]),
+        }
+    }
+
+    fn counters() -> EngineCounters {
+        EngineCounters {
+            counters_since: at("2026-11-11T08:00:00Z"),
+            taps_fired: 3,
+            input_vetoed: 1,
+            actions_failed: 0,
+            capture_dropped_frames: 0,
+            controller_dropped: 0,
+            events_dropped: 0,
+            telemetry_dropped: 0,
+            input_dropped: 0,
+            decisions_dropped: 0,
+            dispatch_dropped: 0,
+            recorder_dropped_frames: 0,
+            recorder_dropped_events: 0,
+            stale_messages: 2,
+            lifecycle_lost: 0,
+            faults: 0,
+        }
+    }
+
+    fn device_info() -> DeviceInfo {
+        DeviceInfo {
+            endpoint_id: identity().endpoint_id,
+            name: "Desk mic".to_string(),
+            is_default: true,
+            state: DeviceState::Active,
+            probe: ProbeOutcome::Probed {
+                probe: DeviceProbe {
+                    format: format(),
+                    raw_supported: true,
+                },
+            },
+        }
+    }
+
+    fn veto_reason() -> VetoUnavailableReason {
+        VetoUnavailableReason::RegistrationFailed {
+            class: InputDeviceClass::Mouse,
+            code: 5,
+        }
+    }
+
+    fn calibrated_status() -> CalibrationStatus {
+        CalibrationStatus::Calibrated {
+            device: fingerprint(),
+            calibrated_at: at("2026-11-10T18:00:00Z"),
+            environment: EnvironmentQuality::Quiet,
+            summary: Box::new(training_summary()),
+        }
+    }
+
+    fn import_preview() -> ImportPreview {
+        ImportPreview {
+            preview: PreviewId(1),
+            name: "Desk".to_string(),
+            zones: vec![zone()],
+            calibration: calibrated_status(),
+        }
+    }
+
+    fn sound_map() -> SoundMap {
+        SoundMap {
+            axes: [vec![1.0, 0.0], vec![0.0, 1.0]],
+            taps: vec![MapPoint {
+                zone: ZoneIndex(0),
+                at: [0.5, -0.25],
+            }],
+            background: vec![[0.0, 0.125]],
+        }
+    }
+
+    fn shutdown_report() -> ShutdownReport {
+        ShutdownReport {
+            joined: vec![ThreadName::Capture, ThreadName::Processing],
+            timed_out: vec![ThreadName::Dispatch],
+            recording: Some(RecordingSummary {
+                dir: "DebugCaptures/20261111T084500Z".to_string(),
+                frames: 48_000,
+                bytes: 384_044,
+                events: 12,
+                gaps: 0,
+            }),
+        }
+    }
+
+    /// The golden snapshot: every top-level field holds a representative value.
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            revision: 7,
+            mode: Mode::Listening,
+            desired: Desired::Listening,
+            config: Config::initial(),
+            config_status: ConfigStatus::Loaded,
+            profiles: vec![
+                ProfileSummary {
+                    file: "Profiles/00000000-0000-0000-0000-000000000101.json".to_string(),
+                    is_active: true,
+                    content: ProfileContent::Readable {
+                        id: profile_id(1),
+                        name: "Desk".to_string(),
+                        zones: ZoneCount::new(2).expect("allowed count"),
+                        calibration: ProfileCalibration::Calibrated {
+                            device: identity(),
+                            calibrated_at: at("2026-11-10T18:00:00Z"),
+                        },
+                        imported_at: None,
+                        latest_report: Some(report_summary()),
+                    },
+                },
+                ProfileSummary {
+                    file: "Profiles/broken.json".to_string(),
+                    is_active: false,
+                    content: ProfileContent::Unreadable { error: failure() },
+                },
+            ],
+            active_profile: Some(ProfileView {
+                id: profile_id(1),
+                name: "Desk".to_string(),
+                zones: vec![zone()],
+                calibration: CalibrationStatus::NeedsRecalibration {
+                    reason: RecalibrationReason::NewProfile,
+                },
+                updated_at: at("2026-11-10T18:00:00Z"),
+            }),
+            devices: vec![device_info()],
+            capture: CaptureStatus::Running {
+                opened: opened(),
+                purpose: CapturePurpose::Listening,
+            },
+            veto: VetoStatus::Active,
+            recorder: RecorderStatus {
+                state: RecorderState::Off,
+                stored: StoredRecordings {
+                    count: 1,
+                    bytes: 2048,
+                },
+            },
+            telemetry: TelemetryLevel::Off,
+            health: Health {
+                counters: counters(),
+                latency: latency_stats(),
+                warnings: vec![HealthWarning::MmcssUnavailable { code: 1552 }],
+            },
+            activity: ActivityLog {
+                recent: vec![ActivityEntry::Fired {
+                    at: at("2026-11-11T08:44:00Z"),
+                    zone: zone_id(1),
+                    label: "Left".to_string(),
+                    origin: JobOrigin::Tap,
+                    tap: Some(tap_ref()),
+                    latency: Some(Milliseconds::new(53.0)),
+                    result: Some(action_result()),
+                    close_call: None,
+                }],
+                attention: vec![AttentionItem {
+                    id: AttentionId(1),
+                    first_at: at("2026-11-11T08:40:00Z"),
+                    last_at: at("2026-11-11T08:41:00Z"),
+                    count: 2,
+                    zone: zone_id(1),
+                    label: "Left".to_string(),
+                    error: ActionError::TargetNotFound {
+                        target: "C:/Tools/missing.exe".to_string(),
+                    },
+                }],
+            },
+            pending_tests: vec![PendingTest {
+                zone: zone_id(1),
+                origin: JobOrigin::TestAction { action_index: 0 },
+                fires_at: HostTime(9_000_000),
+            }],
+            unsaved_report: None,
+            paths: Paths {
+                data_dir: PathBuf::from("D:/QwertyData"),
+                logs: PathBuf::from("D:/QwertyData/Logs"),
+                recordings: PathBuf::from("D:/QwertyData/DebugCaptures"),
+            },
+        }
+    }
+
+    /// Every Command variant, once.
+    fn commands() -> Vec<Command> {
+        let path = || PathBuf::from("D:/out/file.json");
+        let report = || ReportId("20261111T084500000Z".to_string());
+        vec![
+            Command::ShellReady,
+            Command::GetSnapshot,
+            Command::Shutdown,
+            Command::SetListening { listening: false },
+            Command::ToggleListening,
+            Command::SetTelemetry {
+                level: TelemetryLevel::Diagnostics,
+            },
+            Command::ListDevices,
+            Command::RetryCapture,
+            Command::RetryInputVeto,
+            Command::UpdateConfig {
+                edit: ConfigEdit {
+                    text_zoom: Some(125),
+                    global_hotkey: Some(HotkeyEdit::Clear),
+                    ..ConfigEdit::default()
+                },
+            },
+            Command::ResetConfig,
+            Command::ReconcileAutostart,
+            Command::SwitchProfile { id: profile_id(1) },
+            Command::RenameProfile {
+                id: profile_id(1),
+                name: "Desk 2".to_string(),
+            },
+            Command::DuplicateProfile {
+                id: profile_id(1),
+                name: "Copy".to_string(),
+            },
+            Command::DeleteProfile { id: profile_id(2) },
+            Command::EditZone {
+                zone: zone_id(1),
+                edit: ZoneEdit {
+                    label: Some("Right".to_string()),
+                    layout: None,
+                    trigger: Some(Trigger::Double),
+                    actions: Some(vec![ActionSpec::VisualOnly]),
+                },
+            },
+            Command::ExportProfile {
+                id: profile_id(1),
+                path: path(),
+            },
+            Command::PreviewImport { path: path() },
+            Command::ImportProfile {
+                preview: PreviewId(3),
+            },
+            Command::RebindDevice {
+                profile: profile_id(1),
+                endpoint_id: "{mic-2}".to_string(),
+            },
+            Command::StartCalibration {
+                target: CalibrationTarget::Recalibrate {
+                    profile: profile_id(1),
+                },
+                zones: vec![ZoneDraft {
+                    label: "Left".to_string(),
+                    layout: layout(),
+                }],
+                device: DeviceChoice::Endpoint {
+                    endpoint_id: "{mic-1}".to_string(),
+                },
+                taps_per_zone: 10,
+            },
+            Command::Calibration {
+                action: CalibrationAction::RedoZone { zone: zone_id(1) },
+            },
+            Command::CancelCalibration,
+            Command::StartEvaluation {
+                prompts_per_zone: 15,
+                negatives: vec![NegativePhase {
+                    class: NegativeClass::Everyday,
+                    duration: Seconds::new(30.0),
+                }],
+            },
+            Command::UndoLastPrompt,
+            Command::CancelEvaluation,
+            Command::RetrySaveReport,
+            Command::DiscardUnsavedReport,
+            Command::ExportUnsavedReport {
+                format: ReportFormat::Csv,
+                path: path(),
+            },
+            Command::ListEvaluations {
+                profile: profile_id(1),
+            },
+            Command::GetEvaluation {
+                profile: profile_id(1),
+                report: report(),
+            },
+            Command::ExportEvaluation {
+                profile: profile_id(1),
+                report: report(),
+                format: ReportFormat::PromptsCsv,
+                path: path(),
+            },
+            Command::DeleteEvaluation {
+                profile: profile_id(1),
+                report: report(),
+            },
+            Command::TestAction {
+                zone: zone_id(1),
+                action_index: 2,
+                delay: Milliseconds::new(3000.0),
+            },
+            Command::TestChain {
+                zone: zone_id(1),
+                delay: Milliseconds::new(0.0),
+            },
+            Command::CancelTest { zone: zone_id(1) },
+            Command::DismissAttention { id: AttentionId(4) },
+            Command::ShellToast,
+            Command::GetInspection,
+            Command::ExportInspection { path: path() },
+            Command::GetSoundMap,
+            Command::SaveLatencyReport,
+            Command::MarkSegment {
+                kind: SegmentKind::Corpus {
+                    class: NegativeClass::Typing,
+                },
+            },
+            Command::DeleteDebugRecordings,
+        ]
+    }
+
+    /// Every Reply variant, once.
+    fn replies() -> Vec<Reply> {
+        vec![
+            Reply::Ack,
+            Reply::Snapshot {
+                snapshot: Box::new(snapshot()),
+            },
+            Reply::Devices {
+                devices: vec![device_info()],
+            },
+            Reply::Saved {
+                path: PathBuf::from("D:/out/file.json"),
+            },
+            Reply::ProfileCreated { id: profile_id(2) },
+            Reply::ImportPreview {
+                preview: Box::new(import_preview()),
+            },
+            Reply::Calibration {
+                run: Box::new(calibration_run()),
+            },
+            Reply::Committed {
+                profile: profile_id(1),
+            },
+            Reply::Evaluation {
+                view: evaluation_view(),
+            },
+            Reply::Evaluations {
+                reports: vec![report_summary()],
+            },
+            Reply::EvaluationReport {
+                report: Box::new(evaluation_report()),
+            },
+            Reply::TestScheduled {
+                fires_at: HostTime(9_000_000),
+            },
+            Reply::Inspection {
+                entries: vec![trace_entry()],
+            },
+            Reply::SoundMap {
+                map: sound_map(),
+                overlaps: vec![[zone_id(1), zone_id(2)]],
+            },
+            Reply::Shutdown {
+                report: shutdown_report(),
+            },
+        ]
+    }
+
+    fn capture_errors() -> Vec<CaptureError> {
+        vec![
+            CaptureError::ComInit {
+                hresult: -2_147_417_850,
+            },
+            CaptureError::DeviceNotFound {
+                endpoint_id: "{mic-9}".to_string(),
+            },
+            CaptureError::DeviceNotActive {
+                endpoint_id: "{mic-9}".to_string(),
+                state: DeviceState::Unplugged,
+            },
+            CaptureError::NoDefaultDevice,
+            CaptureError::AccessDenied,
+            CaptureError::InUseExclusive,
+            CaptureError::UnsupportedMixFormat { tag: 1, bits: 16 },
+            CaptureError::UnsupportedSampleRate { hz: 8000 },
+            CaptureError::UnsupportedChannelCount { channels: 64 },
+            CaptureError::DeviceInvalidated,
+            CaptureError::Stalled {
+                after: Milliseconds::new(2000.0),
+            },
+            CaptureError::OpenTimeout,
+            CaptureError::Os {
+                stage: CaptureStage::Initialize,
+                hresult: -2_004_287_480,
+            },
+            CaptureError::Unexpected {
+                stage: CaptureStage::Read,
+                detail: "data length mismatch".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn en9_protocol_serde_round_trips_and_goldens() {
+        // ---- Commands, replies and their kinds ----
+        let commands = commands();
+        rt_variants(&commands, 45);
+        let kinds: Vec<CommandKind> = commands.iter().map(Command::kind).collect();
+        rt_variants(&kinds, 45);
+        let replies = replies();
+        rt_variants(&replies, 15);
+        let reply_kinds: Vec<ReplyKind> = replies.iter().map(Reply::kind).collect();
+        rt_variants(&reply_kinds, 15);
+        rt_variants(
+            &[
+                DeviceChoice::ProfileBound,
+                DeviceChoice::SystemDefault,
+                DeviceChoice::Endpoint {
+                    endpoint_id: "{mic-1}".to_string(),
+                },
+            ],
+            3,
+        );
+        rt_variants(
+            &[
+                CalibrationTarget::New {
+                    name: "Desk".to_string(),
+                },
+                CalibrationTarget::Recalibrate {
+                    profile: profile_id(1),
+                },
+            ],
+            2,
+        );
+        rt_variants(
+            &[
+                CalibrationAction::RecordAmbient,
+                CalibrationAction::AcceptAmbient,
+                CalibrationAction::RetryAmbient,
+                CalibrationAction::UndoLastTap,
+                CalibrationAction::RestartZone,
+                CalibrationAction::NextZone,
+                CalibrationAction::SkipNegatives,
+                CalibrationAction::RedoZone { zone: zone_id(1) },
+                CalibrationAction::Commit {
+                    name: "Desk".to_string(),
+                },
+            ],
+            9,
+        );
+        rt_variants(
+            &[
+                HotkeyEdit::Clear,
+                HotkeyEdit::Set {
+                    combo: KeyCombo {
+                        modifiers: vec![Modifier::Ctrl, Modifier::Alt],
+                        key: "K".to_string(),
+                    },
+                },
+            ],
+            2,
+        );
+        rt_variants(
+            &[
+                TelemetryLevel::Off,
+                TelemetryLevel::Meter,
+                TelemetryLevel::Diagnostics,
+            ],
+            3,
+        );
+        rt_variants(
+            &[
+                ReportFormat::Json,
+                ReportFormat::Csv,
+                ReportFormat::PromptsCsv,
+            ],
+            3,
+        );
+        let full_edit = ConfigEdit {
+            theme: Some(Theme::Midnight),
+            start_with_windows: Some(true),
+            minimize_to_tray_on_close: Some(false),
+            notification_verbosity: Some(NotificationVerbosity::Minimal),
+            global_hotkey: Some(HotkeyEdit::Clear),
+            debug_capture_enabled: Some(false),
+            input_veto_enabled: Some(true),
+            eval_prompts_per_zone: Some(20),
+            eval_background_check: Some(false),
+            dismiss_notice: Some(NoticeId::UnattendedActions),
+            window_placement: Some(WindowPlacement {
+                x: 10,
+                y: 20,
+                w: 800,
+                h: 600,
+                maximized: false,
+            }),
+            text_zoom: Some(125),
+        };
+        rt(&full_edit);
+        // #[serde(default)]: the shell sends only what changed.
+        let partial: ConfigEdit =
+            serde_json::from_str(r#"{"text_zoom":105}"#).expect("a partial patch");
+        assert_eq!(
+            partial,
+            ConfigEdit {
+                text_zoom: Some(105),
+                ..ConfigEdit::default()
+            }
+        );
+        assert_eq!(
+            rt(&ReportId("20261111T084500000Z".to_string())),
+            "20261111T084500000Z"
+        );
+        assert_eq!(rt(&PreviewId(3)), 3);
+        assert_eq!(rt(&AttentionId(4)), 4);
+        rt(&ZoneDraft {
+            label: "Left".to_string(),
+            layout: layout(),
+        });
+        rt(&import_preview());
+
+        // ---- Snapshot and its parts ----
+        let modes = vec![
+            Mode::Starting,
+            Mode::Idle,
+            Mode::Listening,
+            Mode::Paused,
+            Mode::Calibrating {
+                run: Box::new(calibration_run()),
+            },
+            Mode::Evaluating {
+                view: evaluation_view(),
+            },
+            Mode::Blocked {
+                blocker: Blocker::InputVetoUnavailable {
+                    reason: veto_reason(),
+                },
+            },
+            Mode::Faulted {
+                thread: ThreadName::Capture,
+                message: "capture panicked".to_string(),
+            },
+        ];
+        rt_variants(&modes, 8);
+        let mode_kinds: Vec<ModeKind> = modes.iter().map(Mode::kind).collect();
+        rt_variants(&mode_kinds, 8);
+        rt(&calibration_run());
+        rt_variants(
+            &[
+                RunSession::Active {
+                    view: Box::new(calibration_view()),
+                },
+                RunSession::MicLost {
+                    reason: MicUnavailableReason::Stalled,
+                },
+            ],
+            2,
+        );
+        rt_variants(&[Desired::Listening, Desired::Paused], 2);
+        rt_variants(
+            &[
+                Blocker::ProfileUnreadable {
+                    file: "Profiles/x.json".to_string(),
+                    error: failure(),
+                },
+                Blocker::NeedsRecalibration {
+                    profile: profile_id(1),
+                    reason: RecalibrationReason::FrontEndChanged {
+                        trained: 1,
+                        current: 2,
+                    },
+                },
+                Blocker::ProfileIncompatible {
+                    profile: profile_id(1),
+                    error: PipelineError::ModelIncompatible {
+                        reason: Incompatibility::FrontEndVersion {
+                            model: 1,
+                            current: 2,
+                        },
+                    },
+                },
+                Blocker::MicUnavailable {
+                    endpoint_id: "{mic-1}".to_string(),
+                    name: "Desk mic".to_string(),
+                    reason: MicUnavailableReason::NotPresent,
+                },
+                Blocker::MicMismatch {
+                    bound: identity(),
+                    current: fingerprint().identity,
+                    fields: vec![IdentityField::CaptureMode],
+                },
+                Blocker::InputVetoUnavailable {
+                    reason: veto_reason(),
+                },
+            ],
+            6,
+        );
+        rt_variants(
+            &[
+                MicUnavailableReason::NotPresent,
+                MicUnavailableReason::Disabled,
+                MicUnavailableReason::Unplugged,
+                MicUnavailableReason::AccessDenied,
+                MicUnavailableReason::InUseExclusive,
+                MicUnavailableReason::Stalled,
+                MicUnavailableReason::OpenFailed {
+                    error: CaptureError::OpenTimeout,
+                },
+            ],
+            7,
+        );
+        rt_variants(
+            &[
+                ConfigStatus::Loaded,
+                ConfigStatus::Initial,
+                ConfigStatus::Migrated { from_version: 1 },
+                ConfigStatus::Unreadable { error: failure() },
+            ],
+            4,
+        );
+        rt(&failure());
+        rt_variants(
+            &[
+                PersistenceFailureKind::Io,
+                PersistenceFailureKind::Json,
+                PersistenceFailureKind::SchemaMismatch {
+                    found: 3,
+                    expected: 2,
+                },
+                PersistenceFailureKind::InvalidData,
+            ],
+            4,
+        );
+        rt_variants(
+            &[
+                ProfileContent::Readable {
+                    id: profile_id(1),
+                    name: "Desk".to_string(),
+                    zones: ZoneCount::new(4).expect("allowed count"),
+                    calibration: ProfileCalibration::NeedsRecalibration {
+                        reason: RecalibrationReason::MigratedFromV1 {
+                            v1_device_name: "Old mic".to_string(),
+                        },
+                    },
+                    imported_at: Some(at("2026-11-09T10:00:00Z")),
+                    latest_report: None,
+                },
+                ProfileContent::Unreadable { error: failure() },
+            ],
+            2,
+        );
+        rt_variants(
+            &[
+                ProfileCalibration::Calibrated {
+                    device: identity(),
+                    calibrated_at: at("2026-11-10T18:00:00Z"),
+                },
+                ProfileCalibration::NeedsRecalibration {
+                    reason: RecalibrationReason::ZoneSetChanged,
+                },
+            ],
+            2,
+        );
+        rt_variants(
+            &[
+                calibrated_status(),
+                CalibrationStatus::NeedsRecalibration {
+                    reason: RecalibrationReason::NewProfile,
+                },
+            ],
+            2,
+        );
+        rt_variants(
+            &[
+                report_summary().content,
+                ReportContent::Legacy {
+                    run_at: at("2026-10-01T12:00:00Z"),
+                    overall_accuracy: 0.875,
+                },
+                ReportContent::Unreadable { error: failure() },
+            ],
+            3,
+        );
+        rt_variants(
+            &[
+                CaptureStatus::Off,
+                CaptureStatus::Running {
+                    opened: opened(),
+                    purpose: CapturePurpose::Diagnostics,
+                },
+                CaptureStatus::Failed {
+                    endpoint_id: "{mic-1}".to_string(),
+                    error: CaptureError::DeviceInvalidated,
+                    retry: RetryState::Scheduled {
+                        attempt: 1,
+                        at: HostTime(20_000_000),
+                    },
+                },
+            ],
+            3,
+        );
+        rt_variants(
+            &[
+                RetryState::Scheduled {
+                    attempt: 3,
+                    at: HostTime(1),
+                },
+                RetryState::Exhausted,
+            ],
+            2,
+        );
+        rt_variants(
+            &[
+                CapturePurpose::Listening,
+                CapturePurpose::Calibrating,
+                CapturePurpose::Evaluating,
+                CapturePurpose::Diagnostics,
+            ],
+            4,
+        );
+        rt_variants(
+            &[
+                VetoStatus::Disabled,
+                VetoStatus::NotNeeded,
+                VetoStatus::WaitingForShell,
+                VetoStatus::Registering,
+                VetoStatus::Active,
+                VetoStatus::Unavailable {
+                    reason: veto_reason(),
+                },
+            ],
+            6,
+        );
+        rt_variants(
+            &[
+                RecorderState::Off,
+                RecorderState::Recording {
+                    dir: "DebugCaptures/20261111T084500Z".to_string(),
+                    bytes: 4096,
+                    duration: Seconds::new(1.5),
+                    gaps: 1,
+                    dropped_events: 0,
+                },
+                RecorderState::Stopped {
+                    dir: "DebugCaptures/20261111T084500Z".to_string(),
+                    reason: RecorderStopReason::SizeLimit,
+                },
+                RecorderState::Failed {
+                    error: RecordingError::FormatMismatch,
+                },
+            ],
+            4,
+        );
+        rt_variants(
+            &[
+                RecorderStopReason::Disabled,
+                RecorderStopReason::CaptureStopped,
+                RecorderStopReason::SizeLimit,
+                RecorderStopReason::DiskSpaceLow { free_bytes: 1024 },
+                RecorderStopReason::StructureEventLost,
+                RecorderStopReason::NewCalibrationRun,
+            ],
+            6,
+        );
+        rt_variants(
+            &[
+                HealthWarning::CaptureOverflow { frames: 480 },
+                HealthWarning::CaptureStalled {
+                    after: Milliseconds::new(500.0),
+                },
+                HealthWarning::MmcssUnavailable { code: 1552 },
+                HealthWarning::NoiseTrackerStarved {
+                    frozen_fraction: 0.625,
+                },
+                HealthWarning::LowSignal {
+                    near_miss_fraction: 0.5,
+                },
+                HealthWarning::ControllerOverloaded,
+                HealthWarning::SelfOutputStuck { id: OutputId(9) },
+                HealthWarning::SpeechCallbackPanicked { count: 1 },
+                HealthWarning::EventsDropped { count: 3 },
+                HealthWarning::DiskSpaceLow { free_bytes: 1024 },
+                HealthWarning::PlatformRebuilt {
+                    panic: "action panicked".to_string(),
+                },
+                HealthWarning::AutostartFailed {
+                    detail: "access denied".to_string(),
+                },
+                HealthWarning::RecognitionDrift {
+                    window: 20,
+                    ambiguous: 5,
+                    close_calls: 4,
+                },
+                HealthWarning::SpeechUnmatched { count: 1 },
+            ],
+            14,
+        );
+        rt_variants(
+            &[
+                ThreadName::Controller,
+                ThreadName::Capture,
+                ThreadName::Processing,
+                ThreadName::Dispatch,
+                ThreadName::RawInput,
+                ThreadName::Recorder,
+                ThreadName::Build,
+            ],
+            7,
+        );
+        rt_variants(
+            &[
+                ActivityEntry::Fired {
+                    at: at("2026-11-11T08:44:00Z"),
+                    zone: zone_id(1),
+                    label: "Left".to_string(),
+                    origin: JobOrigin::Tap,
+                    tap: Some(tap_ref()),
+                    latency: Some(Milliseconds::new(53.0)),
+                    result: Some(action_result()),
+                    close_call: Some(zone_id(2)),
+                },
+                ActivityEntry::NotRecognized {
+                    at: at("2026-11-11T08:44:01Z"),
+                    reason: ModelRejectReason::Ambiguous,
+                    best_zone: Some(zone_id(2)),
+                },
+            ],
+            2,
+        );
+        rt(&LatencyReport {
+            schema_version: 1,
+            created_at: at("2026-11-11T09:00:00Z"),
+            profile_id: profile_id(1),
+            device: identity(),
+            end_to_end: latency_stats(),
+            decision: latency_stats(),
+            controller: latency_stats(),
+            dispatch: latency_stats(),
+            budget_p50: LATENCY_BUDGET_P50,
+            budget_p95: LATENCY_BUDGET_P95,
+            passed: false,
+        });
+
+        // ---- Events ----
+        let events = vec![
+            Event::StateChanged {
+                snapshot: Box::new(snapshot()),
+            },
+            Event::TapFired {
+                tap: TapReport {
+                    candidate: CandidateId(7),
+                    zone: zone_id(1),
+                    label: "Left".to_string(),
+                    t0: HostTime(1_000_000),
+                    latency: LatencyBreakdown {
+                        decision: Milliseconds::new(51.0),
+                        controller: Milliseconds::new(1.0),
+                    },
+                },
+            },
+            Event::TapRejected {
+                rejected: RejectedBy::Model {
+                    reason: ModelRejectReason::OutOfDistribution,
+                },
+                best_zone: None,
+            },
+            Event::GestureArmed {
+                zone: zone_id(1),
+                expires_at: HostTime(4_000_000),
+            },
+            Event::GestureCleared { zone: zone_id(1) },
+            Event::ActionCompleted {
+                zone: zone_id(1),
+                tap: Some(tap_ref()),
+                origin: JobOrigin::Tap,
+                result: action_result(),
+            },
+            Event::ActionSkipped {
+                zone: zone_id(1),
+                origin: JobOrigin::TestChain,
+                reason: SkipReason::TestCanceled,
+            },
+            Event::CommandFinished {
+                zone: zone_id(1),
+                origin: JobOrigin::Tap,
+                step: 1,
+                outcome: CommandOutcome::Exited { code: Some(3) },
+            },
+            Event::CalibrationFeedback {
+                feedback: TapFeedback::Accepted {
+                    zone: ZoneIndex(0),
+                    tap: TapIndex(3),
+                    count: 4,
+                },
+            },
+            Event::CalibrationProgress {
+                progress: BuildProgress::Training {
+                    progress: TrainingProgress::Folds { done: 2, total: 5 },
+                },
+            },
+            Event::CalibrationEnded {
+                outcome: CalibrationOutcome::Committed {
+                    profile: profile_id(1),
+                },
+            },
+            Event::EvaluationUpdate {
+                event: EvaluationEvent::PromptOpened {
+                    index: 0,
+                    zone: ZoneIndex(1),
+                },
+            },
+            Event::EvaluationEnded {
+                outcome: EvaluationOutcome::Cancelled,
+            },
+            Event::ProfileMigrated {
+                id: profile_id(1),
+                from_version: 1,
+                notes: vec![MigrationNote::HotkeyDefaulted],
+            },
+            Event::ConfigMigrated {
+                from_version: 1,
+                notes: vec![],
+            },
+            Event::Telemetry {
+                frame: TelemetryFrame::Meter {
+                    rms: Decibels::new(-42.5),
+                    peak: Decibels::new(-20.0),
+                    noise: TELEMETRY_DB_FLOOR,
+                },
+            },
+            Event::EngineFaulted {
+                thread: ThreadName::Processing,
+                message: "processing panicked".to_string(),
+            },
+            Event::Stopped,
+        ];
+        rt_variants(&events, 18);
+        rt_variants(
+            &[
+                RejectedBy::Model {
+                    reason: ModelRejectReason::Background,
+                },
+                RejectedBy::Vetoed {
+                    reason: VetoReason::SelfOutput {
+                        kind: SelfOutputKind::Speech,
+                    },
+                },
+                RejectedBy::Invalid {
+                    error: DescriptorError::SpanTooShort {
+                        needed: 4096,
+                        got: 10,
+                    },
+                },
+            ],
+            3,
+        );
+        rt_variants(&[SkipReason::QueueFull, SkipReason::TestCanceled], 2);
+        rt_variants(
+            &[
+                CalibrationOutcome::Committed {
+                    profile: profile_id(1),
+                },
+                CalibrationOutcome::Cancelled,
+            ],
+            2,
+        );
+        rt_variants(
+            &[
+                EvaluationOutcome::Saved {
+                    report: ReportId("20261111T084500000Z".to_string()),
+                    overall: overall(),
+                },
+                EvaluationOutcome::SaveFailed {
+                    report: Box::new(evaluation_report()),
+                    error: failure(),
+                },
+                EvaluationOutcome::Cancelled,
+                EvaluationOutcome::Aborted {
+                    reason: MicUnavailableReason::Unplugged,
+                },
+            ],
+            4,
+        );
+        let floor = || Box::new([TELEMETRY_DB_FLOOR; BAND_COUNT]);
+        rt_variants(
+            &[
+                TelemetryFrame::Meter {
+                    rms: Decibels::new(-42.5),
+                    peak: Decibels::new(-20.0),
+                    noise: Decibels::new(-90.0),
+                },
+                TelemetryFrame::Spectrum {
+                    bands: floor(),
+                    noise: floor(),
+                    flux: 0.5,
+                    threshold: 1.25,
+                },
+                TelemetryFrame::Waveform {
+                    min: vec![-0.5, -0.25],
+                    max: vec![0.5, 0.25],
+                },
+                TelemetryFrame::Trace {
+                    entries: vec![trace_entry()],
+                },
+            ],
+            4,
+        );
+        rt_variants(
+            &[
+                Gate::Snr,
+                Gate::BroadbandFraction,
+                Gate::ValidBands,
+                Gate::DecayFraction,
+            ],
+            4,
+        );
+        rt_variants(
+            &[GateUnit::Decibels, GateUnit::Fraction, GateUnit::Count],
+            3,
+        );
+        rt_variants(
+            &[
+                TraceOutcome::DetectorRejected {
+                    reason: RejectReason::LowSnr,
+                },
+                TraceOutcome::Detected,
+                trace_entry().outcome,
+            ],
+            3,
+        );
+
+        // ---- Errors and lifecycle ----
+        let engine_errors = vec![
+            EngineError::ShuttingDown,
+            EngineError::EngineStopped,
+            EngineError::Timeout {
+                command: CommandKind::ListDevices,
+            },
+            EngineError::ProtocolMismatch {
+                expected: ReplyKind::Devices,
+                got: ReplyKind::Ack,
+            },
+            EngineError::InvalidInMode {
+                command: CommandKind::EditZone,
+                mode: ModeKind::Calibrating,
+            },
+            EngineError::NoActiveProfile,
+            EngineError::ProfileNotCalibrated,
+            EngineError::ProfileNotFound { id: profile_id(9) },
+            EngineError::ReportNotFound {
+                profile: profile_id(1),
+                report: ReportId("20261111T084500000Z".to_string()),
+            },
+            EngineError::Profile {
+                error: ProfileError::EmptyName,
+            },
+            EngineError::Persistence { error: failure() },
+            EngineError::ConfigUnreadable,
+            EngineError::ConfigReadable,
+            EngineError::Config {
+                error: ConfigError::InvalidTextZoom { value: 105 },
+            },
+            EngineError::UnsupportedHotkey {
+                combo: KeyCombo {
+                    modifiers: vec![Modifier::Win],
+                    key: "Pause".to_string(),
+                },
+            },
+            EngineError::LegacyReport {
+                report: ReportId("20250101T000000000Z".to_string()),
+            },
+            EngineError::Capture {
+                error: CaptureError::NoDefaultDevice,
+            },
+            EngineError::Setup {
+                error: PipelineError::TriggerCountMismatch {
+                    zones: 4,
+                    triggers: 2,
+                },
+            },
+            EngineError::Calibration {
+                error: SessionError::NothingToUndo,
+            },
+            EngineError::Evaluation {
+                error: AssessmentError::NothingToUndo,
+            },
+            EngineError::Veto {
+                reason: veto_reason(),
+            },
+            EngineError::VetoNotReady,
+            EngineError::UnsavedReportHeld,
+            EngineError::NoUnsavedReport,
+            EngineError::PreviewExpired,
+            EngineError::TestPending { zone: zone_id(1) },
+            EngineError::NoPendingTest { zone: zone_id(1) },
+            EngineError::AttentionNotFound { id: AttentionId(5) },
+            EngineError::NotRecording,
+            EngineError::RecordingActive,
+            EngineError::Autostart {
+                detail: "access denied".to_string(),
+            },
+            EngineError::AutostartNotManaged,
+            EngineError::ThreadSpawn {
+                thread: ThreadName::Build,
+                detail: "out of memory".to_string(),
+            },
+        ];
+        rt_variants(&engine_errors, 33);
+        rt(&shutdown_report());
+        rt_variants(&[AutostartPolicy::Reconcile, AutostartPolicy::Untouched], 2);
+        rt_variants(
+            &[DebugCaptureMode::FromConfig, DebugCaptureMode::ForceOn],
+            2,
+        );
+
+        // ---- The serde types the snapshot embeds ----
+        rt(&opened());
+        rt_variants(
+            &[MmcssStatus::Active, MmcssStatus::Unavailable { code: 1552 }],
+            2,
+        );
+        rt_variants(
+            &[
+                CaptureStage::Spawn,
+                CaptureStage::Enumerate,
+                CaptureStage::Activate,
+                CaptureStage::Properties,
+                CaptureStage::MixFormat,
+                CaptureStage::Initialize,
+                CaptureStage::EventHandle,
+                CaptureStage::CaptureClient,
+                CaptureStage::Start,
+                CaptureStage::Read,
+            ],
+            10,
+        );
+        rt_variants(&capture_errors(), 14);
+        rt(&device_info());
+        rt_variants(
+            &[
+                ProbeOutcome::NotActive,
+                device_info().probe,
+                ProbeOutcome::Failed {
+                    error: CaptureError::AccessDenied,
+                },
+            ],
+            3,
+        );
+        rt_variants(
+            &[
+                DeviceState::Active,
+                DeviceState::Disabled,
+                DeviceState::NotPresent,
+                DeviceState::Unplugged,
+            ],
+            4,
+        );
+        rt_variants(&[InputDeviceClass::Keyboard, InputDeviceClass::Mouse], 2);
+        rt_variants(
+            &[
+                veto_reason(),
+                VetoUnavailableReason::RegistrationNotOwned {
+                    class: InputDeviceClass::Keyboard,
+                },
+                VetoUnavailableReason::OwnershipLost {
+                    class: InputDeviceClass::Mouse,
+                },
+                VetoUnavailableReason::ThreadFailed {
+                    message: "RegisterClassExW failed (1410)".to_string(),
+                },
+            ],
+            4,
+        );
+        rt(&tap_ref());
+        rt_variants(
+            &[
+                JobOrigin::Tap,
+                JobOrigin::TestAction { action_index: 1 },
+                JobOrigin::TestChain,
+            ],
+            3,
+        );
+        rt(&ActionResult {
+            started_at: HostTime(1),
+            finished_at: HostTime(2),
+            steps: vec![
+                StepOutcome::Done,
+                StepOutcome::Started,
+                StepOutcome::Canceled,
+                StepOutcome::Failed {
+                    error: ActionError::ForegroundIsQwerty,
+                },
+            ],
+        });
+        rt_variants(
+            &[
+                StepOutcome::Done,
+                StepOutcome::Started,
+                StepOutcome::Canceled,
+                StepOutcome::Failed {
+                    error: ActionError::SpeechTimeout,
+                },
+            ],
+            4,
+        );
+        rt_variants(
+            &[
+                CommandOutcome::Exited { code: None },
+                CommandOutcome::StillRunning,
+                CommandOutcome::WaitFailed {
+                    detail: "access denied".to_string(),
+                },
+            ],
+            3,
+        );
+
+        // ---- Goldens ----
+        let snapshot_json =
+            serde_json::to_string_pretty(&snapshot()).expect("the snapshot serializes");
+        assert_eq!(snapshot_json, GOLDEN_SNAPSHOT, "golden Snapshot JSON");
+
+        let action_errors = [
+            (
+                ActionError::TargetNotFound {
+                    target: "C:/Tools/missing.exe".to_string(),
+                },
+                r#"{"type":"TargetNotFound","target":"C:/Tools/missing.exe"}"#,
+            ),
+            (
+                ActionError::LaunchFailed {
+                    target: "notepad.exe".to_string(),
+                    reason: "access denied".to_string(),
+                },
+                r#"{"type":"LaunchFailed","target":"notepad.exe","reason":"access denied"}"#,
+            ),
+            (
+                ActionError::Clipboard {
+                    detail: "clipboard busy".to_string(),
+                },
+                r#"{"type":"Clipboard","detail":"clipboard busy"}"#,
+            ),
+            (
+                ActionError::Speech {
+                    detail: "no voice".to_string(),
+                },
+                r#"{"type":"Speech","detail":"no voice"}"#,
+            ),
+            (ActionError::SpeechTimeout, r#"{"type":"SpeechTimeout"}"#),
+            (
+                ActionError::Keystroke {
+                    detail: "unrecognized key".to_string(),
+                },
+                r#"{"type":"Keystroke","detail":"unrecognized key"}"#,
+            ),
+            (
+                ActionError::ForegroundIsQwerty,
+                r#"{"type":"ForegroundIsQwerty"}"#,
+            ),
+            (
+                ActionError::Screenshot {
+                    detail: "BitBlt failed".to_string(),
+                },
+                r#"{"type":"Screenshot","detail":"BitBlt failed"}"#,
+            ),
+            (
+                ActionError::Notification {
+                    detail: "no AUMID".to_string(),
+                },
+                r#"{"type":"Notification","detail":"no AUMID"}"#,
+            ),
+            (
+                ActionError::Sound {
+                    detail: "PlaySound(SystemHand) returned FALSE".to_string(),
+                },
+                r#"{"type":"Sound","detail":"PlaySound(SystemHand) returned FALSE"}"#,
+            ),
+            (
+                ActionError::Panicked {
+                    message: "index out of bounds".to_string(),
+                },
+                r#"{"type":"Panicked","message":"index out of bounds"}"#,
+            ),
+        ];
+        let mut kinds = BTreeSet::new();
+        for (error, golden) in &action_errors {
+            assert_eq!(
+                serde_json::to_string(error).expect("serializes"),
+                *golden,
+                "golden ActionError JSON"
+            );
+            assert_eq!(
+                &serde_json::from_str::<ActionError>(golden).expect("parses"),
+                error
+            );
+            // kind() is the variant name, which is also the serde tag.
+            assert!(golden.starts_with(&format!(r#"{{"type":"{}""#, error.kind())));
+            kinds.insert(error.kind());
+        }
+        assert_eq!(kinds.len(), 11, "every ActionError variant has a golden");
+    }
+
+    /// Recorded from `snapshot()`; a change here is a change to the shell boundary.
+    const GOLDEN_SNAPSHOT: &str = r#"{
+  "revision": 7,
+  "mode": {
+    "type": "Listening"
+  },
+  "desired": {
+    "type": "Listening"
+  },
+  "config": {
+    "schema_version": 2,
+    "active_profile_id": null,
+    "theme": "System",
+    "start_with_windows": false,
+    "minimize_to_tray_on_close": true,
+    "notification_verbosity": "Normal",
+    "global_hotkey": {
+      "modifiers": [
+        "Ctrl",
+        "Alt"
+      ],
+      "key": "Space"
+    },
+    "debug_capture_enabled": false,
+    "input_veto_enabled": true,
+    "eval_prompts_per_zone": 15,
+    "eval_background_check": true,
+    "dismissed_notices": [],
+    "window_placement": null,
+    "text_zoom": 100
+  },
+  "config_status": {
+    "type": "Loaded"
+  },
+  "profiles": [
+    {
+      "file": "Profiles/00000000-0000-0000-0000-000000000101.json",
+      "is_active": true,
+      "content": {
+        "type": "Readable",
+        "id": "00000000-0000-0000-0000-000000000101",
+        "name": "Desk",
+        "zones": 2,
+        "calibration": {
+          "type": "Calibrated",
+          "device": {
+            "endpoint_id": "{0.0.1.00000000}.{mic-1}",
+            "name": "Desk mic",
+            "format": {
+              "rate": 48000,
+              "channels": 2
+            },
+            "capture_mode": {
+              "type": "Raw"
+            }
+          },
+          "calibrated_at": "2026-11-10T18:00:00Z"
+        },
+        "imported_at": null,
+        "latest_report": {
+          "report": "20261111T084500000Z",
+          "content": {
+            "type": "Readable",
+            "run_at": "2026-11-11T08:45:00Z",
+            "model_trained_at": "2026-11-10T18:00:00Z",
+            "target": 0.92,
+            "overall": {
+              "prompts": 40,
+              "correct": 38,
+              "wrong": 0,
+              "rejected": 2,
+              "missed": 0,
+              "accuracy": 0.95,
+              "wrong_action_rate": 0.0,
+              "rejection_rate": 0.05
+            }
+          }
+        }
+      }
+    },
+    {
+      "file": "Profiles/broken.json",
+      "is_active": false,
+      "content": {
+        "type": "Unreadable",
+        "error": {
+          "file": "Profiles/x.json",
+          "kind": {
+            "type": "Json"
+          },
+          "detail": "expected value at line 1 column 1"
+        }
+      }
+    }
+  ],
+  "active_profile": {
+    "id": "00000000-0000-0000-0000-000000000101",
+    "name": "Desk",
+    "zones": [
+      {
+        "id": "00000000-0000-0000-0000-000000000201",
+        "label": "Left",
+        "layout": {
+          "x": 0.0,
+          "y": 0.0,
+          "width": 0.5,
+          "height": 1.0
+        },
+        "trigger": {
+          "type": "Single"
+        },
+        "actions": [
+          {
+            "type": "PlaySound",
+            "sound": "Success"
+          }
+        ]
+      }
+    ],
+    "calibration": {
+      "type": "NeedsRecalibration",
+      "reason": {
+        "type": "NewProfile"
+      }
+    },
+    "updated_at": "2026-11-10T18:00:00Z"
+  },
+  "devices": [
+    {
+      "endpoint_id": "{0.0.1.00000000}.{mic-1}",
+      "name": "Desk mic",
+      "is_default": true,
+      "state": {
+        "type": "Active"
+      },
+      "probe": {
+        "type": "Probed",
+        "probe": {
+          "format": {
+            "rate": 48000,
+            "channels": 2
+          },
+          "raw_supported": true
+        }
+      }
+    }
+  ],
+  "capture": {
+    "type": "Running",
+    "opened": {
+      "identity": {
+        "endpoint_id": "{0.0.1.00000000}.{mic-1}",
+        "name": "Desk mic",
+        "format": {
+          "rate": 48000,
+          "channels": 2
+        },
+        "capture_mode": {
+          "type": "Raw"
+        }
+      },
+      "period": 10.0,
+      "buffer_frames": 960,
+      "mmcss": {
+        "type": "Active"
+      }
+    },
+    "purpose": {
+      "type": "Listening"
+    }
+  },
+  "veto": {
+    "type": "Active"
+  },
+  "recorder": {
+    "state": {
+      "type": "Off"
+    },
+    "stored": {
+      "count": 1,
+      "bytes": 2048
+    }
+  },
+  "telemetry": {
+    "type": "Off"
+  },
+  "health": {
+    "counters": {
+      "counters_since": "2026-11-11T08:00:00Z",
+      "taps_fired": 3,
+      "input_vetoed": 1,
+      "actions_failed": 0,
+      "capture_dropped_frames": 0,
+      "controller_dropped": 0,
+      "events_dropped": 0,
+      "telemetry_dropped": 0,
+      "input_dropped": 0,
+      "decisions_dropped": 0,
+      "dispatch_dropped": 0,
+      "recorder_dropped_frames": 0,
+      "recorder_dropped_events": 0,
+      "stale_messages": 2,
+      "lifecycle_lost": 0,
+      "faults": 0
+    },
+    "latency": {
+      "count": 2,
+      "untimed": 0,
+      "p50": 51.5,
+      "p95": 56.0,
+      "p99": 56.0,
+      "max": 56.0,
+      "histogram": [
+        0,
+        1,
+        1
+      ]
+    },
+    "warnings": [
+      {
+        "type": "MmcssUnavailable",
+        "code": 1552
+      }
+    ]
+  },
+  "activity": {
+    "recent": [
+      {
+        "type": "Fired",
+        "at": "2026-11-11T08:44:00Z",
+        "zone": "00000000-0000-0000-0000-000000000201",
+        "label": "Left",
+        "origin": {
+          "type": "Tap"
+        },
+        "tap": {
+          "candidate": 7,
+          "t0": 1000000,
+          "decided_at": 1510000,
+          "fired_at": 1520000
+        },
+        "latency": 53.0,
+        "result": {
+          "started_at": 1530000,
+          "finished_at": 1540000,
+          "steps": [
+            {
+              "type": "Done"
+            }
+          ]
+        },
+        "close_call": null
+      }
+    ],
+    "attention": [
+      {
+        "id": 1,
+        "first_at": "2026-11-11T08:40:00Z",
+        "last_at": "2026-11-11T08:41:00Z",
+        "count": 2,
+        "zone": "00000000-0000-0000-0000-000000000201",
+        "label": "Left",
+        "error": {
+          "type": "TargetNotFound",
+          "target": "C:/Tools/missing.exe"
+        }
+      }
+    ]
+  },
+  "pending_tests": [
+    {
+      "zone": "00000000-0000-0000-0000-000000000201",
+      "origin": {
+        "type": "TestAction",
+        "action_index": 0
+      },
+      "fires_at": 9000000
+    }
+  ],
+  "unsaved_report": null,
+  "paths": {
+    "data_dir": "D:/QwertyData",
+    "logs": "D:/QwertyData/Logs",
+    "recordings": "D:/QwertyData/DebugCaptures"
+  }
+}"#;
+}
