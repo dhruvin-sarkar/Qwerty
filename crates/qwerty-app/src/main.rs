@@ -44,6 +44,10 @@ fn main() {
             }
         }
         Some("--themes") => ui::theme::print_report(),
+        // The v2 engine modes (p2 §2.15): --v2-list-devices, --v2-monitor, --v2-live, --v2-corpus.
+        Some(mode) if qwerty_app::engine::cli::is_v2(mode) => {
+            std::process::exit(qwerty_app::engine::cli::run(&args[1..]))
+        }
         None => {
             if let Err(e) = ui::shell::run() {
                 eprintln!("error: could not start the GUI: {e}");
@@ -85,6 +89,8 @@ fn print_usage() {
     println!("  qwerty-app --monitor [secs] [device]      live onset monitor + level meter (default 20s, default mic)");
     println!("  qwerty-app --live [zones] [taps] [device] calibrate then classify taps live (default 4 zones, 10 taps)");
     println!("  qwerty-app --themes                       show the 5 theme palettes + WCAG contrast check");
+    println!();
+    println!("{}", qwerty_app::engine::cli::USAGE);
     println!();
     println!(
         "  [device] = a list index (see --list-devices) or a name substring, e.g. \"Realtek\"."
