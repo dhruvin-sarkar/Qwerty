@@ -245,9 +245,8 @@ fn read_reg_text(
             )
         };
         if read == ERROR_MORE_DATA {
-            // The value grew between the two calls: retry with the size it reported, always
-            // larger than this buffer, so the loop cannot spin on one size.
-            size = got.max(size + 2);
+            // The value grew between the two calls: the next pass queries its new size again
+            // (that query ignores `size` on input and overwrites it).
             continue;
         }
         if read == ERROR_FILE_NOT_FOUND {
@@ -861,6 +860,9 @@ impl PlatformActions for WindowsPlatform {
                     Some(rect) => rect,
                     // The user dismissed the overlay (Escape) without selecting — a
                     // deliberate no-capture, not a failure.
+                    // SPEC: region_select.rs (kept unchanged, p2 file table) also returns `None`
+                    // after logging a Win32 setup failure, so that failure reports as Canceled
+                    // too; separating it needs a spec change to select_screen_region.
                     None => return Ok(Screenshot::Canceled),
                 }
             }
