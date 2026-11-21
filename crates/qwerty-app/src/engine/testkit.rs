@@ -25,7 +25,7 @@ use qwerty_core::veto::{InputEvent, OutputId, SelfOutputKind};
 use crate::engine::messages::{
     CaptureExit, CaptureRequest, DeviceMsg, DeviceWatch, InputRecord, OpenedCapture, OsParts,
     PacketMeta, RawInputMsg, RawInputRequest, RawInputStatus, RecorderDisk, StopSignal, ThreadEnd,
-    Worker,
+    Worker, WorkerId,
 };
 use crate::engine::protocol::{
     CaptureError, DeviceInfo, DeviceProbe, DeviceState, MmcssStatus, OpenedStream, ProbeOutcome,
@@ -130,6 +130,8 @@ struct FakeState {
     captures: Mutex<Vec<Arc<CaptureControl>>>,
     input: Mutex<Option<InputScript>>,
     raw_input_failure: Mutex<Option<VetoUnavailableReason>>,
+    /// The worker of every raw-input request that started, in order (each brought its own ring).
+    raw_input_workers: Mutex<Vec<WorkerId>>,
     platform: Mutex<PlatformState>,
     free_bytes: AtomicU64,
     recorder_stall: Mutex<Milliseconds>,
@@ -194,6 +196,7 @@ impl FakeOs {
                 captures: Mutex::new(Vec::new()),
                 input: Mutex::new(None),
                 raw_input_failure: Mutex::new(None),
+                raw_input_workers: Mutex::new(Vec::new()),
                 platform: Mutex::new(PlatformState {
                     calls: Vec::new(),
                     fail_next: None,
@@ -286,6 +289,14 @@ impl FakeOs {
     /// The next raw-input spawn fails with `reason` (once).
     pub fn fail_next_raw_input(&self, reason: VetoUnavailableReason) {
         *lock(&self.state.raw_input_failure) = Some(reason);
+    }
+
+    // SPEC: §2.11 lists no way to see which input ring a raw-input worker got; EN11 needs it to
+    // show each return to Active came with a fresh ring, so the testkit adds this query.
+    /// The worker id of every raw-input request that started, oldest first. Each request carries
+    /// its own new ring, so a new id here is a fresh input ring.
+    pub fn raw_input_workers(&self) -> Vec<WorkerId> {
+        lock(&self.state.raw_input_workers).clone()
     }
 
     /// Replayed by the fake raw-input worker after it reports Active (a running worker picks it
@@ -572,6 +583,7 @@ impl OsParts for FakeOs {
             tx,
             exits,
         } = request;
+        lock(&self.state.raw_input_workers).push(worker);
         Worker::spawn(
             worker,
             ThreadName::RawInput,

@@ -171,8 +171,46 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// How many engines may run at once in this binary. Each runs its processing thread on fake
+/// audio at `SPEED` × real time; with all 16 tests at once on a loaded machine processing fell
+/// behind, the capture ring overflowed, and every overflow is a discontinuity that restarts the
+/// detector (hundreds of InputFaults, no candidate at all), so scripted taps were never seen.
+fn engine_permits() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 3)
+        .unwrap_or(2)
+        .clamp(2, 6)
+}
+
+/// A slot among `engine_permits()`, held for a rig's whole life.
+struct Permit;
+
+static RUNNING: Mutex<usize> = Mutex::new(0);
+static FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+impl Permit {
+    fn take() -> Permit {
+        let limit = engine_permits();
+        let mut running = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+        while *running >= limit {
+            running = FREED.wait(running).unwrap_or_else(|p| p.into_inner());
+        }
+        *running += 1;
+        Permit
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut running = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+        *running -= 1;
+        FREED.notify_one();
+    }
+}
+
 /// One engine on a fake OS, with its events collected on a thread.
 struct Rig {
+    _permit: Permit,
     os: Arc<FakeOs>,
     handle: EngineHandle,
     events: Arc<Mutex<Vec<Event>>>,
@@ -205,6 +243,7 @@ impl Rig {
     }
 
     fn start(dir: PathBuf, os: Arc<FakeOs>, options: RigOptions) -> Rig {
+        let permit = Permit::take();
         for (info, script) in options.devices {
             os.add_device(info, script);
         }
@@ -220,6 +259,7 @@ impl Rig {
         let events = Arc::new(Mutex::new(Vec::new()));
         let collector = Some(collect(stream, Arc::clone(&events)));
         let rig = Rig {
+            _permit: permit,
             os,
             handle,
             events,
@@ -262,8 +302,10 @@ impl Rig {
             }
             if Instant::now() > deadline {
                 panic!(
-                    "timed out waiting for {what}; mode {:?}, capture {:?}, veto {:?}",
-                    s.mode, s.capture, s.veto
+                    "timed out waiting for {what}; mode {:?}, veto {:?}\n{}",
+                    s.mode,
+                    s.veto,
+                    self.diagnosis()
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -280,8 +322,9 @@ impl Rig {
             }
             if Instant::now() > deadline {
                 panic!(
-                    "timed out waiting for {what}; mode {:?}",
-                    self.snapshot().mode
+                    "timed out waiting for {what}; mode {:?}\n{}",
+                    self.snapshot().mode,
+                    self.diagnosis()
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -290,6 +333,35 @@ impl Rig {
 
     fn events(&self) -> Vec<Event> {
         self.events.lock().expect("events lock").clone()
+    }
+
+    /// What became of the scripted taps, for a timeout's message: the counters, the rejections
+    /// and the newest inspection entries.
+    fn diagnosis(&self) -> String {
+        let s = self.snapshot();
+        let rejected: Vec<String> = self
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                Event::TapRejected { rejected, .. } => Some(format!("{rejected:?}")),
+                Event::CalibrationFeedback { feedback } => Some(format!("{feedback:?}")),
+                _ => None,
+            })
+            .collect();
+        let inspection = match self.handle.request(Command::GetInspection) {
+            Ok(Reply::Inspection { entries }) => entries
+                .iter()
+                .rev()
+                .take(12)
+                .map(|e| format!("  {:?} {:?}", e.onset, e.outcome))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => format!("  no inspection: {other:?}"),
+        };
+        format!(
+            "counters {:?}\nwarnings {:?}\ncapture {:?}\nrejected {rejected:?}\ninspection (newest first):\n{inspection}",
+            s.health.counters, s.health.warnings, s.capture
+        )
     }
 
     fn fired(&self) -> Vec<TapReport> {
@@ -738,8 +810,24 @@ fn en4_a_stuck_action_fills_the_queue_and_the_next_fire_is_skipped() {
     rig.wait("dispatch_dropped", |s| {
         s.health.counters.dispatch_dropped > before
     });
-    assert!(
-        fired_count(&rig.events()) >= 18,
+    // TapFired precedes each Fire's job: the first QueueFull is exactly the 18th fire (one
+    // running chain, 16 queued behind it, then this one).
+    let events = rig.events();
+    let skip = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                Event::ActionSkipped {
+                    reason: SkipReason::QueueFull,
+                    ..
+                }
+            )
+        })
+        .expect("a QueueFull");
+    assert_eq!(
+        fired_count(&events[..skip]),
+        18,
         "a running chain, 16 queued and one more"
     );
     rig.finish();
@@ -864,7 +952,10 @@ fn en6_a_capture_panic_faults_the_engine() {
         .shutdown()
         .expect("shutdown after a fault");
     assert!(report.timed_out.is_empty(), "{report:?}");
+    // The run had the veto on (a run needs it), so the raw-input worker was running too.
+    assert_eq!(rig.os.raw_input_workers().len(), 1);
     for thread in [
+        ThreadName::RawInput,
         ThreadName::Processing,
         ThreadName::Dispatch,
         ThreadName::Recorder,
@@ -938,20 +1029,24 @@ fn en7_latency_identities() {
             .expect("an activity entry for the tap")
             .expect("its latency once completed");
         assert!((entry_latency.get() - ms_between(result.started_at, t.t0)).abs() < 1e-6);
-        // The detected onset lies close to a scripted tap's start (§1.6 onset tolerance).
+        // The detected onset lies within §1.6.4's T2 bound of a scripted tap's arrival at a mic:
+        // its start plus the propagation r / c, with r from the tap's position (two_taps puts
+        // the first on zone 0 and the second on zone 1) to that mic.
+        let positions = [tap_on(0), tap_on(1)];
         let nearest = starts
             .iter()
-            .map(|s| {
-                ms_between(
-                    t.t0,
-                    qwerty_app::engine::testkit::sample_time(stream_start, *s, format()),
-                )
-                .abs()
+            .zip(&positions)
+            .flat_map(|(s, tap)| {
+                let start = qwerty_app::engine::testkit::sample_time(stream_start, *s, format());
+                desk_mics().into_iter().map(move |m| {
+                    let r = ((tap.x - m.x).powi(2) + (tap.y - m.y).powi(2) + m.z.powi(2)).sqrt();
+                    (ms_between(t.t0, start) - r / SPEED_OF_SOUND * 1000.0).abs()
+                })
             })
             .fold(f64::INFINITY, f64::min);
         assert!(
             nearest <= ONSET_TOLERANCE_MS,
-            "t0 is {nearest} ms from the script"
+            "t0 is {nearest} ms from the nearest scripted arrival"
         );
     }
     // Health.latency is the stats of started_at − t0 over the fired taps.
@@ -1000,9 +1095,17 @@ fn en7_latency_identities() {
     rig.finish();
 }
 
-/// The detector's onset estimate against the scripted contact (T3 bounds it to 0.25 ms against
-/// the arrival; the fixture's arrival lags the contact by the desk's propagation delay).
-const ONSET_TOLERANCE_MS: f64 = 5.0;
+/// The detector's onset error against the true arrival: p01 §1.6.4 T2's hard bound (T3's
+/// 0.25 ms holds for one mic at a known position), plus the 0.01 m position jitter of the
+/// scripted taps (0.03 ms at the speed of sound).
+const ONSET_TOLERANCE_MS: f64 = 2.0 + 0.01 / SPEED_OF_SOUND * 1000.0;
+/// The desk model's speed of sound (m/s).
+const SPEED_OF_SOUND: f64 = 343.0;
+
+/// The fake capture's mics: the default desk at the scripts' rate and seed (`desk_script`).
+fn desk_mics() -> Vec<qwerty_core::desk::MicPos> {
+    qwerty_core::desk::DeskConfig::default_for(format().rate, 11).mics
+}
 
 #[test]
 fn en8_command_reply_table_and_typed_extraction() {
@@ -1035,16 +1138,84 @@ fn en8_command_reply_table_and_typed_extraction() {
         },
         Command::ShellToast,
         Command::DeleteDebugRecordings,
-        Command::GetSoundMap,
-        Command::SaveLatencyReport,
     ];
-    let mut answered = 0;
+    let mut refused = Vec::new();
     for command in commands {
-        if rig.request(command).is_ok() {
-            answered += 1;
+        let text = format!("{command:?}");
+        if let Err(e) = rig.request(command) {
+            refused.push(format!("{text}: {e:?}"));
         }
     }
-    assert!(answered >= 10, "only {answered} commands answered");
+    assert!(refused.is_empty(), "refused: {refused:#?}");
+    // These two need a calibrated active profile; Idle refuses them.
+    assert_eq!(
+        rig.request(Command::GetSoundMap).err(),
+        Some(EngineError::ProfileNotCalibrated)
+    );
+    assert_eq!(
+        rig.request(Command::SaveLatencyReport).err(),
+        Some(EngineError::NoActiveProfile)
+    );
+
+    // The rest of the table needs a calibrated profile and a saved evaluation report.
+    rig.calibrate("Desk");
+    let profile = rig
+        .snapshot()
+        .active_profile
+        .as_ref()
+        .expect("an active profile")
+        .id;
+    let zone = rig.zone_ids()[0];
+    rig.set_actions(zone, vec![copy("test")]);
+    rig.ok(Command::GetSoundMap);
+    rig.ok(Command::SaveLatencyReport);
+    rig.ok(Command::ExportProfile {
+        id: profile,
+        path: rig.dir.join("profile-export.json"),
+    });
+    rig.ok(Command::DuplicateProfile {
+        id: profile,
+        name: "Copy".to_string(),
+    });
+    rig.ok(Command::TestAction {
+        zone,
+        action_index: 0,
+        delay: Milliseconds::new(0.0),
+    });
+    rig.ok(Command::ListEvaluations { profile });
+    // An evaluation with no taps misses every prompt and ends with a report; with Evaluations
+    // a regular file, saving it fails, so the report is held unsaved.
+    let evaluations = rig.dir.join("Evaluations");
+    std::fs::remove_dir_all(&evaluations).expect("remove Evaluations");
+    std::fs::write(&evaluations, b"not a directory").expect("a file named Evaluations");
+    rig.ok(Command::StartEvaluation {
+        prompts_per_zone: 1,
+        negatives: Vec::new(),
+    });
+    rig.wait("Evaluating", |s| matches!(s.mode, Mode::Evaluating { .. }));
+    rig.wait("the evaluation to end", |s| s.mode == Mode::Listening);
+    rig.ok(Command::ExportUnsavedReport {
+        format: qwerty_app::engine::protocol::ReportFormat::Json,
+        path: rig.dir.join("unsaved.json"),
+    });
+    std::fs::remove_file(&evaluations).expect("remove the file");
+    std::fs::create_dir(&evaluations).expect("recreate Evaluations");
+    rig.ok(Command::RetrySaveReport);
+    let reports = rig
+        .ok(Command::ListEvaluations { profile })
+        .into_evaluations()
+        .expect("Evaluations");
+    let report = reports.first().expect("the saved report").report.clone();
+    rig.ok(Command::GetEvaluation {
+        profile,
+        report: report.clone(),
+    });
+    rig.ok(Command::ExportEvaluation {
+        profile,
+        report,
+        format: qwerty_app::engine::protocol::ReportFormat::Csv,
+        path: rig.dir.join("report.csv"),
+    });
     // Typed extraction: each into_* refuses every other variant with ProtocolMismatch.
     let snapshot = rig.ok(Command::GetSnapshot);
     let replies = vec![
@@ -1128,9 +1299,9 @@ fn en10_a_failed_commit_keeps_the_review() {
     std::fs::remove_dir_all(&profiles).expect("remove Profiles");
     std::fs::write(&profiles, b"not a directory").expect("a file named Profiles");
     rig.calibrate_to_build("Desk");
-    rig.wait("Review", |s| {
+    let review = step(&rig.wait("Review", |s| {
         matches!(step(s), Some(CalibrationStep::Review { .. }))
-    });
+    }));
     let commit = || Command::Calibration {
         action: CalibrationAction::Commit {
             name: "Desk".to_string(),
@@ -1148,6 +1319,7 @@ fn en10_a_failed_commit_keeps_the_review() {
         "the session left Review: {:?}",
         s.mode
     );
+    assert_eq!(step(&s), review, "the Review result changed");
     std::fs::remove_file(&profiles).expect("remove the file");
     std::fs::create_dir(&profiles).expect("recreate Profiles");
     let id = rig.ok(commit()).into_committed().expect("Committed");
@@ -1167,10 +1339,21 @@ fn en11_the_veto_comes_back_with_a_fresh_ring() {
             ..Default::default()
         },
     };
+    // Each return to Active comes from a new raw-input request, which brings its own ring.
+    let workers = || rig.os.raw_input_workers();
+    let first = workers();
+    assert_eq!(first.len(), 1, "one raw-input worker so far: {first:?}");
     rig.ok(veto(false));
     rig.wait("veto Disabled", |s| s.veto == VetoStatus::Disabled);
     rig.ok(veto(true));
     rig.wait("veto Active again", |s| s.veto == VetoStatus::Active);
+    let second = workers();
+    assert_eq!(
+        second.len(),
+        2,
+        "toggling on spawned a fresh worker: {second:?}"
+    );
+    assert_ne!(second[1], second[0]);
     // An unavailable veto comes back with RetryInputVeto.
     rig.os.fail_next_raw_input(
         qwerty_app::engine::protocol::VetoUnavailableReason::ThreadFailed {
@@ -1187,33 +1370,77 @@ fn en11_the_veto_comes_back_with_a_fresh_ring() {
     rig.wait("veto Active after the retry", |s| {
         s.veto == VetoStatus::Active
     });
+    // The failed spawn started no worker; the retry did, with its own ring.
+    let third = workers();
+    assert_eq!(
+        third.len(),
+        3,
+        "the retry spawned a fresh worker: {third:?}"
+    );
+    assert!(!third[..2].contains(&third[2]));
     rig.finish();
 }
 
 #[test]
 fn en12_late_messages_are_stale() {
-    let rig = Rig::new("en12");
+    const OTHER: &str = "mic-other";
+    let mut options = RigOptions::desk();
+    options.devices.push((
+        desk_device(OTHER, "Other mic", false, format()),
+        desk_script(),
+    ));
+    let rig = Rig::with("en12", options);
+    // Listening on a calibrated profile first: a recalibration on the same mic then keeps the
+    // capture and the veto across CancelCalibration, so neither worker's exit can be the stale
+    // message counted below.
+    rig.calibrate("Desk");
+    let workers = rig.os.raw_input_workers().len();
     rig.calibrate_to_build("Stale");
     rig.wait("Building", |s| {
-        matches!(
-            step(s),
-            Some(CalibrationStep::Building { .. }) | Some(CalibrationStep::Review { .. })
-        )
+        matches!(step(s), Some(CalibrationStep::Building { .. }))
     });
     let before = counters(&rig).stale_messages;
     rig.ok(Command::CancelCalibration);
-    rig.wait("Idle", |s| s.mode == Mode::Idle);
-    rig.wait("the build's late exit to count", |s| {
+    rig.wait("Listening", |s| s.mode == Mode::Listening);
+    rig.wait("the cancelled build's late message to count", |s| {
         s.health.counters.stale_messages > before
     });
-    // A capture exit from a replaced worker: close and reopen the capture.
+    assert_eq!(
+        rig.os.raw_input_workers().len(),
+        workers,
+        "the veto was kept, so its worker cannot be the stale sender"
+    );
+    // A capture exit from a replaced worker: a run on the other mic replaces the Listening
+    // capture, and cancelling it replaces that one in turn.
     let before = counters(&rig).stale_messages;
-    rig.start_run("Again");
-    rig.ok(Command::CancelCalibration);
-    rig.wait("Idle", |s| s.mode == Mode::Idle);
-    rig.wait("the old capture's exit to count", |s| {
+    rig.ok(Command::StartCalibration {
+        target: CalibrationTarget::New {
+            name: "Elsewhere".to_string(),
+        },
+        zones: drafts(),
+        device: DeviceChoice::Endpoint {
+            endpoint_id: OTHER.to_string(),
+        },
+        taps_per_zone: TAPS_PER_ZONE,
+    });
+    rig.wait("the other mic", |s| {
+        matches!(&s.capture, CaptureStatus::Running { opened, .. }
+            if opened.identity.endpoint_id == OTHER)
+    });
+    rig.wait("the replaced capture's exit to count", |s| {
         s.health.counters.stale_messages > before
     });
+    let before = counters(&rig).stale_messages;
+    rig.ok(Command::CancelCalibration);
+    rig.wait("Listening on the desk mic", |s| {
+        s.mode == Mode::Listening
+            && matches!(&s.capture, CaptureStatus::Running { opened, .. }
+                if opened.identity.endpoint_id == MIC)
+    });
+    rig.wait("the other capture's exit to count", |s| {
+        s.health.counters.stale_messages > before
+    });
+    assert_eq!(rig.os.raw_input_workers().len(), workers);
     rig.finish();
 }
 
@@ -1373,6 +1600,8 @@ fn en14_debug_capture_never_outlives_a_cli_session() {
         config["debug_capture_enabled"],
         serde_json::Value::Bool(false)
     );
+    // The first engine is shut down; give its slot back before the restart takes one.
+    drop(rig);
 
     let rig = Rig::start(
         dir.clone(),
