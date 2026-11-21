@@ -332,6 +332,11 @@ pub(crate) struct Controller {
     pending_calibration_start: Option<CalibrationStart>,
     segment_override: Option<SegmentKind>,
     run: Option<Run>,
+    /// The command (StartCalibration or Calibration) whose handler is installing a setup; a
+    /// calibration setup that fails then is returned to it as EngineError::Setup.
+    setup_caller: Option<CommandKind>,
+    /// The setup error that ended the run while `setup_caller` was set.
+    run_setup_error: Option<PipelineError>,
     auto_advance_at: Option<HostTime>,
     negatives_at: Option<HostTime>,
     evaluation: Option<Evaluation>,
@@ -353,6 +358,10 @@ pub(crate) struct Controller {
     trace_pending: Vec<TraceEntry>,
     last_trace_frame: HostTime,
     last_reject: HostTime,
+    /// The first setup epoch configured after the current model was loaded.
+    model_since: SetupEpoch,
+    /// The newest rejection inside the current 100 ms window, emitted when it ends.
+    pending_reject: Option<(RejectedBy, Option<ZoneId>)>,
     warnings: Vec<HealthWarning>,
     health: Option<ProcessingHealth>,
     drift: DriftWindow,
@@ -361,6 +370,10 @@ pub(crate) struct Controller {
     capture_dropped_seen: u64,
     events_dropped_seen: u64,
     controller_dropped_seen: u64,
+    decisions_dropped_seen: u64,
+    /// Processing's lifetime totals already folded into the counters (ProcessingDrops).
+    processing_messages_seen: u64,
+    processing_telemetry_seen: u64,
     // timers
     eval_tick_at: Option<HostTime>,
     debounce_at: Option<HostTime>,
@@ -596,6 +609,8 @@ impl Controller {
             pending_calibration_start: None,
             segment_override: None,
             run: None,
+            setup_caller: None,
+            run_setup_error: None,
             auto_advance_at: None,
             negatives_at: None,
             evaluation: None,
@@ -632,6 +647,8 @@ impl Controller {
             trace_pending: Vec::new(),
             last_trace_frame: now,
             last_reject: HostTime(i64::MIN / 2),
+            model_since: SetupEpoch(0),
+            pending_reject: None,
             warnings: Vec::new(),
             health: None,
             drift: DriftWindow::new(),
@@ -640,6 +657,9 @@ impl Controller {
             capture_dropped_seen: 0,
             events_dropped_seen: 0,
             controller_dropped_seen: 0,
+            decisions_dropped_seen: 0,
+            processing_messages_seen: 0,
+            processing_telemetry_seen: 0,
             eval_tick_at: None,
             debounce_at: None,
             health_at: after(now, HEALTH_INTERVAL),
@@ -807,6 +827,9 @@ impl Controller {
         if !self.trace_pending.is_empty() {
             consider(Some(after(self.last_trace_frame, TRACE_INTERVAL)));
         }
+        if self.pending_reject.is_some() {
+            consider(Some(after(self.last_reject, REJECT_INTERVAL)));
+        }
         deadline
     }
 
@@ -818,10 +841,26 @@ impl Controller {
     }
 
     fn run_timers(&mut self) {
+        let now = self.now();
         if self.fault.is_some() {
+            // Faulted (§2.11): no timer acts any more, but every deadline must move on or
+            // next_deadline stays in the past and the loop spins on a zero timeout.
+            self.eval_tick_at = None;
+            self.auto_advance_at = None;
+            self.negatives_at = None;
+            self.debounce_at = None;
+            self.retry = None;
+            self.pending_tests.clear();
+            self.pending_reject = None;
+            if !self.trace_pending.is_empty() && now >= after(self.last_trace_frame, TRACE_INTERVAL)
+            {
+                self.flush_trace(now);
+            }
+            if now >= self.health_at {
+                self.health_at = after(now, HEALTH_INTERVAL);
+            }
             return;
         }
-        let now = self.now();
         if let Some(t) = self.eval_tick_at {
             if now >= t {
                 self.eval_tick_at = Some(after(now, EVALUATION_TICK));
@@ -878,6 +917,11 @@ impl Controller {
         if !self.trace_pending.is_empty() && now >= after(self.last_trace_frame, TRACE_INTERVAL) {
             self.flush_trace(now);
         }
+        if now >= after(self.last_reject, REJECT_INTERVAL) {
+            if let Some((rejected, best_zone)) = self.pending_reject.take() {
+                self.emit_rejected(rejected, best_zone);
+            }
+        }
         if now >= self.health_at {
             self.health_at = after(now, HEALTH_INTERVAL);
             self.aggregate_health();
@@ -929,7 +973,11 @@ impl Controller {
                     self.state_pending = false;
                     self.last_state_sent = Some(self.now());
                 }
-                Err(TrySendError::Full(_)) => self.counters.events_dropped += 1,
+                Err(TrySendError::Full(_)) => {
+                    // Try again one publish interval later, not on every loop pass.
+                    self.counters.events_dropped += 1;
+                    self.last_state_sent = Some(self.now());
+                }
                 Err(TrySendError::Disconnected(_)) => self.state_pending = false,
             }
         }
@@ -1153,8 +1201,19 @@ impl Controller {
             }
             Some(CalibrationState::NeedsRecalibration { .. }) | None => None,
         };
-        self.drift.reset();
+        // Setups configured from now on run this model.
+        self.model_since = SetupEpoch(self.epoch.0 + 1);
+        self.reset_drift();
         self.pipeline_failed = None;
+    }
+
+    /// Forgets the drift window and clears its warning (§2.8: a profile switch, a committed
+    /// recalibration or a capture reopen). Once reset, `push` cannot report `Cleared`, so the
+    /// warning must go here.
+    fn reset_drift(&mut self) {
+        self.drift.reset();
+        self.warnings
+            .retain(|w| !matches!(w, HealthWarning::RecognitionDrift { .. }));
     }
 
     fn upsert_profile(&mut self, profile: Profile) {
@@ -1362,7 +1421,7 @@ impl Controller {
                     endpoint.to_string(),
                     DeviceAttempt::Opened(identity.clone()),
                 ));
-                self.drift.reset();
+                self.reset_drift();
                 self.pending_ring = Some(opened.ring);
                 self.configured = None;
                 if self.recording_on() {
@@ -1665,8 +1724,21 @@ impl Controller {
             return;
         }
         if self.run.is_some() {
-            // The calibration front end failed: the run cannot continue.
+            // The calibration front end failed: the run cannot continue, and leaving it in place
+            // would starve it of input with nothing shown. StartCalibration returns
+            // EngineError::Setup (§2.8 Reconcile); a later failure ends the run.
             self.counters.faults += 1;
+            self.end_run();
+            // A run StartCalibration never returned has nothing to end for the shell.
+            if self.setup_caller != Some(CommandKind::StartCalibration) {
+                self.emit(Event::CalibrationEnded {
+                    outcome: CalibrationOutcome::Cancelled,
+                });
+            }
+            if self.setup_caller.is_some() {
+                self.run_setup_error = Some(error);
+            }
+            self.reconcile();
             return;
         }
         if let Some(id) = self.active_id() {
@@ -1959,6 +2031,12 @@ impl Controller {
                 self.on_capture_lost(error);
             }
             (ThreadName::Build, ThreadEnd::Finished | ThreadEnd::Capture { .. }) => {
+                // The build thread sends its result before it exits, but on another channel,
+                // and the loop does not read channels in send order: handle anything still
+                // queued first, so only a result the thread failed to send counts as lost.
+                while let Ok(m) = self.ch.build.try_recv() {
+                    self.on_build(m);
+                }
                 let lost = self.build.as_ref().is_some_and(|b| !b.finished);
                 if let Some(build) = self.build.take() {
                     stop_worker(build.worker);
@@ -2047,6 +2125,20 @@ impl Controller {
             ProcessingBody::Health { .. } | ProcessingBody::SegmentLost
         );
         if !current && !any_epoch {
+            // A decision the old setup made before processing applied the new Configure is
+            // still a live outcome of the recorded stream: replay reproduces it up to the
+            // segment boundary (§2.13, RP2), so it is recorded although nothing acts on it.
+            // Only from a setup that ran the current model (so its zone maps to the same id)
+            // and that the recording covers.
+            let recorded = self
+                .recording
+                .as_ref()
+                .is_some_and(|r| r.first_epoch.0 != 0 && msg.epoch >= r.first_epoch);
+            if recorded && msg.epoch >= self.model_since {
+                if let ProcessingBody::Decision { decision } = &msg.body {
+                    self.record_decision(decision);
+                }
+            }
             self.counters.stale_messages += 1;
             return;
         }
@@ -2088,6 +2180,7 @@ impl Controller {
                 gates,
                 at,
             } => {
+                self.note_detector_outcome(false);
                 self.log_trace(
                     at,
                     TraceSource::Detected {
@@ -2147,6 +2240,7 @@ impl Controller {
 
     fn on_decision(&mut self, decision: TapDecision) {
         self.record_decision(&decision);
+        self.note_detector_outcome(false);
         self.log_trace(
             decision.decided_at,
             TraceSource::Decision {
@@ -2206,12 +2300,20 @@ impl Controller {
         let Some(rejected) = rejected else {
             return;
         };
-        let now = self.now();
-        if now < after(self.last_reject, REJECT_INTERVAL) {
+        let best_zone = decision.scores().and_then(|s| self.zone_id(s.best));
+        // p35 §3.3: ≤ 10 Hz, only the latest in each 100 ms window. Inside the window the newest
+        // rejection replaces the held one; the timer emits it when the window ends.
+        if self.now() < after(self.last_reject, REJECT_INTERVAL) {
+            self.pending_reject = Some((rejected, best_zone));
             return;
         }
-        self.last_reject = now;
-        let best_zone = decision.scores().and_then(|s| self.zone_id(s.best));
+        self.emit_rejected(rejected, best_zone);
+    }
+
+    /// Emits one coalesced `TapRejected` (and its `NotRecognized` entry) and opens a new window.
+    fn emit_rejected(&mut self, rejected: RejectedBy, best_zone: Option<ZoneId>) {
+        self.last_reject = self.now();
+        self.pending_reject = None;
         if let RejectedBy::Model { reason } = &rejected {
             self.push_activity(ActivityEntry::NotRecognized {
                 at: Utc::now(),
@@ -2588,7 +2690,15 @@ impl Controller {
     fn on_health(&mut self, health: ProcessingHealth) {
         let d = health.dropped;
         self.counters.decisions_dropped = d.decisions;
-        self.counters.telemetry_dropped = self.counters.telemetry_dropped.max(d.telemetry);
+        // ProcessingDrops are processing's lifetime totals; add only what is new, since the
+        // controller adds its own drops to the same counters (§2.11: Trace frames count in
+        // telemetry_dropped; every failed non-decision send counts in controller_dropped).
+        self.counters.telemetry_dropped +=
+            d.telemetry.saturating_sub(self.processing_telemetry_seen);
+        self.processing_telemetry_seen = self.processing_telemetry_seen.max(d.telemetry);
+        self.counters.controller_dropped +=
+            d.messages.saturating_sub(self.processing_messages_seen);
+        self.processing_messages_seen = self.processing_messages_seen.max(d.messages);
         self.counters.recorder_dropped_frames = d.recorder_frames;
         self.counters.recorder_dropped_events = d.recorder_events + self.decision_feed_dropped;
         // SPEC: §2.11's table names `input_dropped` but no source for it; the raw-input worker
@@ -2613,9 +2723,6 @@ impl Controller {
     }
 
     fn note_near_miss(&mut self, rejected: &qwerty_core::detector::RejectedCandidate) {
-        if !matches!(self.mode, Mode::Listening | Mode::Evaluating { .. }) {
-            return;
-        }
         use qwerty_core::detector::RejectReason;
         // A candidate without a gate report (Superseded, PendingOverflow, ...) is no near miss.
         let near = match &rejected.gates {
@@ -2627,10 +2734,20 @@ impl Controller {
             }
             None => false,
         };
+        self.note_detector_outcome(near);
+    }
+
+    /// One detector outcome for LowSignal's window (§2.8: the last 20 detector outcomes while
+    /// Listening or Evaluating). A candidate that passed the detector (a Decision or Detected)
+    /// is an outcome too, never a near miss.
+    fn note_detector_outcome(&mut self, near_miss: bool) {
+        if !matches!(self.mode, Mode::Listening | Mode::Evaluating { .. }) {
+            return;
+        }
         if self.near_misses.len() == LOW_SIGNAL_WINDOW {
             self.near_misses.pop_front();
         }
-        self.near_misses.push_back(near);
+        self.near_misses.push_back(near_miss);
     }
 
     fn aggregate_health(&mut self) {
@@ -2708,9 +2825,14 @@ impl Controller {
         }
         let dropped_now = self.devices_dropped.swap(0, Ordering::AcqRel);
         self.counters.controller_dropped += dropped_now;
-        if self.counters.controller_dropped > self.controller_dropped_seen {
+        // §2.11: a dropped decision and any other dropped message both mean the controller fell
+        // behind.
+        if self.counters.controller_dropped > self.controller_dropped_seen
+            || self.counters.decisions_dropped > self.decisions_dropped_seen
+        {
             keep.push(HealthWarning::ControllerOverloaded);
             self.controller_dropped_seen = self.counters.controller_dropped;
+            self.decisions_dropped_seen = self.counters.decisions_dropped;
         }
         if self.counters.events_dropped > self.events_dropped_seen {
             keep.push(HealthWarning::EventsDropped {
@@ -3735,7 +3857,14 @@ impl Controller {
             seed,
             taps_per_zone,
         });
+        self.setup_caller = Some(CommandKind::StartCalibration);
         self.ensure_setup(true);
+        self.setup_caller = None;
+        if let Some(error) = self.run_setup_error.take() {
+            // on_setup_error ended the run and reconciled.
+            self.pending_calibration_start = None;
+            return Err(EngineError::Setup { error });
+        }
         // INVARIANT: the run was stored just above.
         let run = self.run.as_ref().expect("the run was just stored");
         Ok(Reply::Calibration {
@@ -3793,6 +3922,21 @@ impl Controller {
     }
 
     fn calibration_action(
+        &mut self,
+        kind: CommandKind,
+        action: CalibrationAction,
+    ) -> Result<Reply, EngineError> {
+        self.setup_caller = Some(CommandKind::Calibration);
+        let result = self.calibration_step(kind, action);
+        self.setup_caller = None;
+        // A setup that could not be built ended the run (on_setup_error).
+        match self.run_setup_error.take() {
+            Some(error) => Err(EngineError::Setup { error }),
+            None => result,
+        }
+    }
+
+    fn calibration_step(
         &mut self,
         kind: CommandKind,
         action: CalibrationAction,
@@ -3865,8 +4009,11 @@ impl Controller {
             }
             CalibrationAction::Commit { name } => return self.commit(name),
         }
-        // INVARIANT: the run exists (checked on entry; no action above ends it).
-        let run = self.run.as_ref().expect("the run exists");
+        // Only a setup that could not be built ends the run above; calibration_action then
+        // returns that EngineError::Setup instead of this.
+        let Some(run) = self.run.as_ref() else {
+            return Err(self.invalid(kind));
+        };
         Ok(Reply::Calibration {
             run: Box::new(self.run_view(run)),
         })
@@ -3884,7 +4031,14 @@ impl Controller {
                 if fault {
                     self.counters.faults += 1;
                 }
-                if let TapFeedback::ZoneFull { .. } = feedback {
+                // XR-UI-02: arm when a zone that is not the last becomes full. The core gives
+                // the filling tap `Accepted` and only a later extra tap `ZoneFull`, so both
+                // arm; an armed timer is never pushed later.
+                let fills = matches!(
+                    feedback,
+                    TapFeedback::Accepted { .. } | TapFeedback::ZoneFull { .. }
+                );
+                if fills && self.auto_advance_at.is_none() {
                     let auto = matches!(self.run.as_ref().map(|r| &r.state), Some(RunState::Active(s)) if s.auto_advances());
                     if auto {
                         self.auto_advance_at = Some(after(self.now(), AUTO_ADVANCE_DELAY));
@@ -4385,7 +4539,7 @@ impl DriftWindow {
     }
 
     /// Forgets every outcome and the raised state (a profile switch, a committed recalibration or
-    /// a capture reopen). The caller clears the warning itself.
+    /// a capture reopen). The caller clears the warning itself (`Controller::reset_drift`).
     pub fn reset(&mut self) {
         self.samples.clear();
         self.raised = false;
