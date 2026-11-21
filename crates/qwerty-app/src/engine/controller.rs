@@ -1616,6 +1616,8 @@ impl Controller {
                             .iter()
                             .find(|z| z.id == *id)
                             .map(|z| z.trigger)
+                            // INVARIANT: Profile::validate (run on every load and save) checks
+                            // that every model zone id names one of the profile's zones.
                             .expect("a validated profile has every model zone")
                     })
                     .collect();
@@ -1947,10 +1949,13 @@ impl Controller {
         match (exit.thread, exit.end) {
             (ThreadName::Capture, ThreadEnd::Capture { exit: capture_exit }) => {
                 self.counters.capture_dropped_frames += capture_exit.dropped_frames;
-                let error = capture_exit.error.unwrap_or(CaptureError::Unexpected {
-                    stage: crate::engine::protocol::CaptureStage::Read,
-                    detail: "the capture thread ended without an error".to_string(),
-                });
+                let error = match capture_exit.error {
+                    Some(error) => error,
+                    None => CaptureError::Unexpected {
+                        stage: crate::engine::protocol::CaptureStage::Read,
+                        detail: "the capture thread ended without an error".to_string(),
+                    },
+                };
                 self.on_capture_lost(error);
             }
             (ThreadName::Build, ThreadEnd::Finished | ThreadEnd::Capture { .. }) => {
@@ -1966,7 +1971,10 @@ impl Controller {
                     }));
                 }
             }
-            (ThreadName::RawInput, _) => {
+            (
+                ThreadName::RawInput,
+                ThreadEnd::Finished | ThreadEnd::Capture { .. } | ThreadEnd::Panicked { .. },
+            ) => {
                 self.raw_input = None;
                 self.send_processing(ProcessingCmd::SetInputRing { inputs: None });
                 if !matches!(self.veto, VetoStatus::Unavailable { .. }) {
@@ -1978,9 +1986,18 @@ impl Controller {
                 }
                 self.reconcile();
             }
-            (thread, _) => {
+            (thread @ ThreadName::Capture, ThreadEnd::Finished)
+            | (
+                thread @ (ThreadName::Processing
+                | ThreadName::Dispatch
+                | ThreadName::Recorder
+                | ThreadName::Controller),
+                ThreadEnd::Finished | ThreadEnd::Capture { .. },
+            ) => {
                 self.enter_fault(thread, "the thread ended unexpectedly".to_string());
             }
+            // Panicked was handled above, before the match.
+            (thread, ThreadEnd::Panicked { message }) => self.enter_fault(thread, message),
         }
     }
 
@@ -2023,6 +2040,16 @@ impl Controller {
 
     fn on_processing(&mut self, msg: ProcessingMsg) {
         let current = msg.epoch == self.epoch;
+        // Health and SegmentLost apply whatever their epoch; anything else from an old setup is
+        // stale.
+        let any_epoch = matches!(
+            msg.body,
+            ProcessingBody::Health { .. } | ProcessingBody::SegmentLost
+        );
+        if !current && !any_epoch {
+            self.counters.stale_messages += 1;
+            return;
+        }
         match msg.body {
             ProcessingBody::Health { health } => self.on_health(health),
             ProcessingBody::SegmentLost => {
@@ -2036,7 +2063,6 @@ impl Controller {
                     self.counters.stale_messages += 1;
                 }
             }
-            _ if !current => self.counters.stale_messages += 1,
             ProcessingBody::Decision { decision } => self.on_decision(*decision),
             ProcessingBody::Gesture { event, at } => self.on_gesture(event, at),
             ProcessingBody::DetectorRejected { rejected, at } => {
@@ -2884,6 +2910,7 @@ impl Controller {
                     snapshot: Box::new(snapshot),
                 })
             }
+            // INVARIANT: on_command answers Shutdown itself and never calls handle with it.
             Command::Shutdown => unreachable!("Shutdown is handled before dispatch"),
             Command::SetListening { listening } => {
                 self.desired = if listening {
@@ -3087,11 +3114,9 @@ impl Controller {
                     let here = self
                         .os
                         .list_devices()
-                        .map(|list| {
-                            list.iter()
-                                .any(|d| d.endpoint_id == device.identity.endpoint_id)
-                        })
-                        .unwrap_or(false);
+                        .map_err(|error| EngineError::Capture { error })?
+                        .iter()
+                        .any(|d| d.endpoint_id == device.identity.endpoint_id);
                     profile.imported_at = if here { None } else { Some(Utc::now()) };
                 }
                 let new_id = profile.id;
@@ -4106,16 +4131,20 @@ impl Controller {
         let zone_refs: Vec<ZoneRef> = model
             .zone_ids
             .iter()
-            .map(|id| ZoneRef {
-                id: *id,
-                label: profile
+            .map(|id| {
+                profile
                     .zones
                     .iter()
                     .find(|z| z.id == *id)
-                    .map(|z| z.label.clone())
-                    .unwrap_or_default(),
+                    .map(|z| ZoneRef {
+                        id: *id,
+                        label: z.label.clone(),
+                    })
+                    .ok_or(EngineError::Profile {
+                        error: qwerty_core::store::ProfileError::ZoneNotFound { zone: *id },
+                    })
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         if self.config.input_veto_enabled {
             match &self.veto {
                 VetoStatus::Active => {}

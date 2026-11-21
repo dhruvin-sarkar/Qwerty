@@ -253,6 +253,8 @@ impl FakeOs {
                     None
                 }
             })
+            // INVARIANT: a running fake capture exists only for a Desk device (FailOpen never
+            // opens; a Panic capture is test misuse and fails the test here).
             .expect("release_taps: the endpoint has a Desk script");
         let position = capture.position.load(Ordering::Acquire);
         let mut released = lock(&capture.released);
