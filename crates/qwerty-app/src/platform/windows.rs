@@ -958,21 +958,26 @@ impl SpeechEngine for Tts {
     }
 }
 
+/// The Speak failure detail when the speech backend has no utterance callbacks (p35 R9).
+const CALLBACKS_UNSUPPORTED: &str = "utterance callbacks unsupported by the speech backend";
+
 /// Creates the engine on the speech thread. With an observer, the two utterance callbacks are
 /// registered once; each captures only the observer and calls its wait-free `speech_finished`
 /// (tts 0.26.3 runs the end callback inside its MediaEnded handler with its global mutexes held,
-/// and the stop callback inside `stop()`).
+/// and the stop callback inside `stop()`). An `Err` is every Speak's failure detail, verbatim.
 fn open_tts(observer: Option<Arc<dyn OutputObserver>>) -> Result<Tts, String> {
-    let tts = Tts::default().map_err(|e| format!("{e:?}"))?;
+    let unavailable = |what: String| format!("text-to-speech is unavailable: {what}");
+    let tts = Tts::default().map_err(|e| unavailable(format!("{e:?}")))?;
     if let Some(observer) = observer {
         if !tts.supported_features().utterance_callbacks {
-            return Err("the speech backend reports no utterance callbacks".to_string());
+            // R9: fail fast; there is no time-estimate fallback.
+            return Err(CALLBACKS_UNSUPPORTED.to_string());
         }
         let on_end = Arc::clone(&observer);
         tts.on_utterance_end(Some(Box::new(move |_| on_end.speech_finished())))
-            .map_err(|e| format!("registering the utterance end callback: {e:?}"))?;
+            .map_err(|e| unavailable(format!("registering the utterance end callback: {e:?}")))?;
         tts.on_utterance_stop(Some(Box::new(move |_| observer.speech_finished())))
-            .map_err(|e| format!("registering the utterance stop callback: {e:?}"))?;
+            .map_err(|e| unavailable(format!("registering the utterance stop callback: {e:?}")))?;
     }
     Ok(tts)
 }
@@ -1097,7 +1102,8 @@ fn request_speech(
     }
 }
 
-/// The speech thread's body. Every request is answered, even when the engine cannot be created.
+/// The speech thread's body. Every request is answered, even when the engine cannot be created:
+/// then each Speak fails with `open`'s error as its detail, unchanged.
 fn run_speech_worker<E: SpeechEngine>(
     open: impl FnOnce() -> Result<E, String>,
     observer: Option<&dyn OutputObserver>,
@@ -1117,7 +1123,7 @@ fn run_speech_worker<E: SpeechEngine>(
                         send_reply(
                             &reply,
                             SpeechReply::Failed {
-                                detail: format!("text-to-speech is unavailable: {detail}"),
+                                detail: detail.clone(),
                             },
                         );
                     }
@@ -1458,6 +1464,24 @@ mod tests {
         worker.stop();
         assert_each_speech_finished_once(&observer.calls());
         assert_eq!(observer.finishes(), 1);
+    }
+
+    /// p35 R9: with no utterance callbacks, each Speak fails fast with exactly the spec's detail.
+    #[test]
+    fn a_backend_without_utterance_callbacks_fails_each_speak_with_the_r9_detail() {
+        let observer = Arc::new(FakeObserver::default());
+        let worker = SpeechWorker::spawn(
+            || Err::<FakeTts, String>(CALLBACKS_UNSUPPORTED.to_string()),
+            Some(Arc::clone(&observer) as Arc<dyn OutputObserver>),
+        )
+        .expect("speech thread");
+        assert_eq!(
+            request_speech(&worker, Some(observer.as_ref()), "one"),
+            Err(ActionError::Speech {
+                detail: "utterance callbacks unsupported by the speech backend".to_string()
+            })
+        );
+        assert_each_speech_finished_once(&observer.calls());
     }
 
     #[test]
