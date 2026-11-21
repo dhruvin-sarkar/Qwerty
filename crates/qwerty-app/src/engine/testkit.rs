@@ -107,6 +107,10 @@ struct CaptureControl {
     position: AtomicU64,
     /// Taps to mix, by absolute start sample.
     released: Mutex<Vec<(u64, TapSpec)>>,
+    /// Every tap ever scheduled on this stream, by absolute start sample.
+    scheduled: Mutex<Vec<u64>>,
+    /// The fake time of sample 0.
+    stream_start: HostTime,
     invalidated: AtomicBool,
     stop: AtomicBool,
 }
@@ -125,6 +129,7 @@ struct FakeState {
     device_tx: Mutex<Option<Sender<DeviceMsg>>>,
     captures: Mutex<Vec<Arc<CaptureControl>>>,
     input: Mutex<Option<InputScript>>,
+    raw_input_failure: Mutex<Option<VetoUnavailableReason>>,
     platform: Mutex<PlatformState>,
     free_bytes: AtomicU64,
     recorder_stall: Mutex<Milliseconds>,
@@ -188,6 +193,7 @@ impl FakeOs {
                 device_tx: Mutex::new(None),
                 captures: Mutex::new(Vec::new()),
                 input: Mutex::new(None),
+                raw_input_failure: Mutex::new(None),
                 platform: Mutex::new(PlatformState {
                     calls: Vec::new(),
                     fail_next: None,
@@ -250,9 +256,34 @@ impl FakeOs {
             .expect("release_taps: the endpoint has a Desk script");
         let position = capture.position.load(Ordering::Acquire);
         let mut released = lock(&capture.released);
+        let mut scheduled = lock(&capture.scheduled);
         for t in taps {
-            released.push((position + rate.samples_in(t.at) as u64, t.tap));
+            let start = position + rate.samples_in(t.at) as u64;
+            released.push((start, t.tap));
+            scheduled.push(start);
         }
+    }
+
+    // SPEC: §2.11 lists no way to read where a released tap landed; EN7 needs it to compare t0
+    // with the scripted onset, so the testkit adds this query.
+    /// The running fake capture on `endpoint_id`: its stream start (the fake time of sample 0)
+    /// and the absolute start sample of every tap scheduled on it, in release order.
+    pub fn scheduled_taps(&self, endpoint_id: &str) -> Option<(HostTime, Vec<SampleIndex>)> {
+        lock(&self.state.captures)
+            .iter()
+            .rev()
+            .find(|c| c.endpoint_id == endpoint_id && !c.stop.load(Ordering::Acquire))
+            .map(|c| {
+                let starts = lock(&c.scheduled).iter().map(|s| SampleIndex(*s)).collect();
+                (c.stream_start, starts)
+            })
+    }
+
+    // SPEC: §2.11 lists no way to make the fake raw input unavailable; EN11 needs one for
+    // `RetryInputVeto` after `Unavailable`, so the testkit adds this switch.
+    /// The next raw-input spawn fails with `reason` (once).
+    pub fn fail_next_raw_input(&self, reason: VetoUnavailableReason) {
+        *lock(&self.state.raw_input_failure) = Some(reason);
     }
 
     /// Replayed by the fake raw-input worker after it reports Active (a running worker picks it
@@ -454,6 +485,12 @@ impl OsParts for FakeOs {
             ),
             invalidated: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            scheduled: Mutex::new(
+                taps.iter()
+                    .map(|t| format.rate.samples_in(t.at) as u64)
+                    .collect(),
+            ),
+            stream_start,
         });
         {
             let mut captures = lock(&self.state.captures);
@@ -521,6 +558,9 @@ impl OsParts for FakeOs {
     }
 
     fn spawn_raw_input(&self, request: RawInputRequest) -> Result<Worker, VetoUnavailableReason> {
+        if let Some(reason) = lock(&self.state.raw_input_failure).take() {
+            return Err(reason);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::clone(&self.state);
         let body_stop = Arc::clone(&stop);

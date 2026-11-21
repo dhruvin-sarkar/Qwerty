@@ -343,6 +343,10 @@ pub(crate) struct Controller {
     counters: EngineCounters,
     latency: std::collections::VecDeque<LatencySample>,
     latency_stats: LatencyStats,
+    /// Live decisions the recorder feed refused (part of recorder_dropped_events).
+    decision_feed_dropped: u64,
+    /// The workers a fault stopped, reported again by the Shutdown that follows.
+    fault_stops: Option<ShutdownReport>,
     recent: VecDeque<(u64, ActivityEntry)>,
     attention: Vec<AttentionItem>,
     inspection: VecDeque<TraceEntry>,
@@ -620,6 +624,8 @@ impl Controller {
             },
             latency: VecDeque::new(),
             latency_stats: LatencyStats::from_samples(&[], 0),
+            decision_feed_dropped: 0,
+            fault_stops: None,
             recent: VecDeque::new(),
             attention: Vec::new(),
             inspection: VecDeque::new(),
@@ -1256,6 +1262,12 @@ impl Controller {
                             opened: c.opened.clone(),
                             purpose,
                         };
+                        // A capture kept across a change of purpose (a Commit binds the profile
+                        // to the stream the wizard ran on) is this endpoint's attempt.
+                        self.device_attempt = Some((
+                            endpoint.clone(),
+                            DeviceAttempt::Opened(c.opened.identity.clone()),
+                        ));
                     }
                 } else {
                     let failed_here = matches!(&self.capture_status,
@@ -2108,6 +2120,7 @@ impl Controller {
     }
 
     fn on_decision(&mut self, decision: TapDecision) {
+        self.record_decision(&decision);
         self.log_trace(
             decision.decided_at,
             TraceSource::Decision {
@@ -2190,6 +2203,31 @@ impl Controller {
         self.model
             .as_ref()
             .and_then(|m| m.model.zone_ids.get(usize::from(zone.0)).copied())
+    }
+
+    // SPEC: §2.13 has processing send `Decision{onset, accepted_zone}` through the feed, but
+    // `ProcessingSetup::Pipeline` (WP-C0's type) carries no zone ids, so processing cannot name
+    // the accepted zone. The controller, which holds the model's `zone_ids`, sends it instead,
+    // on the same feed and with the same `try_send` and drop count.
+    /// The live outcome of a decision, for live-vs-replay equality (RP2).
+    fn record_decision(&mut self, decision: &TapDecision) {
+        if self.recording.is_none() {
+            return;
+        }
+        let accepted_zone = match decision.outcome {
+            DecisionOutcome::Accepted { zone, .. } => self.zone_id(zone),
+            DecisionOutcome::Vetoed { .. }
+            | DecisionOutcome::Rejected { .. }
+            | DecisionOutcome::Invalid { .. } => None,
+        };
+        let event = SidecarEvent::Decision {
+            onset: decision.onset,
+            accepted_zone,
+        };
+        if self.ch.feed_events.try_send(event).is_err() {
+            self.decision_feed_dropped += 1;
+            self.counters.recorder_dropped_events += 1;
+        }
     }
 
     fn zone_info(&self, zone: ZoneId) -> Option<(String, Vec<qwerty_core::profile::ActionSpec>)> {
@@ -2526,7 +2564,7 @@ impl Controller {
         self.counters.decisions_dropped = d.decisions;
         self.counters.telemetry_dropped = self.counters.telemetry_dropped.max(d.telemetry);
         self.counters.recorder_dropped_frames = d.recorder_frames;
-        self.counters.recorder_dropped_events = d.recorder_events;
+        self.counters.recorder_dropped_events = d.recorder_events + self.decision_feed_dropped;
         // SPEC: §2.11's table names `input_dropped` but no source for it; the raw-input worker
         // coalesces every overflow into one Gap record, and the timeline counts each Gap (and each
         // eviction) in `gaps`, the one lifetime count of input the veto could not see.
@@ -2675,8 +2713,7 @@ impl Controller {
             thread = thread.os_name(),
             "an engine thread panicked; the engine is faulted"
         );
-        let report = self.stop_workers();
-        drop(report);
+        self.fault_stops = Some(self.stop_workers());
         self.fault = Some((thread, message.clone()));
         self.run = None;
         self.evaluation = None;
@@ -2755,8 +2792,20 @@ impl Controller {
 
     fn shutdown_sequence(&mut self) -> ShutdownReport {
         self.shutting_down = true;
-
-        self.stop_workers()
+        let mut report = self.stop_workers();
+        // A fault already stopped the workers; its stops are this shutdown's too.
+        if let Some(earlier) = self.fault_stops.take() {
+            let mut joined = earlier.joined;
+            joined.append(&mut report.joined);
+            report.joined = joined;
+            let mut timed_out = earlier.timed_out;
+            timed_out.append(&mut report.timed_out);
+            report.timed_out = timed_out;
+            if report.recording.is_none() {
+                report.recording = earlier.recording;
+            }
+        }
+        report
     }
 
     /// The controller's own panic arm (§2.11): drop every worker (each Drop signals stop), run the
