@@ -11,8 +11,9 @@
 //! <data_dir>/Logs/qwerty.log, qwerty.1.log
 //! ```
 
+use std::ffi::OsStr;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -357,10 +358,18 @@ fn report_file(id: ProfileId, report: &ReportId) -> PathBuf {
     reports_dir(id).join(format!("{}.{JSON_EXTENSION}", report.0))
 }
 
-/// A report id names a file in the profile's folder: ASCII letters and digits only (the
-/// YYYYMMDDTHHMMSSmmmZ stamp, and v1's), so an id from outside can never reach another path.
+/// A report id names a file in the profile's folder: `<id>.json` is one plain file name whose
+/// stem is the id, which is exactly what list_reports lists. An id with a path separator, a root
+/// or a drive is refused, so an id from outside can never reach another path.
 fn is_report_id(report: &ReportId) -> bool {
-    !report.0.is_empty() && report.0.bytes().all(|b| b.is_ascii_alphanumeric())
+    let name = format!("{}.{JSON_EXTENSION}", report.0);
+    let name = Path::new(&name);
+    let mut parts = name.components();
+    let one_file_name = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    one_file_name && name.file_stem() == Some(OsStr::new(&report.0))
 }
 
 /// Import and export touch only the path the shell's dialog chose (PARITY-27): never the data
@@ -980,5 +989,89 @@ mod tests {
         let reloaded = data.load_config().expect("loads");
         assert_eq!(reloaded.status, ConfigStatus::Loaded);
         assert_eq!(reloaded.config, Config::initial());
+    }
+
+    /// Every id list_reports gives names a file that load_report reads and delete_report
+    /// removes, whatever the file is called (here the copy Explorer makes of a report).
+    #[test]
+    fn listed_report_ids_load_and_delete() {
+        let tmp = TempDir::new("listed-ids");
+        let root = tmp.0.join("data");
+        let data = DataDir::open(root.clone()).expect("opens");
+        let report = report();
+        let saved = data.save_report(&report).expect("saves the report");
+        let dir = root.join("Evaluations").join(report.profile_id.to_string());
+        let copy = ReportId(format!("{} - Copy", saved.0));
+        std::fs::copy(
+            dir.join(format!("{}.json", saved.0)),
+            dir.join(format!("{}.json", copy.0)),
+        )
+        .expect("copies the report");
+
+        let listed: Vec<ReportId> = data
+            .list_reports(report.profile_id)
+            .expect("lists")
+            .into_iter()
+            .map(|summary| summary.report)
+            .collect();
+        assert_eq!(listed, [saved, copy]);
+        for id in &listed {
+            match data.load_report(report.profile_id, id).expect("loads") {
+                Some(StoredReport::Current(back)) => assert_eq!(*back, report),
+                Some(StoredReport::Legacy) | None => panic!("{id:?} is listed, so it loads"),
+            }
+        }
+        for id in &listed {
+            assert!(
+                data.delete_report(report.profile_id, id).expect("deletes"),
+                "{id:?} is listed, so it is deleted"
+            );
+        }
+        assert!(data
+            .list_reports(report.profile_id)
+            .expect("lists")
+            .is_empty());
+    }
+
+    /// An id that is not the stem of one plain file name in the profile's folder reaches
+    /// nothing: a file one folder up, a file elsewhere by its full path, and the ".json" file
+    /// the listing never shows all stay as they are.
+    #[test]
+    fn report_ids_outside_the_folder_reach_nothing() {
+        let tmp = TempDir::new("outside-ids");
+        let root = tmp.0.join("data");
+        let data = DataDir::open(root.clone()).expect("opens");
+        let report = report();
+        data.save_report(&report).expect("saves the report");
+        let json = report.to_json().expect("valid");
+        let dir = root.join("Evaluations").join(report.profile_id.to_string());
+        let planted = [
+            root.join("Evaluations").join("outside.json"),
+            tmp.0.join("elsewhere.json"),
+            dir.join(".json"),
+        ];
+        for path in &planted {
+            std::fs::write(path, &json).expect("plants a report");
+        }
+
+        let mut ids = vec![
+            "../outside".to_string(),
+            tmp.0.join("elsewhere").display().to_string(),
+            String::new(),
+        ];
+        if cfg!(windows) {
+            ids.push("..\\outside".to_string());
+        }
+        for id in ids.into_iter().map(ReportId) {
+            let loaded = data.load_report(report.profile_id, &id).expect("no error");
+            assert!(loaded.is_none(), "{id:?} loads nothing");
+            let deleted = data
+                .delete_report(report.profile_id, &id)
+                .expect("no error");
+            assert!(!deleted, "{id:?} deletes nothing");
+        }
+        for path in &planted {
+            assert!(path.is_file(), "{} is untouched", path.display());
+        }
     }
 }
