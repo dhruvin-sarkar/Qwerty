@@ -62,6 +62,7 @@ impl Engine {
         options: EngineOptions,
         os: Arc<dyn OsParts>,
     ) -> Result<(EngineHandle, EventStream), EngineError> {
+        install_panic_hook();
         let persistence = |error| EngineError::Persistence { error };
         let (events_tx, events_rx) = crossbeam_channel::bounded::<Event>(EVENTS);
         // 1-2. The data folder and the config.
@@ -286,6 +287,38 @@ fn send_startup(events: &crossbeam_channel::Sender<Event>, event: Event) {
     if events.try_send(event).is_err() {
         tracing::error!("a startup event did not fit the empty event channel");
     }
+}
+
+/// §2.11 Panic policy: a tracing panic hook logs the thread, the panic location (file:line) and
+/// the message, so a worker's panic reaches the log and not only stderr (which the GUI process
+/// lacks). Installed once per process; the previous hook still runs after it.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "an unknown location".to_string());
+            let payload = info.payload();
+            let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            tracing::error!(
+                thread = thread.name().unwrap_or("unnamed"),
+                %location,
+                %message,
+                "a thread panicked"
+            );
+            previous(info);
+        }));
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
