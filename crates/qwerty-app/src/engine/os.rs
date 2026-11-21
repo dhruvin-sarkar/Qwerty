@@ -13,12 +13,12 @@ use qwerty_core::units::HostTime;
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-use crate::engine::clock;
 use crate::engine::messages::{
     CaptureRequest, DeviceMsg, DeviceWatch, OpenedCapture, OsParts, RawInputRequest, RecorderDisk,
     Worker,
 };
-use crate::engine::protocol::{CaptureError, CaptureStage, DeviceInfo, VetoUnavailableReason};
+use crate::engine::protocol::{CaptureError, DeviceInfo, VetoUnavailableReason};
+use crate::engine::{capture, clock, devices, rawinput};
 use crate::platform::{OutputObserver, PlatformActions};
 
 /// The product OS parts: QPC time, WASAPI capture and devices, Raw Input, the Windows platform.
@@ -30,9 +30,6 @@ impl WindowsParts {
         WindowsParts
     }
 }
-
-/// The text of a part that WP-C1/C3 provide and the integration step wires.
-const NOT_WIRED: &str = "this part is wired when WP-C1..C3 land";
 
 impl OsParts for WindowsParts {
     fn now(&self) -> HostTime {
@@ -51,11 +48,7 @@ impl OsParts for WindowsParts {
     }
 
     fn list_devices(&self) -> Result<Vec<DeviceInfo>, CaptureError> {
-        // SPEC: wired after C1-C4 land: `crate::engine::devices::list_capture_devices()`.
-        Err(CaptureError::Unexpected {
-            stage: CaptureStage::Enumerate,
-            detail: NOT_WIRED.to_string(),
-        })
+        devices::list_capture_devices()
     }
 
     fn watch_devices(
@@ -63,39 +56,23 @@ impl OsParts for WindowsParts {
         tx: Sender<DeviceMsg>,
         dropped: Arc<AtomicU64>,
     ) -> Result<DeviceWatch, CaptureError> {
-        // SPEC: wired after C1-C4 land: `crate::engine::devices::watch(tx, dropped)`.
-        drop((tx, dropped));
-        Err(CaptureError::Unexpected {
-            stage: CaptureStage::Enumerate,
-            detail: NOT_WIRED.to_string(),
-        })
+        devices::watch(tx, dropped)
     }
 
     fn open_capture(
         &self,
         request: CaptureRequest,
     ) -> Result<(Worker, OpenedCapture), CaptureError> {
-        // SPEC: wired after C1-C4 land: `crate::engine::capture::open(request)`.
-        drop(request);
-        Err(CaptureError::Unexpected {
-            stage: CaptureStage::Spawn,
-            detail: NOT_WIRED.to_string(),
-        })
+        capture::open(request)
     }
 
     fn spawn_raw_input(&self, request: RawInputRequest) -> Result<Worker, VetoUnavailableReason> {
-        // SPEC: wired after C1-C4 land: `crate::engine::rawinput::spawn(request)`.
-        drop(request);
-        Err(VetoUnavailableReason::ThreadFailed {
-            message: NOT_WIRED.to_string(),
-        })
+        rawinput::spawn(request)
     }
 
     fn platform(&self, observer: Arc<dyn OutputObserver>) -> Box<dyn PlatformActions> {
         let platform = crate::platform::windows::WindowsPlatform::new();
-        // SPEC: wired after C1-C4 land: WP-C2 adds `set_output_observer`; the integration step
-        // calls `platform.set_output_observer(observer)` here.
-        drop(observer);
+        platform.set_output_observer(observer);
         Box::new(platform)
     }
 

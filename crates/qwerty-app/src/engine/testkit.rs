@@ -1,14 +1,15 @@
-//! `FakeOs`, `FakePlatform` and the scripts (p2 Â§2.11; RUST-RT-3).
+//! `FakeOs`, `FakePlatform` and the scripts (p2 §2.11; RUST-RT-3).
 //!
 //! Public test support, like `qwerty_core::soak`: the integration tests in
 //! `crates/qwerty-app/tests/` drive the real controller, processing, dispatch and recorder through
 //! `Engine::start_with(options, Arc::new(fake))`. The product never constructs any of this.
 //!
-//! Fake time runs `speed`Ã— real time. Every wait goes through `OsParts::timeout_until`, so the
+//! Fake time runs `speed`× real time. Every wait goes through `OsParts::timeout_until`, so the
 //! engine's deadlines and this clock never disagree. The fake capture stamps each packet with the
 //! fake time of its first sample, so fake time and stream position share one timebase.
 
 use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -31,15 +32,15 @@ use crate::engine::protocol::{
     ThreadName, VetoUnavailableReason,
 };
 use crate::engine::ring::{audio_ring, PushOutcome, CAPTURE_RING};
-use crate::platform::{ActionError, OutputObserver, PlatformActions, ToastSpec};
+use crate::platform::{ActionError, OutputObserver, PlatformActions, Screenshot, ToastSpec};
 
 /// The fake clock's origin: 1000 s, so no engine time is ever near zero.
 const CLOCK_ORIGIN: HostTime = HostTime(1000 * HostTime::TICKS_PER_SECOND);
 /// The longest real sleep a fake thread takes before re-checking its stop flag.
 const POLL: Duration = Duration::from_millis(5);
-/// How long after a Speak returns the fake tts end callback fires (fake time, Â§2.11).
+/// How long after a Speak returns the fake tts end callback fires (fake time, §2.11).
 const SPEECH_END_AFTER: Milliseconds = Milliseconds::new(500.0);
-/// The fake raw-input ring (Â§2.11: rtrb InputRecord, 1024).
+/// The fake raw-input ring (§2.11: rtrb InputRecord, 1024).
 pub const INPUT_RING: usize = 1024;
 
 /// Locks a testkit mutex. A poisoned lock means a test thread panicked while holding it; the
@@ -49,10 +50,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().expect("a testkit lock is never poisoned")
 }
 
-/// A capture device's behaviour (Â§2.11).
+/// A capture device's behaviour (§2.11).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CaptureScript {
-    /// `qwerty_core::desk::ModalDesk` audio (Â§1.19.1): `DeskConfig::default_for(format.rate, seed)`
+    /// `qwerty_core::desk::ModalDesk` audio (§1.19.1): `DeskConfig::default_for(format.rate, seed)`
     /// with floor `Pink{rms: ambient}` (format.channels = its 2 mics), taps at fixed times from
     /// stream start, released in packets of `period`. Every open restarts the script at sample 0.
     Desk {
@@ -74,7 +75,7 @@ pub enum CaptureScript {
 pub struct ScriptedTap {
     /// From stream start in `Desk.taps`; from the current position in `release_taps`.
     pub at: Milliseconds,
-    /// Â§1.19.1; positions from `ModalDesk::zone_centres`.
+    /// §1.19.1; positions from `ModalDesk::zone_centres`.
     pub tap: TapSpec,
 }
 
@@ -167,13 +168,13 @@ impl FakeState {
     }
 }
 
-/// The fake OS parts (Â§2.11). Share it with the engine as `Arc<FakeOs>`; the test keeps a clone.
+/// The fake OS parts (§2.11). Share it with the engine as `Arc<FakeOs>`; the test keeps a clone.
 pub struct FakeOs {
     state: Arc<FakeState>,
 }
 
 impl FakeOs {
-    /// Fake time runs `speed`Ã— real time; `timeout_until` scales by it.
+    /// Fake time runs `speed`× real time; `timeout_until` scales by it.
     pub fn new(speed: f64) -> FakeOs {
         assert!(
             speed.is_finite() && speed > 0.0,
@@ -643,7 +644,7 @@ fn run_fake_capture(
         ..DeskConfig::default_for(format.rate, seed)
     };
     // INVARIANT: the default desk has two microphones and every scripted format here is the
-    // desk's own (format.channels = its 2 mics, Â§2.11).
+    // desk's own (format.channels = its 2 mics, §2.11).
     let mut desk = ModalDesk::new(config).expect("the default desk is valid");
     assert_eq!(
         desk.channels(),
@@ -743,7 +744,7 @@ struct PendingSpeech {
     remaining: u32,
 }
 
-/// The fake platform (Â§2.11): records every call into `FakeOs`'s log. Speak reports
+/// The fake platform (§2.11): records every call into `FakeOs`'s log. Speak reports
 /// `output_started(Speech)`, returns after the action time, and calls `speech_finished` 500 ms
 /// (fake) later from its own timer, as tts's end callback would; `stop_speech` fires every pending
 /// `speech_finished` at once; PlaySound reports Began/Ended around it.
@@ -776,18 +777,6 @@ impl FakePlatform {
         match fail {
             Some(error) => Err(error),
             None => Ok(()),
-        }
-    }
-
-    /// Ends all queued speech: each pending finish fires now, in order (Â§2.6 `stop_speech`).
-    // SPEC: wired after C1-C4 land: WP-C2 adds `stop_speech` (and `set_output_observer`) to
-    // `PlatformActions`; until then this is an inherent method, and the trait impl gains it then.
-    pub fn stop_speech(&self) {
-        let pending: Vec<PendingSpeech> = std::mem::take(&mut *lock(&self.pending_speech));
-        for p in pending {
-            for _ in 0..p.remaining {
-                self.observer.speech_finished();
-            }
         }
     }
 
@@ -839,11 +828,20 @@ impl PlatformActions for FakePlatform {
         })
     }
 
-    fn run_command(&self, cmd: &str, args: &[String]) -> Result<(), ActionError> {
+    fn run_command(&self, cmd: &str, args: &[String]) -> Result<Child, ActionError> {
         self.call(ActionSpec::RunCommand {
             command: cmd.to_string(),
             args: args.to_vec(),
-        })
+        })?;
+        // A real, immediately exiting child: `Child` has no public constructor. The scripted
+        // command itself never runs.
+        Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .map_err(|e| ActionError::LaunchFailed {
+                target: cmd.to_string(),
+                reason: e.to_string(),
+            })
     }
 
     fn copy_to_clipboard(&self, text: &str) -> Result<(), ActionError> {
@@ -858,7 +856,7 @@ impl PlatformActions for FakePlatform {
         let result = self.call(ActionSpec::Speak {
             text: text.to_string(),
         });
-        // Every Began{Speech} gets its finishes, whether the speech succeeds or fails (Â§2.6).
+        // Every Began{Speech} gets its finishes, whether the speech succeeds or fails (§2.6).
         self.schedule_speech_end(finishes);
         result
     }
@@ -876,8 +874,9 @@ impl PlatformActions for FakePlatform {
         result
     }
 
-    fn screenshot_to_clipboard(&self, mode: ScreenshotMode) -> Result<(), ActionError> {
+    fn screenshot_to_clipboard(&self, mode: ScreenshotMode) -> Result<Screenshot, ActionError> {
         self.call(ActionSpec::Screenshot { mode })
+            .map(|()| Screenshot::Copied)
     }
 
     fn notify(&self, toast: &ToastSpec) -> Result<(), ActionError> {
@@ -886,6 +885,22 @@ impl PlatformActions for FakePlatform {
             title: toast.title.clone(),
             body: toast.body.clone(),
         })
+    }
+
+    /// The observer is fixed at construction (`FakeOs::platform(observer)`); the engine never
+    /// registers a second one.
+    fn set_output_observer(&self, observer: Arc<dyn OutputObserver>) {
+        drop(observer);
+    }
+
+    /// Ends all queued speech: each pending finish fires now, in order (§2.6 `stop_speech`).
+    fn stop_speech(&self) {
+        let pending: Vec<PendingSpeech> = std::mem::take(&mut *lock(&self.pending_speech));
+        for p in pending {
+            for _ in 0..p.remaining {
+                self.observer.speech_finished();
+            }
+        }
     }
 }
 
