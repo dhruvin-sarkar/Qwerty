@@ -8,7 +8,8 @@
 //!   zones, negatives, build, review, commit), then Listening with decisions, fires and latency
 //!   stats; writes a `LatencyReport` at exit.
 //! - `--v2-corpus <class> <secs> [device] --data-dir <dir>`: a recording marked as a negative
-//!   corpus segment.
+//!   corpus segment, made while Listening on the data folder's calibrated profile (whose actions
+//!   must all be VisualOnly, as `--v2-live` leaves them).
 //!
 //! Recording is switched on only through `EngineOptions.debug_capture` (`--record` and
 //! `--v2-corpus`), never through the config (ADR-006). Every engine mode prints the recorder state.
@@ -31,14 +32,20 @@ use crate::engine::logfile::RotatingLog;
 use crate::engine::messages::OsParts;
 use crate::engine::os::WindowsParts;
 use crate::engine::protocol::{
-    AutostartPolicy, CalibrationAction, CalibrationTarget, Command, DebugCaptureMode, DeviceChoice,
-    DeviceInfo, EngineError, Event, Mode, ProbeOutcome, RecorderState, RunSession, Snapshot,
-    TelemetryFrame, TelemetryLevel, TraceEntry, TraceOutcome, ZoneDraft,
+    AutostartPolicy, CalibrationAction, CalibrationTarget, CaptureStatus, Command,
+    DebugCaptureMode, DeviceChoice, DeviceInfo, EngineError, Event, Mode, ProbeOutcome,
+    RecorderState, RunSession, Snapshot, TelemetryFrame, TelemetryLevel, TraceEntry, TraceOutcome,
+    ZoneDraft,
 };
 
 /// Exit codes: 0 success, 1 a runtime failure, 2 a usage error.
 pub const EXIT_FAILURE: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
+
+/// The longest the CLI waits on the engine alone (a step change, a capture or recorder start).
+const ENGINE_WAIT: Duration = Duration::from_secs(30);
+/// The longest it waits for the optional negatives step plus the model build.
+const BUILD_WAIT: Duration = Duration::from_secs(600);
 
 pub const USAGE: &str = "\
 v2 engine modes (hardware evidence; v1 stays the shipping app until WP-D1):
@@ -47,6 +54,7 @@ v2 engine modes (hardware evidence; v1 stays the shipping app until WP-D1):
   qwerty-app --v2-live [zones] [taps] [device] --data-dir <dir> [--record]
                                                                    (default 4 zones, 10 taps per zone)
   qwerty-app --v2-corpus <class> <secs> [device] --data-dir <dir>
+                                                                   (a --data-dir --v2-live calibrated)
   [device] = an index from --v2-list-devices, a name substring matching one device, or an endpoint id.
   <class>  = typing | clicking | speech | music | knocks | objects-set-down | everyday";
 
@@ -121,6 +129,10 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("error: {e}");
             EXIT_FAILURE
         }
+        Err(CliError::Stuck(why)) => {
+            eprintln!("error: {why}");
+            EXIT_FAILURE
+        }
     }
 }
 
@@ -134,6 +146,9 @@ enum CliError {
     Usage(UsageError),
     Engine(EngineError),
     Io(std::io::Error),
+    /// A wait that can no longer end: the engine faulted, the microphone was lost, the
+    /// recording ended, or the time limit passed (fail fast instead of hanging).
+    Stuck(String),
 }
 
 impl From<EngineError> for CliError {
@@ -428,19 +443,40 @@ impl Session {
         Ok(event)
     }
 
-    /// Waits for a snapshot satisfying `pred`, handing every other event to `on_event`.
+    /// Waits for a snapshot satisfying `pred`, handing every other event to `on_event`. Fails
+    /// with `Stuck` when the engine faults, when a calibration run loses its microphone, or
+    /// after `limit` (None: a wait on the user, such as their taps).
     fn wait_for(
         &mut self,
         pred: impl Fn(&Snapshot) -> bool,
         on_event: &mut dyn FnMut(&Event),
+        limit: Option<Duration>,
     ) -> Result<Arc<Snapshot>, CliError> {
+        let deadline = limit.map(|l| Instant::now() + l);
         loop {
             let s = self.handle.snapshot();
             if pred(&s) {
                 return Ok(s);
             }
-            if let Some(e) = self.next(Duration::from_millis(50))? {
-                on_event(&e);
+            if let Some(why) = stuck(&s) {
+                return Err(CliError::Stuck(why));
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(CliError::Stuck(format!(
+                    "nothing happened within {} s; mode {:?}, capture {:?}",
+                    limit.map_or(0, |l| l.as_secs()),
+                    s.mode,
+                    s.capture
+                )));
+            }
+            match self.next(Duration::from_millis(50))? {
+                Some(Event::EngineFaulted { thread, message }) => {
+                    return Err(CliError::Stuck(format!(
+                        "the engine faulted on {thread:?}: {message}"
+                    )))
+                }
+                Some(e) => on_event(&e),
+                None => {}
             }
         }
     }
@@ -463,10 +499,11 @@ impl Session {
     }
 }
 
-// SPEC: §2.15 gives `--v2-monitor` and `--v2-corpus` a `[device]`, but with no calibrated profile
-// the engine's Diagnostics capture opens the system default endpoint (§2.8 capture target), and
-// no command selects another one outside a calibration run. These modes therefore accept only the
-// default endpoint and refuse any other with a usage error naming it.
+// SPEC: §2.15 gives `--v2-monitor` a `[device]`, but with no calibrated profile the engine's
+// Diagnostics capture opens the system default endpoint (§2.8 capture target), and no command
+// selects another one outside a calibration run. This mode therefore accepts only the default
+// endpoint and refuses any other with a usage error naming it. (`--v2-corpus` records while
+// Listening, so its `[device]` must be the profile's bound endpoint.)
 fn require_default(session: &Session, device: &Option<String>) -> Result<(), CliError> {
     let Some(arg) = device else {
         return Ok(());
@@ -578,6 +615,26 @@ fn stdin_lines() -> Receiver<String> {
         }
     });
     rx
+}
+
+/// A state no CLI wait can leave: the engine faulted, or the calibration run lost its microphone.
+fn stuck(s: &Snapshot) -> Option<String> {
+    match &s.mode {
+        Mode::Faulted { .. } => Some(format!("the engine faulted: {:?}", s.mode)),
+        Mode::Calibrating { run } => match &run.session {
+            RunSession::MicLost { .. } => Some(format!(
+                "the microphone was lost during calibration: {:?}",
+                s.capture
+            )),
+            RunSession::Active { .. } => None,
+        },
+        Mode::Starting
+        | Mode::Idle
+        | Mode::Listening
+        | Mode::Paused
+        | Mode::Evaluating { .. }
+        | Mode::Blocked { .. } => None,
+    }
 }
 
 fn step(s: &Snapshot) -> Option<CalibrationStep> {
@@ -704,6 +761,7 @@ fn live(
                 && s.veto != crate::engine::protocol::VetoStatus::Registering
         },
         &mut show,
+        Some(ENGINE_WAIT),
     )?;
     prompt(
         &lines,
@@ -713,6 +771,7 @@ fn live(
     let review = session.wait_for(
         |s| matches!(step(s), Some(CalibrationStep::AmbientReview { .. })),
         &mut show,
+        Some(ENGINE_WAIT),
     )?;
     if let Some(CalibrationStep::AmbientReview {
         environment,
@@ -741,6 +800,8 @@ fn live(
                 Some(_) | None => false,
             },
             &mut show,
+            // The user's taps: no limit.
+            None,
         )?;
     }
     let answer = prompt(
@@ -761,6 +822,8 @@ fn live(
             )
         },
         &mut show,
+        // Negatives (if chosen) end on their own deadline; then the build.
+        Some(BUILD_WAIT),
     )?;
     match step(&review) {
         Some(CalibrationStep::Review { summary }) => {
@@ -773,7 +836,11 @@ fn live(
     }
     calibration(&session, CalibrationAction::Commit { name })?;
     // Fires do nothing on the machine: every zone's chain is VisualOnly.
-    let s = session.wait_for(|s| s.mode == Mode::Listening, &mut |_| {})?;
+    let s = session.wait_for(
+        |s| s.mode == Mode::Listening,
+        &mut |_| {},
+        Some(ENGINE_WAIT),
+    )?;
     let zone_ids: Vec<_> = s
         .active_profile
         .as_ref()
@@ -852,17 +919,53 @@ fn corpus(
     data_dir: PathBuf,
 ) -> Result<(), CliError> {
     let mut session = Session::start(data_dir, DebugCaptureMode::ForceOn)?;
-    require_default(&session, &device)?;
-    session
-        .handle
-        .request(Command::SetTelemetry {
-            level: TelemetryLevel::Diagnostics,
-        })?
-        .into_ack()?;
-    session.wait_for(
-        |s| matches!(s.recorder.state, RecorderState::Recording { .. }),
+    // §2.9.2 step 7: only --v2-monitor changes the telemetry level, so this mode records the
+    // capture a calibrated profile runs while Listening (with its veto, as in use), on the
+    // profile's bound endpoint.
+    let settled = session.wait_for(|s| s.mode != Mode::Starting, &mut |_| {}, Some(ENGINE_WAIT))?;
+    if settled.mode != Mode::Listening {
+        return Err(CliError::Stuck(format!(
+            "--v2-corpus records while Listening, so --data-dir needs a calibrated active profile (run --v2-live with it first); mode {:?}",
+            settled.mode
+        )));
+    }
+    // Listening fires the profile's chains; a corpus session must never run real actions.
+    let acts = settled.active_profile.as_ref().is_some_and(|p| {
+        p.zones
+            .iter()
+            .flat_map(|z| &z.actions)
+            .any(|a| *a != ActionSpec::VisualOnly)
+    });
+    if acts {
+        return Err(CliError::Stuck(
+            "the active profile has actions that would run on every fire; use a --data-dir whose profile only has VisualOnly actions (as --v2-live leaves it)".to_string(),
+        ));
+    }
+    if let Some(arg) = &device {
+        let devices = session.devices()?;
+        let wanted = resolve_device(&devices, arg)?;
+        let bound = match &settled.capture {
+            CaptureStatus::Running { opened, .. } => Some(opened.identity.endpoint_id.as_str()),
+            CaptureStatus::Off | CaptureStatus::Failed { .. } => None,
+        };
+        if bound != Some(wanted.endpoint_id.as_str()) {
+            return Err(CliError::Usage(UsageError(format!(
+                "{} is not the active profile's microphone; this mode records the profile's bound device",
+                wanted.name
+            ))));
+        }
+    }
+    let s = session.wait_for(
+        |s| !matches!(s.recorder.state, RecorderState::Off),
         &mut |_| {},
+        Some(ENGINE_WAIT),
     )?;
+    if !matches!(s.recorder.state, RecorderState::Recording { .. }) {
+        return Err(CliError::Stuck(format!(
+            "the recording did not start: {:?}",
+            s.recorder.state
+        )));
+    }
     session
         .handle
         .request(Command::MarkSegment {
