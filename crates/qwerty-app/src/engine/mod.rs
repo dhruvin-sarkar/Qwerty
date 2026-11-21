@@ -21,3 +21,4 @@ pub mod recorder;
 pub mod ring;
 pub mod telemetry;
 pub mod testkit;
+pub use handle::{Engine, EngineHandle, EngineOptions, EventStream};
