@@ -358,7 +358,13 @@ impl Processing {
                 self.epoch = epoch;
                 self.setup = Setup::from_message(setup);
                 self.segment = segment;
-                self.calibration_started = calibration_started;
+                // The controller attaches the calibration seed to one Configure only. When a
+                // second Configure arrives before that one saw its first block (RecordAmbient's
+                // re-Configure right after StartCalibration), CalibrationStarted is still
+                // unwritten and must carry over to the next first block. An Idle setup ends it.
+                if calibration_started.is_some() || !self.first_block {
+                    self.calibration_started = calibration_started;
+                }
                 self.first_block = true;
                 self.ambient.clear();
                 self.last_packet = None;
@@ -371,6 +377,7 @@ impl Processing {
                 if self.setup.is_idle() {
                     self.ring = None;
                     self.telemetry.clear_format();
+                    self.calibration_started = None;
                 }
             }
             ProcessingCmd::SetInputRing { inputs } => self.inputs = inputs,
@@ -729,5 +736,62 @@ mod tests {
         let popped: Vec<u64> = std::iter::from_fn(|| fifo.pop()).map(|id| id.0).collect();
         assert_eq!(popped, (4..20).collect::<Vec<u64>>());
         assert_eq!(fifo.pop(), None);
+    }
+
+    fn calibration_setup() -> ProcessingSetup {
+        use qwerty_core::audio::ChannelLayout;
+        use qwerty_core::detector::DetectorParams;
+        use qwerty_core::units::{ChannelCount, SampleRate};
+        let format = AudioFormat {
+            rate: SampleRate::new(48_000).expect("rate"),
+            channels: ChannelCount::new(2).expect("channels"),
+        };
+        let layout = ChannelLayout::all_real(format.channels);
+        let front_end = CalibrationFrontEnd::new(format, &layout, &DetectorParams::DEFAULT)
+            .expect("a calibration front end");
+        ProcessingSetup::Calibration {
+            front_end: Box::new(front_end),
+            forward_ambient: false,
+        }
+    }
+
+    fn configure(
+        epoch: u64,
+        setup: ProcessingSetup,
+        calibration_started: Option<CalibrationStart>,
+    ) -> ProcessingCmd {
+        ProcessingCmd::Configure {
+            epoch: SetupEpoch(epoch),
+            setup,
+            segment: SegmentKind::Idle,
+            calibration_started,
+            ring: None,
+        }
+    }
+
+    /// C5-CONC-2: StartCalibration's Configure carries the seed; RecordAmbient's re-Configure,
+    /// arriving before the first block, carries none. The seed must survive to the first block.
+    #[test]
+    fn a_second_configure_before_the_first_block_keeps_the_calibration_seed() {
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let (events, _events_rx) = crossbeam_channel::bounded(8);
+        let (_self_tx, self_output) = crossbeam_channel::bounded(8);
+        let os: Arc<dyn OsParts> = Arc::new(crate::engine::testkit::FakeOs::new(1.0));
+        let mut p = Processing::new(tx, events, self_output, Arc::new(SpeechEnds::default()), os);
+        let start = CalibrationStart {
+            seed: 7,
+            taps_per_zone: 5,
+        };
+        p.command(configure(1, calibration_setup(), Some(start)));
+        p.command(configure(2, calibration_setup(), None));
+        assert_eq!(p.calibration_started, Some(start), "the seed was lost");
+        // Once a block has passed under it, a Configure without one ends it.
+        p.first_block = false;
+        p.command(configure(3, calibration_setup(), None));
+        assert_eq!(p.calibration_started, None);
+        // An Idle setup ends an unwritten one too.
+        p.command(configure(4, calibration_setup(), Some(start)));
+        p.command(configure(5, ProcessingSetup::Idle, None));
+        assert_eq!(p.calibration_started, None);
     }
 }
