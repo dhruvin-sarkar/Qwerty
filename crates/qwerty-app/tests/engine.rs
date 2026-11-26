@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use qwerty_app::engine::protocol::{
     ActionResult, ActivityEntry, AutostartPolicy, Blocker, CalibrationAction, CalibrationTarget,
     CaptureError, CapturePurpose, CaptureStatus, Command, DebugCaptureMode, DeviceChoice,
-    DeviceInfo, DeviceState, EngineError, Event, Mode, PersistenceFailureKind, ProbeOutcome,
-    RecorderState, RecorderStopReason, Reply, ReplyKind, RetryState, RunSession, SkipReason,
-    Snapshot, StepOutcome, TapRef, TapReport, TelemetryLevel, ThreadName, VetoStatus, ZoneDraft,
+    DeviceInfo, DeviceState, EngineError, Event, HealthWarning, Mode, PersistenceFailureKind,
+    ProbeOutcome, RecorderState, RecorderStopReason, Reply, ReplyKind, RetryState, RunSession,
+    SkipReason, Snapshot, StepOutcome, TapRef, TapReport, TelemetryLevel, ThreadName, VetoStatus,
+    ZoneDraft,
 };
 use qwerty_app::engine::testkit::{desk_device, CaptureScript, FakeOs, InputScript, ScriptedTap};
 use qwerty_app::engine::{Engine, EngineHandle, EngineOptions, EventStream};
@@ -1797,4 +1798,42 @@ fn rp2_live_and_replay_agree() {
         );
     }
     remove_dir(&dir);
+}
+
+/// §2.11: ring drops surface as `capture_dropped_frames` and `CaptureOverflow` while the stream
+/// still runs, and a stop the controller starts loses none of them.
+#[test]
+fn capture_drops_show_while_the_stream_runs() {
+    let rig = Rig::new("capture-drops");
+    rig.ok(Command::SetTelemetry {
+        level: TelemetryLevel::Diagnostics,
+    });
+    rig.wait("the Diagnostics capture", |s| {
+        matches!(s.capture, CaptureStatus::Running { .. })
+    });
+    rig.os.drop_packets(MIC, 3);
+    // 3 packets of 10 ms at 48 kHz.
+    let dropped = 3 * 480;
+    rig.wait("CaptureOverflow", |s| {
+        s.health
+            .warnings
+            .iter()
+            .any(|w| matches!(w, HealthWarning::CaptureOverflow { .. }))
+    });
+    rig.wait("the drops and packets while the stream runs", |s| {
+        s.health.counters.capture_dropped_frames == dropped
+            && s.health.counters.capture_packets > 3
+            && matches!(s.capture, CaptureStatus::Running { .. })
+    });
+    rig.ok(Command::SetTelemetry {
+        level: TelemetryLevel::Off,
+    });
+    rig.wait("the capture stopped", |s| s.capture == CaptureStatus::Off);
+    // The stopped worker's exit arrives after the stop; it must not count the drops again.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        rig.snapshot().health.counters.capture_dropped_frames,
+        dropped
+    );
+    rig.finish();
 }

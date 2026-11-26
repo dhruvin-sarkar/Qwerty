@@ -367,7 +367,7 @@ fn run_controller(
 }
 
 /// The snapshot the slot holds before the controller publishes its first one.
-fn starting_snapshot() -> Snapshot {
+pub(crate) fn starting_snapshot() -> Snapshot {
     Snapshot {
         revision: 0,
         mode: Mode::Starting,
@@ -391,6 +391,7 @@ fn starting_snapshot() -> Snapshot {
                 input_vetoed: 0,
                 actions_failed: 0,
                 capture_dropped_frames: 0,
+                capture_packets: 0,
                 controller_dropped: 0,
                 events_dropped: 0,
                 telemetry_dropped: 0,

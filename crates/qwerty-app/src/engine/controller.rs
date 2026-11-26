@@ -47,11 +47,11 @@ use qwerty_core::units::{CandidateId, HostDuration, HostTime, Milliseconds};
 use qwerty_core::veto::{SelfOutputKind, VetoParams};
 
 use crate::engine::messages::{
-    AmbientChunk, BuildMsg, CalibrationStart, CaptureRequest, CommandMsg, DeviceMsg, DeviceWatch,
-    DispatchJob, DispatchMsg, DispatchQueue, InputRecord, JobKey, OsParts, ProcessingBody,
-    ProcessingCmd, ProcessingHealth, ProcessingMsg, ProcessingSetup, RawInputMsg, RawInputRequest,
-    RawInputStatus, RecorderCmd, RecorderFeed, RecorderMsg, SelfOutputLink, SetupEpoch, SpeechEnds,
-    ThreadEnd, ThreadExit, Worker, WorkerId,
+    AmbientChunk, BuildMsg, CalibrationStart, CaptureCounters, CaptureRequest, CommandMsg,
+    DeviceMsg, DeviceWatch, DispatchJob, DispatchMsg, DispatchQueue, InputRecord, JobKey, OsParts,
+    ProcessingBody, ProcessingCmd, ProcessingHealth, ProcessingMsg, ProcessingSetup, RawInputMsg,
+    RawInputRequest, RawInputStatus, RecorderCmd, RecorderFeed, RecorderMsg, SelfOutputLink,
+    SetupEpoch, SpeechEnds, ThreadEnd, ThreadExit, Worker, WorkerId,
 };
 use crate::engine::modes::{
     self, Activity, DeviceReadiness, ModeInputs, PipelineReadiness, ProfileReadiness,
@@ -298,6 +298,8 @@ pub(crate) struct Controller {
     build_lost: Arc<AtomicU64>,
     device_watch: Option<DeviceWatch>,
     devices_dropped: Arc<AtomicU64>,
+    /// Shared with every capture worker; read into the counters each health tick.
+    capture_counters: Arc<CaptureCounters>,
     next_worker: u64,
     epoch: SetupEpoch,
     next_job: u64,
@@ -576,6 +578,7 @@ impl Controller {
             build_lost: Arc::new(AtomicU64::new(0)),
             device_watch: None,
             devices_dropped: Arc::new(AtomicU64::new(0)),
+            capture_counters: Arc::default(),
             next_worker: workers.next_worker,
             epoch: SetupEpoch(0),
             next_job: 0,
@@ -625,6 +628,7 @@ impl Controller {
                 input_vetoed: 0,
                 actions_failed: 0,
                 capture_dropped_frames: 0,
+                capture_packets: 0,
                 controller_dropped: 0,
                 events_dropped: 0,
                 telemetry_dropped: 0,
@@ -1402,6 +1406,7 @@ impl Controller {
             endpoint_id: endpoint.to_string(),
             wake: self.processing_thread.clone(),
             exits: self.ch.exits_tx.clone(),
+            counters: Arc::clone(&self.capture_counters),
         };
         match self.os.open_capture(request) {
             Ok((worker, opened)) => {
@@ -2020,7 +2025,7 @@ impl Controller {
         }
         match (exit.thread, exit.end) {
             (ThreadName::Capture, ThreadEnd::Capture { exit: capture_exit }) => {
-                self.counters.capture_dropped_frames += capture_exit.dropped_frames;
+                // Its packets and dropped frames are already in `capture_counters`.
                 let error = match capture_exit.error {
                     Some(error) => error,
                     None => CaptureError::Unexpected {
@@ -2817,6 +2822,9 @@ impl Controller {
                 keep.push(HealthWarning::MmcssUnavailable { code });
             }
         }
+        self.counters.capture_packets = self.capture_counters.packets.load(Ordering::Relaxed);
+        self.counters.capture_dropped_frames =
+            self.capture_counters.dropped_frames.load(Ordering::Relaxed);
         if self.counters.capture_dropped_frames > self.capture_dropped_seen {
             keep.push(HealthWarning::CaptureOverflow {
                 frames: self.counters.capture_dropped_frames - self.capture_dropped_seen,

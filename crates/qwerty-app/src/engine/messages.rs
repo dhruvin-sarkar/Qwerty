@@ -246,12 +246,26 @@ impl DeviceWatch {
 // Capture and devices (§2.3, §2.4)
 // ---------------------------------------------------------------------------
 
+// SPEC: §2.3's CaptureRequest has no counters, and CaptureExit reports a stream's packets and
+// dropped frames only when its thread ends. The controller takes the Worker before a stop it
+// starts, so that exit is stale; and while the stream runs nothing would reach
+// `capture_dropped_frames` or `CaptureOverflow` (§2.11, §2.8). The capture thread therefore also
+// adds each packet and each lost frame to these engine-lifetime atomics (no channel, no lock),
+// which the controller reads every health tick.
+/// Engine-lifetime capture totals across every capture worker, written by the capture threads.
+#[derive(Debug, Default)]
+pub struct CaptureCounters {
+    pub packets: AtomicU64,
+    pub dropped_frames: AtomicU64,
+}
+
 pub struct CaptureRequest {
     pub worker: WorkerId,
     pub endpoint_id: String,
     /// processing
     pub wake: std::thread::Thread,
     pub exits: Sender<ThreadExit>,
+    pub counters: Arc<CaptureCounters>,
 }
 
 pub struct OpenedCapture {

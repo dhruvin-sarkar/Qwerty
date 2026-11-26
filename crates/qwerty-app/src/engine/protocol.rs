@@ -1019,6 +1019,10 @@ pub struct EngineCounters {
     pub input_vetoed: u64,
     pub actions_failed: u64,
     pub capture_dropped_frames: u64,
+    // SPEC: §2.9 has no packet counter, but p35 §4.2 WP-C1's `--v2-monitor` evidence names the
+    // packets a stream delivered; this is CaptureExit.packets summed over every capture worker,
+    // read live like `capture_dropped_frames`.
+    pub capture_packets: u64,
     pub controller_dropped: u64,
     pub events_dropped: u64,
     pub telemetry_dropped: u64,
@@ -2080,6 +2084,7 @@ mod tests {
             input_vetoed: 1,
             actions_failed: 0,
             capture_dropped_frames: 0,
+            capture_packets: 0,
             controller_dropped: 0,
             events_dropped: 0,
             telemetry_dropped: 0,
@@ -3558,6 +3563,7 @@ mod tests {
       "input_vetoed": 1,
       "actions_failed": 0,
       "capture_dropped_frames": 0,
+      "capture_packets": 0,
       "controller_dropped": 0,
       "events_dropped": 0,
       "telemetry_dropped": 0,

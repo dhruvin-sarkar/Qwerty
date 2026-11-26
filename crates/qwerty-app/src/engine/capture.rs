@@ -5,6 +5,7 @@
 //! `messages.rs`, and the serde ones (`OpenedStream`, `MmcssStatus`, `CaptureStage`,
 //! `CaptureError`, `DeviceProbe`) in `protocol.rs` (WP-C0); this module holds the behaviour.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::Thread;
 use std::time::Duration;
@@ -28,7 +29,8 @@ use windows::Win32::System::Threading::{
 
 use crate::engine::devices::{self, from_wasapi_state};
 use crate::engine::messages::{
-    CaptureExit, CaptureRequest, OpenedCapture, PacketMeta, StopSignal, ThreadEnd, Worker,
+    CaptureCounters, CaptureExit, CaptureRequest, OpenedCapture, PacketMeta, StopSignal, ThreadEnd,
+    Worker,
 };
 use crate::engine::protocol::{
     CaptureError, CaptureStage, DeviceProbe, DeviceState, MmcssStatus, OpenedStream, ThreadName,
@@ -61,6 +63,7 @@ pub fn open(request: CaptureRequest) -> Result<(Worker, OpenedCapture), CaptureE
         endpoint_id,
         wake,
         exits,
+        counters,
     } = request;
     let stop = Arc::new(StopEvent::new().map_err(|e| CaptureError::Os {
         stage: CaptureStage::Spawn,
@@ -74,7 +77,7 @@ pub fn open(request: CaptureRequest) -> Result<(Worker, OpenedCapture), CaptureE
         Box::new(CaptureStop(stop)),
         exits,
         move || ThreadEnd::Capture {
-            exit: run(&endpoint_id, &wake, &thread_stop, &opened_tx),
+            exit: run(&endpoint_id, &wake, &thread_stop, &opened_tx, counters),
         },
     )
     // SPEC: §2.3 names no CaptureError for a failed thread spawn; Worker::spawn's only error is
@@ -245,13 +248,14 @@ fn run(
     wake: &Thread,
     stop: &StopEvent,
     opened: &Sender<OpenResult>,
+    counters: Arc<CaptureCounters>,
 ) -> CaptureExit {
     let _com = match ComApartment::enter() {
         Ok(com) => com,
         Err(error) => return fail(opened, error),
     };
     // Every COM object lives inside `session` and is released before `_com` uninitializes.
-    session(endpoint_id, wake, stop, opened)
+    session(endpoint_id, wake, stop, opened, counters)
 }
 
 /// Open (steps 2-8), stream (the loop), and release.
@@ -260,8 +264,9 @@ fn session(
     wake: &Thread,
     stop: &StopEvent,
     opened: &Sender<OpenResult>,
+    counters: Arc<CaptureCounters>,
 ) -> CaptureExit {
-    let (mut stream, facts, reader) = match open_stream(endpoint_id) {
+    let (mut stream, facts, reader) = match open_stream(endpoint_id, counters) {
         Ok(parts) => parts,
         Err(error) => return fail(opened, error),
     };
@@ -506,7 +511,10 @@ struct StreamFacts {
 }
 
 /// Steps 2-6.
-fn open_stream(endpoint_id: &str) -> Result<(Stream, StreamFacts, RingReader), CaptureError> {
+fn open_stream(
+    endpoint_id: &str,
+    counters: Arc<CaptureCounters>,
+) -> Result<(Stream, StreamFacts, RingReader), CaptureError> {
     let enumerator = DeviceEnumerator::new().map_err(|e| map_wasapi(CaptureStage::Enumerate, e))?;
     let device = capture_device(&enumerator, endpoint_id)?;
     // Step 3.
@@ -560,7 +568,7 @@ fn open_stream(endpoint_id: &str) -> Result<(Stream, StreamFacts, RingReader), C
     let block_align = mix.wave.get_blockalign() as usize;
     // The last allocations before the stream starts.
     let bytes = vec![0u8; buffer_frames as usize * block_align];
-    let sink = PacketSink::new(mix.format.channels, buffer_frames);
+    let sink = PacketSink::new(mix.format.channels, buffer_frames, counters);
     let identity = DeviceIdentity {
         endpoint_id: endpoint_id.to_string(),
         name,
@@ -751,10 +759,16 @@ pub(crate) struct PacketSink {
     frames: u64,
     dropped_frames: u64,
     packets: u64,
+    /// The engine-lifetime totals the controller reads while this stream runs.
+    live: Arc<CaptureCounters>,
 }
 
 impl PacketSink {
-    pub(crate) fn new(channels: ChannelCount, max_frames: u32) -> PacketSink {
+    pub(crate) fn new(
+        channels: ChannelCount,
+        max_frames: u32,
+        live: Arc<CaptureCounters>,
+    ) -> PacketSink {
         let channels = usize::from(channels.get());
         PacketSink {
             positions: PositionTracker::default(),
@@ -763,6 +777,7 @@ impl PacketSink {
             frames: 0,
             dropped_frames: 0,
             packets: 0,
+            live,
         }
     }
 
@@ -788,9 +803,6 @@ impl PacketSink {
                 host_time: HostTime(info.timestamp as i64),
             }
         };
-        self.packets += 1;
-        self.frames += u64::from(frames);
-        self.dropped_frames += lost;
         let meta = PacketMeta {
             start,
             frames,
@@ -798,12 +810,25 @@ impl PacketSink {
             discontinuity,
         };
         let outcome = ring.push(meta, samples);
-        match outcome {
-            PushOutcome::Written => self.positions.written(),
-            PushOutcome::Dropped { frames } => {
-                self.dropped_frames += u64::from(frames);
-                self.positions.ring_dropped();
-            }
+        let dropped = lost
+            + match outcome {
+                PushOutcome::Written => {
+                    self.positions.written();
+                    0
+                }
+                PushOutcome::Dropped { frames } => {
+                    self.positions.ring_dropped();
+                    u64::from(frames)
+                }
+            };
+        self.packets += 1;
+        self.frames += u64::from(frames);
+        self.dropped_frames += dropped;
+        self.live.packets.fetch_add(1, Ordering::Relaxed);
+        if dropped > 0 {
+            self.live
+                .dropped_frames
+                .fetch_add(dropped, Ordering::Relaxed);
         }
         outcome
     }
@@ -853,7 +878,7 @@ mod tests {
 
         // Through the sink: the silent packet reaches the ring as zeros.
         let (mut ring, mut reader) = audio_ring(mono_48k(), CAPTURE_RING, 16, 4);
-        let mut sink = PacketSink::new(mono_48k().channels, 4);
+        let mut sink = PacketSink::new(mono_48k().channels, 4, Arc::default());
         let flags = AUDCLNT_BUFFERFLAGS_SILENT.0 as u32;
         sink.deliver(&mut ring, &bytes, 4, &info(7, flags));
         let mut popped = Vec::new();
@@ -864,7 +889,8 @@ mod tests {
     #[test]
     fn cp2_forward_gap_is_a_counted_discontinuity() {
         let (mut ring, mut reader) = audio_ring(mono_48k(), CAPTURE_RING, 16, 10);
-        let mut sink = PacketSink::new(mono_48k().channels, 10);
+        let live = Arc::new(CaptureCounters::default());
+        let mut sink = PacketSink::new(mono_48k().channels, 10, Arc::clone(&live));
         sink.deliver(&mut ring, &packet_bytes(100, 10), 10, &info(100, 0));
         // Device positions 110..125 never arrived.
         sink.deliver(&mut ring, &packet_bytes(125, 10), 10, &info(125, 0));
@@ -885,13 +911,22 @@ mod tests {
             (exit.frames, exit.dropped_frames, exit.packets),
             (20, 15, 2)
         );
+        // The live totals match the exit while the stream still runs.
+        assert_eq!(
+            (
+                live.dropped_frames.load(Ordering::Relaxed),
+                live.packets.load(Ordering::Relaxed)
+            ),
+            (15, 2)
+        );
     }
 
     #[test]
     fn cp3_ring_full_marks_the_next_written_packet() {
         // Room for exactly one 10-frame packet.
         let (mut ring, mut reader) = audio_ring(mono_48k(), Milliseconds::new(0.0), 4, 10);
-        let mut sink = PacketSink::new(mono_48k().channels, 10);
+        let live = Arc::new(CaptureCounters::default());
+        let mut sink = PacketSink::new(mono_48k().channels, 10, Arc::clone(&live));
         assert_eq!(
             sink.deliver(&mut ring, &packet_bytes(0, 10), 10, &info(0, 0)),
             PushOutcome::Written
@@ -920,6 +955,13 @@ mod tests {
         assert_eq!(
             (exit.frames, exit.dropped_frames, exit.packets),
             (30, 10, 3)
+        );
+        assert_eq!(
+            (
+                live.dropped_frames.load(Ordering::Relaxed),
+                live.packets.load(Ordering::Relaxed)
+            ),
+            (10, 3)
         );
         // The flag is spent once a packet is written.
         assert_eq!(
@@ -1130,6 +1172,7 @@ mod tests {
             endpoint_id: default.endpoint_id.clone(),
             wake: std::thread::current(),
             exits: exits_tx,
+            counters: Arc::default(),
         })
         .expect("open");
         let mut samples = Vec::new();

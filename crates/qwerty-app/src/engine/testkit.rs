@@ -23,9 +23,9 @@ use qwerty_core::units::{Decibels, HostDuration, HostTime, Milliseconds, SampleI
 use qwerty_core::veto::{InputEvent, OutputId, SelfOutputKind};
 
 use crate::engine::messages::{
-    CaptureExit, CaptureRequest, DeviceMsg, DeviceWatch, InputRecord, OpenedCapture, OsParts,
-    PacketMeta, RawInputMsg, RawInputRequest, RawInputStatus, RecorderDisk, StopSignal, ThreadEnd,
-    Worker, WorkerId,
+    CaptureCounters, CaptureExit, CaptureRequest, DeviceMsg, DeviceWatch, InputRecord,
+    OpenedCapture, OsParts, PacketMeta, RawInputMsg, RawInputRequest, RawInputStatus, RecorderDisk,
+    StopSignal, ThreadEnd, Worker, WorkerId,
 };
 use crate::engine::protocol::{
     CaptureError, DeviceInfo, DeviceProbe, DeviceState, MmcssStatus, OpenedStream, ProbeOutcome,
@@ -113,6 +113,8 @@ struct CaptureControl {
     stream_start: HostTime,
     invalidated: AtomicBool,
     stop: AtomicBool,
+    /// The next this many packets are dropped as if the ring were full.
+    drop_next: AtomicU64,
 }
 
 struct PlatformState {
@@ -233,6 +235,19 @@ impl FakeOs {
         self.state.send_device(DeviceMsg::Removed {
             id: endpoint_id.to_string(),
         });
+    }
+
+    /// Drops the endpoint's next `packets` packets at the ring, as a processing stall would.
+    pub fn drop_packets(&self, endpoint_id: &str, packets: u64) {
+        let captures = lock(&self.state.captures);
+        let Some(capture) = captures
+            .iter()
+            .rev()
+            .find(|c| c.endpoint_id == endpoint_id && !c.stop.load(Ordering::Acquire))
+        else {
+            panic!("drop_packets: no running fake capture on {endpoint_id}");
+        };
+        capture.drop_next.fetch_add(packets, Ordering::AcqRel);
     }
 
     /// Mixes `taps` into the endpoint's running fake capture; each `at` is an offset from the
@@ -498,6 +513,7 @@ impl OsParts for FakeOs {
             ),
             invalidated: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            drop_next: AtomicU64::new(0),
             scheduled: Mutex::new(
                 taps.iter()
                     .map(|t| format.rate.samples_in(t.at) as u64)
@@ -515,6 +531,7 @@ impl OsParts for FakeOs {
         let body_stop = Arc::clone(&stop);
         let body_control = Arc::clone(&control);
         let wake = request.wake;
+        let live = request.counters;
         let worker = Worker::spawn(
             request.worker,
             ThreadName::Capture,
@@ -535,6 +552,7 @@ impl OsParts for FakeOs {
                     },
                     &mut writer,
                     &wake,
+                    &live,
                 );
                 body_control.stop.store(true, Ordering::Release);
                 ThreadEnd::Capture { exit }
@@ -678,6 +696,7 @@ fn run_fake_capture(
     stream: FakeStream,
     writer: &mut crate::engine::ring::RingWriter,
     wake: &std::thread::Thread,
+    live: &CaptureCounters,
 ) -> CaptureExit {
     let FakeStream {
         format,
@@ -757,15 +776,29 @@ fn run_fake_capture(
             },
             discontinuity,
         };
-        match writer.push(meta, &packet) {
+        let scripted_drop = control
+            .drop_next
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok();
+        let outcome = if scripted_drop {
+            PushOutcome::Dropped {
+                frames: period_frames as u32,
+            }
+        } else {
+            writer.push(meta, &packet)
+        };
+        match outcome {
             PushOutcome::Written => discontinuity = false,
             PushOutcome::Dropped { frames } => {
                 exit.dropped_frames += u64::from(frames);
+                live.dropped_frames
+                    .fetch_add(u64::from(frames), Ordering::Relaxed);
                 discontinuity = true;
             }
         }
         exit.frames += period_frames as u64;
         exit.packets += 1;
+        live.packets.fetch_add(1, Ordering::Relaxed);
         position = end;
         control.position.store(position, Ordering::Release);
         wake.unpark();
@@ -991,6 +1024,7 @@ mod tests {
                 endpoint_id: "mic-a".to_string(),
                 wake: std::thread::current(),
                 exits: exits_tx,
+                counters: Arc::default(),
             })
             .expect("open");
         let mut buf = Vec::new();
