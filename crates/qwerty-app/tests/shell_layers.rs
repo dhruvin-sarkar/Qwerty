@@ -101,6 +101,13 @@ fn names_platform_module(code: &str) -> bool {
         .any(|rest| !rest.starts_with("::"))
 }
 
+/// The shell layer `layer` named as a path: `shell::win`, or relative `super::win`.
+fn names_shell_layer(code: &str, layer: &str) -> bool {
+    ["shell", "super"]
+        .iter()
+        .any(|parent| !whole_words(code, &format!("{parent}::{layer}")).is_empty())
+}
+
 const V1_MODULES: [&str; 6] = [
     "app_state",
     "tray",
@@ -140,6 +147,21 @@ fn violations(relative: &str, code: &str) -> Vec<String> {
         }
         if names_platform_module(code) {
             found.push(format!("{relative}: imports the `crate::platform` module"));
+        }
+    }
+    // The shell layers a file may not use (§1.2: arrows point from VIEW to WINDOWS to MODEL).
+    let above: &[&str] = if in_model {
+        &["win", "view"]
+    } else if in_win {
+        &["view"]
+    } else {
+        &[]
+    };
+    for layer in above {
+        if names_shell_layer(code, layer) {
+            found.push(format!(
+                "{relative}: uses the shell layer `{layer}` above it"
+            ));
         }
     }
     for module in V1_MODULES {
@@ -193,6 +215,14 @@ fn sb1_shell_layers_hold() {
         ("view/a.rs", "run_action_chain(&chain)"),
         ("view/a.rs", "set_start_with_windows(true)"),
         ("view/a.rs", "platform_for_this_os()"),
+        // Arrows point down only (§1.2): the model uses neither shell layer above it, and the
+        // windows layer does not use the view.
+        ("model/a.rs", "use crate::shell::win::tray;"),
+        ("model/a.rs", "use qwerty_app::shell::win::dwm::apply;"),
+        ("model/vm/a.rs", "use super::super::win::system;"),
+        ("model/a.rs", "use crate::shell::view::app;"),
+        ("win/a.rs", "use crate::shell::view::theme;"),
+        ("win/a.rs", "use super::view::app;"),
     ];
     for (relative, line) in planted {
         assert!(
@@ -202,7 +232,9 @@ fn sb1_shell_layers_hold() {
     }
     let allowed = [
         ("model/a.rs", "use crate::platform::ActionError;"),
-        ("model/a.rs", "use crate::shell::win::tray;"),
+        ("view/a.rs", "use crate::shell::win::tray;"),
+        ("win/a.rs", "use crate::shell::model::bridge::TrayCommand;"),
+        ("view/a.rs", "use crate::shell::model::store::Store;"),
         ("win/a.rs", "use windows::Win32::Foundation::HWND;"),
         ("view/a.rs", "use rune::El;"),
         ("model/a.rs", "let runes = 1; let windows_open = 2;"),
