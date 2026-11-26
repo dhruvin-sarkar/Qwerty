@@ -210,17 +210,27 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(512);
         let pump = EventPump::spawn(rx, Arc::clone(&inbox)).expect("spawns");
 
-        // The producer fills a 512-slot channel 20 times over while the consumer below sleeps:
-        // it finishes only because the pump moves events into the unbounded inbox at once.
+        // First half: nobody drains the inbox. 5,000 events overfill the 512-slot channel almost
+        // ten times, so the producer gets through only if each push returns while the inbox
+        // still holds everything before it: a pump that waited on the inbox would stall here.
+        const UNDRAINED: u32 = EVENTS / 2;
+        let (half_tx, half_rx) = crossbeam_channel::bounded(1);
         let producer = std::thread::spawn(move || {
-            let start = Instant::now();
-            for n in 0..EVENTS {
+            for n in 0..UNDRAINED {
                 tx.send(gesture(n)).expect("the pump is reading");
             }
-            start.elapsed()
+            half_tx.send(()).expect("the test is waiting");
+            for n in UNDRAINED..EVENTS {
+                tx.send(gesture(n)).expect("the pump is reading");
+            }
         });
+        assert!(
+            half_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the producer was held up while the inbox went undrained"
+        );
 
-        let mut received = Vec::with_capacity(EVENTS as usize);
+        // Second half: a slow consumer drains while the producer sends the rest.
+        let mut received = Vec::with_capacity(EVENTS as usize + 1);
         let mut wakes_seen = 0;
         let deadline = Instant::now() + Duration::from_secs(20);
         while received.len() < EVENTS as usize + 1 && Instant::now() < deadline {
@@ -236,11 +246,7 @@ mod tests {
             }
             received.extend(batch);
         }
-        let sending = producer.join().expect("producer");
-        assert!(
-            sending < Duration::from_secs(5),
-            "the producer was held up for {sending:?}"
-        );
+        producer.join().expect("producer");
         pump.join().expect("the pump ends at the disconnect");
         received.extend(inbox.drain());
 
