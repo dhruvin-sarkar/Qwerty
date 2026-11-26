@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use qwerty_core::units::{HostDuration, HostTime, Milliseconds};
 
-use crate::engine::protocol::{Event, Snapshot, TapReport, TelemetryFrame};
+use crate::engine::protocol::{
+    CaptureStatus, Event, OpenedStream, Snapshot, TapReport, TelemetryFrame, TelemetryLevel,
+};
 use crate::shell::model::bridge::ShellInput;
 
 /// The longest any drawing buffer reaches back (B:113).
@@ -47,6 +49,36 @@ impl TelemetryKind {
             TelemetryKind::Spectrum => SPECTRUM_CAPACITY,
             TelemetryKind::Waveform => WAVEFORM_CAPACITY,
             TelemetryKind::Trace => TRACE_CAPACITY,
+        }
+    }
+
+    pub const ALL: [TelemetryKind; 4] = [
+        TelemetryKind::Meter,
+        TelemetryKind::Spectrum,
+        TelemetryKind::Waveform,
+        TelemetryKind::Trace,
+    ];
+
+    /// The stream this kind's frames come from under `snapshot`, or `None` when the engine
+    /// produces none: it computes nothing above the requested level (`Meter` from level Meter,
+    /// the rest only at Diagnostics) and nothing without a running stream.
+    fn produced_from(self, snapshot: &Snapshot) -> Option<&OpenedStream> {
+        let level = match self {
+            TelemetryKind::Meter => {
+                matches!(
+                    snapshot.telemetry,
+                    TelemetryLevel::Meter | TelemetryLevel::Diagnostics
+                )
+            }
+            TelemetryKind::Spectrum | TelemetryKind::Waveform | TelemetryKind::Trace => {
+                snapshot.telemetry == TelemetryLevel::Diagnostics
+            }
+        };
+        match &snapshot.capture {
+            CaptureStatus::Running { opened, .. } if level => Some(opened),
+            CaptureStatus::Running { .. } | CaptureStatus::Off | CaptureStatus::Failed { .. } => {
+                None
+            }
         }
     }
 }
@@ -197,6 +229,9 @@ impl Store {
                     buffer.pop_front();
                 }
                 buffer.push_back(frame);
+                if kind == TelemetryKind::Trace {
+                    trim_traces(buffer);
+                }
                 Changes::telemetry(kind)
             }
             Event::TapFired { tap } => {
@@ -246,6 +281,19 @@ impl Store {
             None => true,
         };
         if newer {
+            // A kind whose production starts here (its level reached, its stream started or
+            // replaced) starts with an empty buffer, so frames from before a gap in production
+            // never sit next to the ones after it.
+            for kind in TelemetryKind::ALL {
+                let now = kind.produced_from(&snapshot);
+                let before = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|held| kind.produced_from(held));
+                if now.is_some() && now != before {
+                    self.buffer_mut(kind).clear();
+                }
+            }
             self.snapshot = Some(snapshot);
             Changes {
                 snapshot: true,
@@ -307,6 +355,28 @@ impl Store {
     }
 }
 
+/// The newest entry time of one Trace frame; `None` for a frame with no entries.
+fn trace_time(frame: &TelemetryFrame) -> Option<HostTime> {
+    match frame {
+        TelemetryFrame::Trace { entries } => entries.iter().map(|entry| entry.at).max(),
+        TelemetryFrame::Meter { .. }
+        | TelemetryFrame::Spectrum { .. }
+        | TelemetryFrame::Waveform { .. } => None,
+    }
+}
+
+/// Trace frames come only when the controller logs something, so their count bounds nothing in
+/// time: keep the frames whose entries are within [`BUFFER_SPAN`] of the newest entry, on the
+/// engine clock (`TraceEntry.at`). A frame with no entries has nothing to show and no time.
+fn trim_traces(buffer: &mut VecDeque<TelemetryFrame>) {
+    let Some(newest) = buffer.iter().filter_map(trace_time).max() else {
+        buffer.clear();
+        return;
+    };
+    let span = HostDuration::from_ms(BUFFER_SPAN);
+    buffer.retain(|frame| trace_time(frame).is_some_and(|at| newest.since(at) <= span));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,12 +387,16 @@ mod tests {
     use qwerty_core::model::ModelRejectReason;
     use qwerty_core::units::SampleIndex;
 
-    fn state(revision: u64) -> ShellInput {
-        let mut snapshot = fixture::snapshot();
-        snapshot.revision = revision;
+    fn snapshot_input(snapshot: Snapshot) -> ShellInput {
         ShellInput::Engine(Event::StateChanged {
             snapshot: Box::new(snapshot),
         })
+    }
+
+    fn state(revision: u64) -> ShellInput {
+        let mut snapshot = fixture::snapshot();
+        snapshot.revision = revision;
+        snapshot_input(snapshot)
     }
 
     fn held(store: &Store) -> u64 {
@@ -390,6 +464,80 @@ mod tests {
         assert_eq!(newest, HostTime(1_000_000_000 + 79 * 2_500_000));
         assert!(newest.since(oldest) <= HostDuration::from_ms(BUFFER_SPAN));
         assert_eq!(taps.len(), 41, "10 s at 250 ms, both ends included");
+
+        // Frames stop while their kind is not produced (the engine computes nothing above the
+        // requested level, and nothing without a running stream); the frames from before such a
+        // gap are not kept next to the ones after it.
+        let mut store = Store::new();
+        let mut diagnostics = fixture::snapshot();
+        diagnostics.revision = 1;
+        diagnostics.telemetry = TelemetryLevel::Diagnostics;
+        store.apply(snapshot_input(diagnostics.clone()));
+        let telemetry = |store: &mut Store, n: u64| {
+            for frame in [
+                fixture::meter_frame(),
+                fixture::spectrum_frame(SampleIndex(4800 + n * 1600)),
+                fixture::waveform_frame(SampleIndex(4800 + n * 1600)),
+            ] {
+                store.apply(ShellInput::Engine(Event::Telemetry { frame }));
+            }
+        };
+        for n in 0..100 {
+            telemetry(&mut store, n);
+        }
+        // Diagnostics left: Spectrum and Waveform stop, Meter goes on.
+        let mut meter_only = diagnostics.clone();
+        meter_only.revision = 2;
+        meter_only.telemetry = TelemetryLevel::Meter;
+        store.apply(snapshot_input(meter_only));
+        // A stray frame the processing thread sent before it saw the new level.
+        telemetry(&mut store, 100);
+        // Minutes later, Diagnostics again.
+        let mut again = diagnostics.clone();
+        again.revision = 3;
+        store.apply(snapshot_input(again.clone()));
+        telemetry(&mut store, 200_000);
+        assert_eq!(store.frames(TelemetryKind::Spectrum).len(), 1);
+        assert_eq!(store.frames(TelemetryKind::Waveform).len(), 1);
+        assert_eq!(
+            store.frames(TelemetryKind::Meter).len(),
+            102,
+            "Meter was produced throughout"
+        );
+        // The stream stops and starts again: Meter starts over too.
+        let mut off = again.clone();
+        off.revision = 4;
+        off.capture = CaptureStatus::Off;
+        store.apply(snapshot_input(off));
+        let mut running = again;
+        running.revision = 5;
+        store.apply(snapshot_input(running));
+        telemetry(&mut store, 0);
+        for kind in [
+            TelemetryKind::Meter,
+            TelemetryKind::Spectrum,
+            TelemetryKind::Waveform,
+        ] {
+            assert_eq!(store.frames(kind).len(), 1, "{kind:?}");
+        }
+
+        // Trace frames come only when the controller logs something, so they are kept by the
+        // engine clock of their entries: one a minute for ten minutes leaves the newest.
+        for n in 0..10i64 {
+            let mut entry = fixture::trace_entry();
+            entry.at = HostTime(1_000_000_000 + n * 600_000_000);
+            store.apply(ShellInput::Engine(Event::Telemetry {
+                frame: TelemetryFrame::Trace {
+                    entries: vec![entry],
+                },
+            }));
+        }
+        let traces = store.frames(TelemetryKind::Trace);
+        assert_eq!(traces.len(), 1);
+        let TelemetryFrame::Trace { entries } = &traces[0] else {
+            panic!("a Trace buffer holds Trace frames");
+        };
+        assert_eq!(entries[0].at, HostTime(1_000_000_000 + 9 * 600_000_000));
     }
 
     #[test]
