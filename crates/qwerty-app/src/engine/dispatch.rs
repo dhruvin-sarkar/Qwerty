@@ -8,7 +8,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -23,8 +23,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use qwerty_core::units::{HostDuration, HostTime};
 
 use crate::engine::messages::{
-    DispatchJob, DispatchMsg, DispatchQueue, JobEvent, JobKey, OsParts, SelfOutputLink, StopSignal,
-    ThreadEnd, ThreadExit, Worker, WorkerId,
+    try_send_counted, DispatchJob, DispatchMsg, DispatchQueue, JobEvent, JobKey, OsParts,
+    SelfOutputLink, StopSignal, ThreadEnd, ThreadExit, Worker, WorkerId,
 };
 use crate::engine::protocol::{
     ActionResult, CommandOutcome, EngineError, StepOutcome, ThreadName, COMMAND_WATCH,
@@ -47,6 +47,7 @@ pub fn spawn(
     link: Arc<SelfOutputLink>,
     os: Arc<dyn OsParts>,
     exits: Sender<ThreadExit>,
+    dropped: Arc<AtomicU64>,
 ) -> Result<(Worker, DispatchQueue), EngineError> {
     let event = Arc::new(JobEvent::new().map_err(|e| EngineError::ThreadSpawn {
         thread: ThreadName::Dispatch,
@@ -62,7 +63,7 @@ pub fn spawn(
         jobs,
         event: Arc::clone(&event),
         stop,
-        out: Outbox { tx, os },
+        out: Outbox { tx, os, dropped },
         link,
     };
     let handle = Worker::spawn(
@@ -93,15 +94,16 @@ impl StopSignal for DispatchStop {
 struct Outbox {
     tx: Sender<DispatchMsg>,
     os: Arc<dyn OsParts>,
+    /// The controller's `controller_dropped` feed (§2.11).
+    dropped: Arc<AtomicU64>,
 }
 
 impl Outbox {
-    /// `try_send`: no worker ever blocks on the controller (RUST-RT-5).
-    // SPEC: §2.11 counts a failed dispatch → controller send as controller_dropped, but §2.6's
-    // spawn signature carries no counter; the channel cannot fill (16 queued jobs give ≤ 34
-    // messages, §2.11), so a Full is logged as the broken invariant it is.
+    /// `try_send`: no worker ever blocks on the controller (RUST-RT-5). The channel cannot fill
+    /// (16 queued jobs give ≤ 34 messages, §2.11), so a Full is counted and logged as the broken
+    /// invariant it is.
     fn send(&self, msg: DispatchMsg) {
-        match self.tx.try_send(msg) {
+        match try_send_counted(&self.tx, msg, &self.dropped) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 tracing::error!("the dispatch to controller channel was full; a message was lost");
@@ -612,8 +614,8 @@ mod tests {
             ));
             let (tx, rx) = crossbeam_channel::bounded(64);
             let (exits_tx, exits) = crossbeam_channel::bounded(16);
-            let (worker, queue) =
-                spawn(WorkerId(7), tx, link, os, exits_tx).expect("spawn the dispatch thread");
+            let (worker, queue) = spawn(WorkerId(7), tx, link, os, exits_tx, Arc::default())
+                .expect("spawn the dispatch thread");
             let harness = Harness {
                 worker: Some(worker),
                 queue,
@@ -887,6 +889,7 @@ mod tests {
                 built: AtomicUsize::new(0),
                 on_platform: None,
             }),
+            dropped: Arc::default(),
         };
         // Children that wait on their (never written) stdin, and exit once a released child's
         // pipe closes.

@@ -4,7 +4,7 @@
 //! controller with `RecorderMsg`. Recordings live only under `<data_dir>/DebugCaptures`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,8 @@ use qwerty_core::recording::{
 use qwerty_core::units::{SampleIndex, Seconds};
 
 use crate::engine::messages::{
-    RecorderCmd, RecorderDisk, RecorderMsg, StopSignal, ThreadEnd, ThreadExit, Worker, WorkerId,
+    try_send_counted, RecorderCmd, RecorderDisk, RecorderMsg, StopSignal, ThreadEnd, ThreadExit,
+    Worker, WorkerId,
 };
 use crate::engine::protocol::{EngineError, RecorderStopReason, StoredRecordings, ThreadName};
 use crate::engine::ring::RingReader;
@@ -46,6 +47,7 @@ pub fn spawn(
     tx: Sender<RecorderMsg>,
     disk: Arc<dyn RecorderDisk>,
     exits: Sender<ThreadExit>,
+    dropped: Arc<AtomicU64>,
 ) -> Result<Worker, EngineError> {
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::clone(&stop);
@@ -53,6 +55,7 @@ pub fn spawn(
         cmds,
         feed_events,
         tx,
+        dropped,
         disk,
         active: None,
     };
@@ -137,6 +140,8 @@ struct Recorder {
     cmds: Receiver<RecorderCmd>,
     feed_events: Receiver<SidecarEvent>,
     tx: Sender<RecorderMsg>,
+    /// The controller's `controller_dropped` feed (§2.11).
+    dropped: Arc<AtomicU64>,
     disk: Arc<dyn RecorderDisk>,
     active: Option<Active>,
 }
@@ -441,9 +446,10 @@ impl Recorder {
     }
 
     /// try_send: the controller drains its channel continuously and progress is 1 Hz, so a full
-    /// channel means a stalled controller; Disconnected means it is gone.
+    /// channel means a stalled controller (counted, so it raises ControllerOverloaded);
+    /// Disconnected means it is gone.
     fn send(&self, msg: RecorderMsg) {
-        match self.tx.try_send(msg) {
+        match try_send_counted(&self.tx, msg, &self.dropped) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(msg)) => tracing::warn!(
                 message = msg_name(&msg),
@@ -593,6 +599,7 @@ mod tests {
                 msgs_tx,
                 Arc::new(TestDisk { free }),
                 exits,
+                Arc::default(),
             )
             .expect("spawns the recorder");
             Harness {
@@ -708,6 +715,49 @@ mod tests {
             kind,
             reconfigured: true,
         }
+    }
+
+    /// RUST-RT-5: a message the full controller channel refuses is counted, not only logged.
+    #[test]
+    fn a_message_the_full_controller_channel_refuses_is_counted() {
+        let tmp = TempDir::new("rc-dropped");
+        let (cmds, cmds_rx) = crossbeam_channel::bounded(64);
+        let (_events, events_rx) = crossbeam_channel::bounded(16);
+        // Room for Started only: the Stopped and Stored after it find the channel full.
+        let (msgs_tx, msgs) = crossbeam_channel::bounded(1);
+        let (exits, _exits) = crossbeam_channel::bounded(16);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker = spawn(
+            WorkerId(1),
+            cmds_rx,
+            events_rx,
+            msgs_tx,
+            Arc::new(TestDisk { free: u64::MAX }),
+            exits,
+            Arc::clone(&dropped),
+        )
+        .expect("spawns the recorder");
+        let (_ring, reader) = audio_ring(format(), RECORDER_RING, 2048, FRAMES);
+        cmds.send(RecorderCmd::Start {
+            root: tmp.0.join("DebugCaptures"),
+            header: Box::new(header()),
+            ring: reader,
+        })
+        .expect("the recorder is running");
+        cmds.send(RecorderCmd::Stop {
+            reason: RecorderStopReason::CaptureStopped,
+        })
+        .expect("the recorder is running");
+        let deadline = Instant::now() + WAIT;
+        while dropped.load(Ordering::Relaxed) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the refused Stopped and Stored were not counted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(msgs.try_recv(), Ok(RecorderMsg::Started { .. })));
+        worker.stop(WAIT).expect("the recorder stops");
     }
 
     #[test]

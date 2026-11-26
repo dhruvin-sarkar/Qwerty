@@ -149,6 +149,8 @@ pub(crate) struct StartWorkers {
     pub recorder: Worker,
     pub link: Arc<SelfOutputLink>,
     pub speech: Arc<SpeechEnds>,
+    /// Given to dispatch and the recorder at spawn; see `Controller::sends_dropped`.
+    pub sends_dropped: Arc<AtomicU64>,
     pub next_worker: u64,
 }
 
@@ -297,7 +299,9 @@ pub(crate) struct Controller {
     build: Option<Build>,
     build_lost: Arc<AtomicU64>,
     device_watch: Option<DeviceWatch>,
-    devices_dropped: Arc<AtomicU64>,
+    /// Worker → controller sends that found their channel full (device callbacks, dispatch, raw
+    /// input, the recorder); folded into `controller_dropped` each health tick (§2.11).
+    sends_dropped: Arc<AtomicU64>,
     /// Shared with every capture worker; read into the counters each health tick.
     capture_counters: Arc<CaptureCounters>,
     next_worker: u64,
@@ -577,7 +581,7 @@ impl Controller {
             build: None,
             build_lost: Arc::new(AtomicU64::new(0)),
             device_watch: None,
-            devices_dropped: Arc::new(AtomicU64::new(0)),
+            sends_dropped: workers.sends_dropped,
             capture_counters: Arc::default(),
             next_worker: workers.next_worker,
             epoch: SetupEpoch(0),
@@ -680,10 +684,10 @@ impl Controller {
     /// §2.9.2 steps 5-8 on the controller thread: the device watch, the device list, autostart,
     /// reconcile. Returns the first error.
     pub(crate) fn init(&mut self) -> Result<(), EngineError> {
-        match self.os.watch_devices(
-            self.ch.devices_tx.clone(),
-            Arc::clone(&self.devices_dropped),
-        ) {
+        match self
+            .os
+            .watch_devices(self.ch.devices_tx.clone(), Arc::clone(&self.sends_dropped))
+        {
             Ok(watch) => self.device_watch = Some(watch),
             Err(error) => return Err(EngineError::Capture { error }),
         }
@@ -1808,6 +1812,7 @@ impl Controller {
             ring: producer,
             tx: self.ch.raw_input_tx.clone(),
             exits: self.ch.exits_tx.clone(),
+            dropped: Arc::clone(&self.sends_dropped),
         };
         match self.os.spawn_raw_input(request) {
             Ok(w) => {
@@ -2831,7 +2836,7 @@ impl Controller {
             });
             self.capture_dropped_seen = self.counters.capture_dropped_frames;
         }
-        let dropped_now = self.devices_dropped.swap(0, Ordering::AcqRel);
+        let dropped_now = self.sends_dropped.swap(0, Ordering::AcqRel);
         self.counters.controller_dropped += dropped_now;
         // §2.11: a dropped decision and any other dropped message both mean the controller fell
         // behind.

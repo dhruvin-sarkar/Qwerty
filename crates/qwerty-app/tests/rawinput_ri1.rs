@@ -42,6 +42,7 @@ fn ri1_ownership_loss_is_reported_and_stop_spares_the_new_owner() {
         ring,
         tx,
         exits: exits_tx,
+        dropped: std::sync::Arc::default(),
     })
     .expect("spawn");
     assert_eq!(

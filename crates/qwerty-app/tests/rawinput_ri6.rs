@@ -63,6 +63,7 @@ fn ri6_a_gap_follows_a_freed_slot_without_further_input() {
         ring,
         tx,
         exits: exits_tx,
+        dropped: std::sync::Arc::default(),
     })
     .expect("spawn");
     assert_eq!(

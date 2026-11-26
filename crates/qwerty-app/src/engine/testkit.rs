@@ -23,9 +23,9 @@ use qwerty_core::units::{Decibels, HostDuration, HostTime, Milliseconds, SampleI
 use qwerty_core::veto::{InputEvent, OutputId, SelfOutputKind};
 
 use crate::engine::messages::{
-    CaptureCounters, CaptureExit, CaptureRequest, DeviceMsg, DeviceWatch, InputRecord,
-    OpenedCapture, OsParts, PacketMeta, RawInputMsg, RawInputRequest, RawInputStatus, RecorderDisk,
-    StopSignal, ThreadEnd, Worker, WorkerId,
+    try_send_counted, CaptureCounters, CaptureExit, CaptureRequest, DeviceMsg, DeviceWatch,
+    InputRecord, OpenedCapture, OsParts, PacketMeta, RawInputMsg, RawInputRequest, RawInputStatus,
+    RecorderDisk, StopSignal, ThreadEnd, Worker, WorkerId,
 };
 use crate::engine::protocol::{
     CaptureError, DeviceInfo, DeviceProbe, DeviceState, MmcssStatus, OpenedStream, ProbeOutcome,
@@ -600,6 +600,7 @@ impl OsParts for FakeOs {
             mut ring,
             tx,
             exits,
+            dropped,
         } = request;
         lock(&self.state.raw_input_workers).push(worker);
         Worker::spawn(
@@ -613,7 +614,7 @@ impl OsParts for FakeOs {
                     status: RawInputStatus::Active,
                     skipped_records: 0,
                 };
-                if tx.try_send(active).is_err() {
+                if try_send_counted(&tx, active, &dropped).is_err() {
                     return ThreadEnd::Finished;
                 }
                 while !body_stop.load(Ordering::Acquire) {

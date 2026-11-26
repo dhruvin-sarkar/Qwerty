@@ -23,6 +23,7 @@ fn ri3_stop_joins_and_a_fresh_spawn_is_active_again() {
             ring,
             tx,
             exits: exits_tx,
+            dropped: std::sync::Arc::default(),
         })
         .expect("spawn");
         assert_eq!(

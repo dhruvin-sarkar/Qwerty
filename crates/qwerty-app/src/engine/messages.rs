@@ -165,6 +165,25 @@ impl Drop for Worker {
     }
 }
 
+// SPEC: §2.2 RUST-RT-5 and §2.11 count every failed worker → controller send as
+// `controller_dropped` (→ `ControllerOverloaded`), but of the senders only `watch_devices` gets a
+// counter in its signature. `dispatch::spawn`, `recorder::spawn` and `RawInputRequest` therefore
+// also take the controller's `dropped` counter, which it folds into `controller_dropped` each
+// health tick.
+/// A worker's `try_send` to the controller (RUST-RT-5): a send that finds the channel Full adds 1
+/// to `dropped`. The result is returned so the caller can log or retry.
+pub fn try_send_counted<T>(
+    tx: &Sender<T>,
+    msg: T,
+    dropped: &AtomicU64,
+) -> Result<(), TrySendError<T>> {
+    let sent = tx.try_send(msg);
+    if let Err(TrySendError::Full(_)) = &sent {
+        dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    sent
+}
+
 /// The text of a panic payload: &str or String; anything else is "non-string panic payload".
 fn panic_message(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -661,6 +680,8 @@ pub struct RawInputRequest {
     pub ring: rtrb::Producer<InputRecord>,
     pub tx: Sender<RawInputMsg>,
     pub exits: Sender<ThreadExit>,
+    /// See [`try_send_counted`].
+    pub dropped: Arc<AtomicU64>,
 }
 
 /// skipped_records: lifetime count of WM_INPUT records skipped for a larger required size. Sent

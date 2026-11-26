@@ -2,6 +2,7 @@
 //! into the engine. `Engine::start_with` runs startup (§2.9.2) and spawns the controller.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -172,12 +173,14 @@ impl Engine {
             Arc::clone(&os),
             exits_tx.clone(),
         )?;
+        let sends_dropped = Arc::new(AtomicU64::new(0));
         let (dispatch_worker, queue) = dispatch::spawn(
             WorkerId(2),
             dispatch_tx,
             Arc::clone(&link),
             Arc::clone(&os),
             exits_tx.clone(),
+            Arc::clone(&sends_dropped),
         )?;
         let recorder_worker = recorder::spawn(
             WorkerId(3),
@@ -186,6 +189,7 @@ impl Engine {
             recorder_tx,
             os.recorder_disk(),
             exits_tx.clone(),
+            Arc::clone(&sends_dropped),
         )?;
         let channels = Channels {
             commands: commands_rx,
@@ -213,6 +217,7 @@ impl Engine {
             recorder: recorder_worker,
             link,
             speech,
+            sends_dropped,
             next_worker: 3,
         };
         let loaded = Loaded0 {

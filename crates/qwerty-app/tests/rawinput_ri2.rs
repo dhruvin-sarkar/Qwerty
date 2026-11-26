@@ -66,6 +66,7 @@ fn ri2_injected_input_is_stamped_within_5_ms_p99() {
         ring,
         tx,
         exits: exits_tx,
+        dropped: std::sync::Arc::default(),
     })
     .expect("spawn");
     assert_eq!(

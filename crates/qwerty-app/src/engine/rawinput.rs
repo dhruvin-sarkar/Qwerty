@@ -5,7 +5,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::addr_of;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crossbeam_channel::{Sender, TrySendError};
@@ -33,8 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::engine::clock;
 use crate::engine::messages::{
-    InputRecord, RawInputMsg, RawInputRequest, RawInputStatus, StopSignal, ThreadEnd, Worker,
-    WorkerId,
+    try_send_counted, InputRecord, RawInputMsg, RawInputRequest, RawInputStatus, StopSignal,
+    ThreadEnd, Worker, WorkerId,
 };
 use crate::engine::protocol::{InputDeviceClass, ThreadName, VetoUnavailableReason};
 
@@ -263,6 +263,7 @@ pub fn spawn(request: RawInputRequest) -> Result<Worker, VetoUnavailableReason> 
         ring,
         tx,
         exits,
+        dropped,
     } = request;
     let stop = Arc::new(AtomicBool::new(false));
     let hwnd = Arc::new(AtomicIsize::new(0));
@@ -276,7 +277,7 @@ pub fn spawn(request: RawInputRequest) -> Result<Worker, VetoUnavailableReason> 
         Box::new(signal),
         exits,
         move || {
-            run(worker, ring, tx, &stop, &hwnd);
+            run(worker, ring, tx, dropped, &stop, &hwnd);
             ThreadEnd::Finished
         },
     )
@@ -296,6 +297,9 @@ pub fn spawn(request: RawInputRequest) -> Result<Worker, VetoUnavailableReason> 
 struct Reporter {
     worker: WorkerId,
     tx: Sender<RawInputMsg>,
+    /// The controller's `controller_dropped` feed (§2.11): each refused send counts, resent or
+    /// not.
+    dropped: Arc<AtomicU64>,
     delivered: Option<(RawInputStatus, u64)>,
 }
 
@@ -310,7 +314,7 @@ impl Reporter {
             status: current.0.clone(),
             skipped_records,
         };
-        match self.tx.try_send(msg) {
+        match try_send_counted(&self.tx, msg, &self.dropped) {
             Ok(()) => self.delivered = Some(current),
             Err(TrySendError::Full(_)) => {
                 tracing::warn!(
@@ -444,12 +448,14 @@ fn run(
     worker: WorkerId,
     ring: rtrb::Producer<InputRecord>,
     tx: Sender<RawInputMsg>,
+    dropped: Arc<AtomicU64>,
     stop: &AtomicBool,
     hwnd_slot: &AtomicIsize,
 ) {
     let mut reporter = Reporter {
         worker,
         tx,
+        dropped,
         delivered: None,
     };
 

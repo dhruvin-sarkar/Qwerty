@@ -19,6 +19,7 @@ fn ri5_stop_right_after_spawn_joins_and_leaves_no_registration() {
             ring,
             tx,
             exits: exits_tx,
+            dropped: std::sync::Arc::default(),
         })
         .expect("spawn");
 
