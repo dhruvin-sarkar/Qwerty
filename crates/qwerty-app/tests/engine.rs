@@ -1,4 +1,5 @@
-//! The engine tests (p2 §2.11): EN2-EN8, EN10-EN15, EN17, RC3 and RP2. Each runs the real
+//! The engine tests (p2 §2.11): EN2-EN8, EN10-EN15, EN17, RC3 and RP2, plus shell-v2's DN1
+//! through the engine's commands. Each runs the real
 //! controller, processing, dispatch and recorder through `Engine::start_with(options,
 //! Arc::new(FakeOs))`, on a temporary data folder.
 //!
@@ -28,7 +29,7 @@ use qwerty_core::audio::AudioFormat;
 use qwerty_core::desk::{ModalDesk, TapSpec};
 use qwerty_core::profile::{ActionSpec, ZoneId, ZoneLayout};
 use qwerty_core::session::CalibrationStep;
-use qwerty_core::store::ZoneEdit;
+use qwerty_core::store::{ProfileError, ZoneEdit};
 use qwerty_core::units::{ChannelCount, Decibels, HostTime, Milliseconds, SampleRate, ZoneIndex};
 
 /// Fake time runs this many times real time.
@@ -401,12 +402,17 @@ impl Rig {
         self.wait("Listening", |s| s.mode == Mode::Listening);
     }
 
-    /// Starts a run on the default mic and waits for its Ready step.
+    /// Starts a run for a new profile on the default mic and waits for its Ready step.
     fn start_run(&self, name: &str) {
+        self.start_run_on(CalibrationTarget::New {
+            name: name.to_string(),
+        });
+    }
+
+    /// Starts a run for `target` on the default mic and waits for its Ready step.
+    fn start_run_on(&self, target: CalibrationTarget) {
         self.ok(Command::StartCalibration {
-            target: CalibrationTarget::New {
-                name: name.to_string(),
-            },
+            target,
             zones: drafts(),
             device: DeviceChoice::SystemDefault,
             taps_per_zone: TAPS_PER_ZONE,
@@ -420,7 +426,14 @@ impl Rig {
 
     /// EN2's choreography up to and including SkipNegatives (the build then starts).
     fn calibrate_to_build(&self, name: &str) {
-        self.start_run(name);
+        self.calibrate_to_build_on(CalibrationTarget::New {
+            name: name.to_string(),
+        });
+    }
+
+    /// `calibrate_to_build` for any target.
+    fn calibrate_to_build_on(&self, target: CalibrationTarget) {
+        self.start_run_on(target);
         self.ok(Command::Calibration {
             action: CalibrationAction::RecordAmbient,
         });
@@ -1326,6 +1339,130 @@ fn en10_a_failed_commit_keeps_the_review() {
     let id = rig.ok(commit()).into_committed().expect("Committed");
     rig.wait("Listening", |s| s.mode == Mode::Listening);
     assert!(profiles.join(format!("{}.json", id.as_uuid())).is_file());
+    rig.finish();
+}
+
+/// DN1 (shell-v2 WP-E1, amendment AB-9) through the engine's own commands: creating (the
+/// wizard's `Commit`), renaming, duplicating or importing to a stored profile's name after trim
+/// and lowercase fails with `DuplicateName` and writes nothing; the same name in another case on
+/// the profile itself succeeds (a rename, and a recalibration's commit).
+#[test]
+fn dn1_duplicate_profile_names_are_refused_by_the_engine() {
+    let rig = Rig::new("dn1");
+    let duplicate = Some(EngineError::Profile {
+        error: ProfileError::DuplicateName,
+    });
+    rig.calibrate("Desk");
+    let desk = rig
+        .snapshot()
+        .active_profile
+        .as_ref()
+        .expect("an active profile")
+        .id;
+
+    // Duplicate.
+    let err = rig
+        .request(Command::DuplicateProfile {
+            id: desk,
+            name: " DESK ".to_string(),
+        })
+        .err();
+    assert_eq!(err, duplicate, "duplicate to a stored name");
+    assert_eq!(rig.profile_files(), 1);
+    let copy = rig
+        .ok(Command::DuplicateProfile {
+            id: desk,
+            name: "Copy".to_string(),
+        })
+        .into_profile_created()
+        .expect("ProfileCreated");
+
+    // Rename.
+    let err = rig
+        .request(Command::RenameProfile {
+            id: copy,
+            name: "desk".to_string(),
+        })
+        .err();
+    assert_eq!(err, duplicate, "rename to another profile's name");
+    rig.ok(Command::RenameProfile {
+        id: copy,
+        name: "COPY".to_string(),
+    });
+
+    // Import: the file's profile keeps its name "Desk".
+    let file = rig.dir.join("desk-export.json");
+    rig.ok(Command::ExportProfile {
+        id: desk,
+        path: file.clone(),
+    });
+    let preview = |rig: &Rig| {
+        rig.ok(Command::PreviewImport { path: file.clone() })
+            .into_import_preview()
+            .expect("ImportPreview")
+            .preview
+    };
+    let err = rig
+        .request(Command::ImportProfile {
+            preview: preview(&rig),
+        })
+        .err();
+    assert_eq!(err, duplicate, "import under a stored name");
+    assert_eq!(rig.profile_files(), 2);
+    rig.ok(Command::RenameProfile {
+        id: desk,
+        name: "Old desk".to_string(),
+    });
+    rig.ok(Command::ImportProfile {
+        preview: preview(&rig),
+    });
+    assert_eq!(rig.profile_files(), 3);
+
+    // Create: the wizard names the new profile at Save, after the run started under another.
+    rig.calibrate_to_build("New desk");
+    let review = |rig: &Rig| {
+        rig.wait("Review", |s| {
+            matches!(step(s), Some(CalibrationStep::Review { .. }))
+        })
+    };
+    review(&rig);
+    let commit = |name: &str| Command::Calibration {
+        action: CalibrationAction::Commit {
+            name: name.to_string(),
+        },
+    };
+    assert_eq!(
+        rig.request(commit(" copy")).err(),
+        duplicate,
+        "a new profile saved under a stored name"
+    );
+    assert!(
+        matches!(step(&rig.snapshot()), Some(CalibrationStep::Review { .. })),
+        "a refused commit keeps the Review"
+    );
+    assert_eq!(rig.profile_files(), 3);
+    let created = rig
+        .ok(commit("Desk 2"))
+        .into_committed()
+        .expect("Committed");
+    rig.wait("Listening", |s| s.mode == Mode::Listening);
+    assert_eq!(rig.profile_files(), 4);
+
+    // Recalibrate: its commit may not take another profile's name, but may recase its own.
+    rig.calibrate_to_build_on(CalibrationTarget::Recalibrate { profile: created });
+    review(&rig);
+    assert_eq!(
+        rig.request(commit("old DESK")).err(),
+        duplicate,
+        "a recalibration renamed to another profile's name"
+    );
+    assert_eq!(
+        rig.ok(commit("DESK 2")).into_committed(),
+        Ok(created),
+        "a recalibration keeps its id"
+    );
+    rig.wait("Listening", |s| s.mode == Mode::Listening);
+    assert_eq!(rig.profile_files(), 4);
     rig.finish();
 }
 

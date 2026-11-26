@@ -3758,12 +3758,10 @@ impl Controller {
             .and_then(|n| ZoneCount::new(n).map_err(|error| EngineError::Profile { error }))?;
         let now = Utc::now();
         let mut draft = match &target {
-            CalibrationTarget::New { name } => {
-                let profile = Profile::new(name.clone(), count, now)
-                    .map_err(|error| EngineError::Profile { error })?;
-                self.check_name_unique(&profile)?;
-                profile
-            }
+            // The start name is the wizard's default and Save replaces it; AB-9's check runs
+            // in `commit`, where the profile is written.
+            CalibrationTarget::New { name } => Profile::new(name.clone(), count, now)
+                .map_err(|error| EngineError::Profile { error })?,
             CalibrationTarget::Recalibrate { profile } => {
                 let mut p = self
                     .profile(*profile)
@@ -4242,6 +4240,9 @@ impl Controller {
         draft
             .validate()
             .map_err(|error| EngineError::Profile { error })?;
+        // AB-9: the wizard's create (and a recalibration's rename) happens here, under the name
+        // typed at Save; a refusal keeps the run in Review like any other failed commit.
+        self.check_name_unique(&draft)?;
         self.data
             .save_profile(&draft)
             .map_err(|error| EngineError::Persistence { error })?;
