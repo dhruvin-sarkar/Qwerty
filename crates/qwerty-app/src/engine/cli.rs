@@ -481,6 +481,32 @@ impl Session {
         }
     }
 
+    /// Runs for `secs`, handing every event to `on_event`. Fails as soon as the engine faults or
+    /// `broken` names a reason, so a run that failed partway never reports success.
+    fn run_for(
+        &mut self,
+        secs: u64,
+        broken: impl Fn(&Snapshot) -> Option<String>,
+        on_event: &mut dyn FnMut(&Event),
+    ) -> Result<(), CliError> {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if let Some(why) = broken(&self.handle.snapshot()) {
+                return Err(CliError::Stuck(why));
+            }
+            match self.next(Duration::from_millis(50))? {
+                Some(Event::EngineFaulted { thread, message }) => {
+                    return Err(CliError::Stuck(format!(
+                        "the engine faulted on {thread:?}: {message}"
+                    )))
+                }
+                Some(e) => on_event(&e),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
     fn finish(self) -> Result<(), CliError> {
         let report = self.handle.shutdown()?;
         if let Some(summary) = report.recording {
@@ -528,38 +554,69 @@ fn monitor(secs: u64, device: Option<String>, data_dir: PathBuf) -> Result<(), C
             level: TelemetryLevel::Diagnostics,
         })?
         .into_ack()?;
+    session.wait_for(
+        |s| matches!(s.capture, CaptureStatus::Running { .. }),
+        &mut |_| {},
+        Some(ENGINE_WAIT),
+    )?;
     println!("Monitoring for {secs} s (Diagnostics telemetry)...");
-    let end = Instant::now() + Duration::from_secs(secs);
     let mut last_meter = Instant::now();
-    while Instant::now() < end {
-        match session.next(Duration::from_millis(50))? {
-            Some(Event::Telemetry {
-                frame: TelemetryFrame::Meter { rms, peak, noise },
-            }) if last_meter.elapsed() >= Duration::from_millis(500) => {
-                last_meter = Instant::now();
-                println!(
-                    "meter  rms {:6.1} dB  peak {:6.1} dB  noise {:6.1} dB",
-                    rms.get(),
-                    peak.get(),
-                    noise.get()
-                );
-            }
-            Some(Event::Telemetry {
-                frame: TelemetryFrame::Trace { entries },
-            }) => entries.iter().for_each(print_trace),
-            Some(Event::EngineFaulted { thread, message }) => {
-                eprintln!("the engine faulted on {thread:?}: {message}");
-                break;
-            }
-            Some(_) | None => {}
+    let ran = session.run_for(secs, monitor_broken, &mut |event| match event {
+        Event::Telemetry {
+            frame: TelemetryFrame::Meter { rms, peak, noise },
+        } if last_meter.elapsed() >= Duration::from_millis(500) => {
+            last_meter = Instant::now();
+            println!(
+                "meter  rms {:6.1} dB  peak {:6.1} dB  noise {:6.1} dB",
+                rms.get(),
+                peak.get(),
+                noise.get()
+            );
         }
-    }
+        Event::Telemetry {
+            frame: TelemetryFrame::Trace { entries },
+        } => entries.iter().for_each(print_trace),
+        _ => {}
+    });
     let s = session.handle.snapshot();
     println!(
-        "capture: {:?}\ndropped frames: {}",
-        s.capture, s.health.counters.capture_dropped_frames
+        "capture: {:?}\npackets: {}\ndropped frames: {}",
+        s.capture, s.health.counters.capture_packets, s.health.counters.capture_dropped_frames
     );
-    session.finish()
+    // Shut down cleanly either way; a failed run is still the error the exit code reports.
+    let finished = session.finish();
+    ran.and(finished)
+}
+
+/// Why a `--v2-monitor` run is no longer valid evidence: the engine faulted or its microphone
+/// stopped.
+fn monitor_broken(s: &Snapshot) -> Option<String> {
+    stuck(s).or_else(|| match &s.capture {
+        CaptureStatus::Running { .. } => None,
+        CaptureStatus::Off | CaptureStatus::Failed { .. } => Some(format!(
+            "the microphone stopped during the run: {:?}",
+            s.capture
+        )),
+    })
+}
+
+/// Why a `--v2-corpus` run is no longer valid evidence: the engine faulted, left Listening (a
+/// lost microphone blocks it), or the recording stopped.
+fn corpus_broken(s: &Snapshot) -> Option<String> {
+    stuck(s)
+        .or_else(|| {
+            (s.mode != Mode::Listening)
+                .then(|| format!("the engine left Listening during the run: {:?}", s.mode))
+        })
+        .or_else(|| match &s.recorder.state {
+            RecorderState::Recording { .. } => None,
+            RecorderState::Off | RecorderState::Stopped { .. } | RecorderState::Failed { .. } => {
+                Some(format!(
+                    "the recording stopped during the run: {:?}",
+                    s.recorder.state
+                ))
+            }
+        })
 }
 
 fn print_trace(e: &TraceEntry) {
@@ -975,25 +1032,95 @@ fn corpus(
         })?
         .into_ack()?;
     println!("Recording the {class:?} corpus for {secs} s...");
-    let end = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < end {
-        if let Some(Event::EngineFaulted { thread, message }) =
-            session.next(Duration::from_millis(100))?
-        {
-            eprintln!("the engine faulted on {thread:?}: {message}");
-            break;
-        }
-    }
-    session.finish()
+    let ran = session.run_for(secs, corpus_broken, &mut |_| {});
+    // Shut down cleanly either way, so the recording is closed; a failed run is still the error.
+    let finished = session.finish();
+    ran.and(finished)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::protocol::DeviceState;
+    use crate::engine::protocol::{
+        Blocker, CapturePurpose, DeviceState, MicUnavailableReason, MmcssStatus, OpenedStream,
+        RecorderStopReason, ThreadName,
+    };
+    use qwerty_core::audio::{AudioFormat, CaptureMode, DeviceIdentity};
+    use qwerty_core::units::{ChannelCount, Milliseconds, SampleRate, Seconds};
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|a| a.to_string()).collect()
+    }
+
+    fn running() -> CaptureStatus {
+        CaptureStatus::Running {
+            opened: OpenedStream {
+                identity: DeviceIdentity {
+                    endpoint_id: "mic".to_string(),
+                    name: "Mic".to_string(),
+                    format: AudioFormat {
+                        rate: SampleRate::new(48_000).expect("rate"),
+                        channels: ChannelCount::new(1).expect("channels"),
+                    },
+                    capture_mode: CaptureMode::Raw,
+                },
+                period: Milliseconds::new(10.0),
+                buffer_frames: 960,
+                mmcss: MmcssStatus::Active,
+            },
+            purpose: CapturePurpose::Listening,
+        }
+    }
+
+    fn faulted() -> Mode {
+        Mode::Faulted {
+            thread: ThreadName::Processing,
+            message: "boom".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_monitor_run_breaks_on_a_fault_or_a_stopped_mic() {
+        let mut s = crate::engine::handle::starting_snapshot();
+        s.mode = Mode::Idle;
+        s.capture = running();
+        assert_eq!(monitor_broken(&s), None);
+        s.mode = faulted();
+        assert!(monitor_broken(&s).is_some());
+        s.mode = Mode::Idle;
+        s.capture = CaptureStatus::Off;
+        assert!(monitor_broken(&s).is_some());
+    }
+
+    #[test]
+    fn a_corpus_run_breaks_on_a_fault_a_lost_mic_or_a_stopped_recording() {
+        let mut s = crate::engine::handle::starting_snapshot();
+        s.mode = Mode::Listening;
+        s.capture = running();
+        s.recorder.state = RecorderState::Recording {
+            dir: "d".to_string(),
+            bytes: 0,
+            duration: Seconds::new(1.0),
+            gaps: 0,
+            dropped_events: 0,
+        };
+        assert_eq!(corpus_broken(&s), None);
+        s.mode = faulted();
+        assert!(corpus_broken(&s).is_some());
+        s.mode = Mode::Blocked {
+            blocker: Blocker::MicUnavailable {
+                endpoint_id: "mic".to_string(),
+                name: "Mic".to_string(),
+                reason: MicUnavailableReason::Unplugged,
+            },
+        };
+        assert!(corpus_broken(&s).is_some());
+        s.mode = Mode::Listening;
+        s.recorder.state = RecorderState::Stopped {
+            dir: "d".to_string(),
+            reason: RecorderStopReason::SizeLimit,
+        };
+        assert!(corpus_broken(&s).is_some());
     }
 
     fn device(id: &str, name: &str, is_default: bool) -> DeviceInfo {
