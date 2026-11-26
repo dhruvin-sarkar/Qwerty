@@ -1580,8 +1580,10 @@ pub(crate) mod tests {
         );
     }
 
+    // The rule itself, case by case; the spec's DN1 test runs it through the engine's commands
+    // (crates/qwerty-app/tests/engine.rs), so this one does not carry the DN1 prefix.
     #[test]
-    fn dn1_profile_names_are_unique_after_trim_and_lowercase() {
+    fn check_name_unique_compares_names_after_trim_and_lowercase() {
         let now = ts("2026-11-27T09:00:00Z");
         let desk = Profile::new("Home desk".into(), count(2), now).expect("valid");
         let work = Profile::new("Work".into(), count(4), now).expect("valid");
