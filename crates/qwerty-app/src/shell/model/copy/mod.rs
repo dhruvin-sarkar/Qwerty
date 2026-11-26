@@ -70,16 +70,26 @@ pub fn more(label: &str) -> String {
 
 /// A path shortened in the middle to at most `limit` characters (U:1842): the first two parts and
 /// as many trailing parts as fit, around "…": `C:\Users\…\Spotify.exe`. A path whose ends alone
-/// do not fit keeps its file name, cut at the end.
+/// do not fit keeps its file name, cut at the end; one whose head leaves no room for a character
+/// of the file name shows the file name alone, cut at the end.
 pub fn middle_path(path: &str, limit: usize) -> String {
     if path.chars().count() <= limit {
         return path.to_string();
     }
+    // `text` in at most `room` characters: whole when it fits, else one fewer than the room and
+    // the "…" that `truncate_end` adds.
+    let cut = |text: &str, room: usize| {
+        if text.chars().count() <= room {
+            text.to_string()
+        } else {
+            truncate_end(text, room.saturating_sub(1))
+        }
+    };
     let separator = if path.contains('\\') { "\\" } else { "/" };
     let parts: Vec<&str> = path.split(separator).collect();
     if parts.len() < 4 {
         // No middle part to drop.
-        return truncate_end(path, limit);
+        return cut(path, limit);
     }
     let head = parts[..2].join(separator);
     // Separator, ellipsis, separator.
@@ -99,10 +109,13 @@ pub fn middle_path(path: &str, limit: usize) -> String {
         return shortened;
     }
     let file = parts[parts.len() - 1];
-    let room = limit.saturating_sub(fixed).max(1);
+    // Room for at least one character of the file name and its "…".
+    if fixed + 2 > limit {
+        return cut(file, limit);
+    }
     format!(
         "{head}{separator}{ELLIPSIS}{separator}{}",
-        truncate_end(file, room)
+        cut(file, limit - fixed)
     )
 }
 
@@ -131,7 +144,11 @@ pub fn with_unit(value: f64, decimals: usize, unit: &str) -> String {
 /// A whole percentage with no space before "%" (U:1836): 0.94 → "94%". Rounds down, so a value
 /// below a target never shows as the target.
 pub fn percent(fraction: f64) -> String {
-    format!("{}%", number((fraction * 100.0).floor(), 0))
+    // A count ratio n / d scaled by 100 can land a rounding error below its whole value
+    // (29 / 100 · 100 = 28.999…), which a plain floor would show one lower. A ratio that is
+    // really below a whole percentage is at least 1 / d below it, far more than this tolerance.
+    const TOLERANCE: f64 = 1e-9;
+    format!("{}%", number((fraction * 100.0 + TOLERANCE).floor(), 0))
 }
 
 /// Key names joined by "+" without spaces (U:1841): "Ctrl+Alt+Space".
@@ -190,6 +207,29 @@ mod tests {
         assert_eq!(with_unit(-47.0, 0, "dBFS"), "−47 dBFS");
         assert_eq!(percent(0.94), "94%");
         assert_eq!(percent(0.949), "94%");
+        assert_eq!(percent(0.98999), "98%");
+        assert_eq!(percent(1.0), "100%");
+        // A count ratio shows its exact whole percentage, though `n / d * 100` lands just below it
+        // in floating point (29 / 100 * 100 = 28.999…).
+        for (n, d, shown) in [
+            (29, 100, "29%"),
+            (57, 100, "57%"),
+            (58, 100, "58%"),
+            (29, 50, "58%"),
+            (87, 150, "58%"),
+        ] {
+            assert_eq!(percent(f64::from(n) / f64::from(d)), shown, "{n}/{d}");
+        }
+        for d in 1..=1000u32 {
+            for n in 0..=d {
+                let exact = n * 100 / d;
+                assert_eq!(
+                    percent(f64::from(n) / f64::from(d)),
+                    format!("{exact}%"),
+                    "{n}/{d}"
+                );
+            }
+        }
         assert_eq!(number(-0.0, 0), "0");
         assert_eq!(number(-0.04, 1), "0.0");
         assert_eq!(number(-3.25, 2), "−3.25");
@@ -229,6 +269,27 @@ mod tests {
             middle_path("D:/QwertyData/DebugCaptures/20261111T084500Z/audio.wav", 30),
             "D:/QwertyData/…/audio.wav"
         );
+        // When even the file name does not fit, it is cut so the whole stays within the limit.
+        let spotify = "C:/Users/Me/AppData/Roaming/Spotify/Spotify.exe";
+        assert_eq!(middle_path(spotify, 21), "C:/Users/…/Spotify.e…");
+        assert_eq!(middle_path(spotify, 16), "C:/Users/…/Spot…");
+        assert_eq!(middle_path(spotify, 11), "Spotify.exe");
+        assert_eq!(middle_path(spotify, 10), "Spotify.e…");
+        assert_eq!(middle_path("C:\\Tools\\run.exe", 10), "C:\\Tools\\…");
+        for path in [
+            spotify,
+            "C:\\Users\\Me\\AppData\\Roaming\\Spotify\\Spotify.exe",
+            "D:/QwertyData/DebugCaptures/20261111T084500Z/audio.wav",
+            "C:\\Tools\\run.exe",
+        ] {
+            for limit in 1..=60 {
+                let shown = middle_path(path, limit);
+                assert!(
+                    shown.chars().count() <= limit,
+                    "{shown:?} is longer than {limit}"
+                );
+            }
+        }
     }
 
     #[test]
