@@ -66,6 +66,12 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_Storage_FileSystem",
     "Win32_Devices_FunctionDiscovery",
+    # v2 shell (shell-v2 §3.1, WP-S0): DWM attributes, HIGHCONTRASTW, file-dialog filter
+    # specs, K32EmptyWorkingSet.
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell_Common",
+    "Win32_System_ProcessStatus",
 ] }
 arboard = "3"
 # Speech + toast, the last two ActionSpec variants. These were stubbed as
