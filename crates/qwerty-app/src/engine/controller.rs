@@ -1187,6 +1187,15 @@ impl Controller {
             .find_map(|e| e.loaded.as_ref().ok().filter(|p| p.id == id))
     }
 
+    // SPEC: shell-v2 WP-E1 lists only protocol.rs, telemetry.rs and store.rs, but AB-9's check
+    // "on create, rename, duplicate and import" (DN1) runs where those commands are handled, here.
+    /// `profile`'s name against every readable stored profile (amendment AB-9).
+    fn check_name_unique(&self, profile: &Profile) -> Result<(), EngineError> {
+        let stored = self.profiles.iter().filter_map(|e| e.loaded.as_ref().ok());
+        qwerty_core::store::check_name_unique(profile, stored)
+            .map_err(|error| EngineError::Profile { error })
+    }
+
     fn active_profile(&self) -> Option<&Profile> {
         self.active_id().and_then(|id| self.profile(id))
     }
@@ -3141,6 +3150,7 @@ impl Controller {
                 profile
                     .validate()
                     .map_err(|error| EngineError::Profile { error })?;
+                self.check_name_unique(&profile)?;
                 self.write_profile(profile)?;
                 Ok(Reply::Ack)
             }
@@ -3157,6 +3167,7 @@ impl Controller {
                 profile
                     .validate()
                     .map_err(|error| EngineError::Profile { error })?;
+                self.check_name_unique(&profile)?;
                 let new_id = profile.id;
                 self.write_profile(profile)?;
                 Ok(Reply::ProfileCreated { id: new_id })
@@ -3245,6 +3256,7 @@ impl Controller {
                     None => return Err(EngineError::PreviewExpired),
                 };
                 profile.id = ProfileId::new();
+                self.check_name_unique(&profile)?;
                 if let CalibrationState::Calibrated { device, .. } = &profile.calibration {
                     let here = self
                         .os
@@ -3746,8 +3758,12 @@ impl Controller {
             .and_then(|n| ZoneCount::new(n).map_err(|error| EngineError::Profile { error }))?;
         let now = Utc::now();
         let mut draft = match &target {
-            CalibrationTarget::New { name } => Profile::new(name.clone(), count, now)
-                .map_err(|error| EngineError::Profile { error })?,
+            CalibrationTarget::New { name } => {
+                let profile = Profile::new(name.clone(), count, now)
+                    .map_err(|error| EngineError::Profile { error })?;
+                self.check_name_unique(&profile)?;
+                profile
+            }
             CalibrationTarget::Recalibrate { profile } => {
                 let mut p = self
                     .profile(*profile)

@@ -289,6 +289,24 @@ pub(crate) fn label_key(label: &str) -> String {
     label.trim().to_lowercase()
 }
 
+/// `profile`'s name against every other stored profile (amendment AB-9): `DuplicateName` when
+/// one with another id has the same name after trimming and lowercasing. A profile never
+/// collides with itself, so a rename that only changes case succeeds. The caller passes the
+/// profile as it will be written (a new id for create, duplicate and import).
+pub fn check_name_unique<'a>(
+    profile: &Profile,
+    existing: impl IntoIterator<Item = &'a Profile>,
+) -> Result<(), ProfileError> {
+    let key = label_key(&profile.name);
+    if existing
+        .into_iter()
+        .any(|other| other.id != profile.id && label_key(&other.name) == key)
+    {
+        return Err(ProfileError::DuplicateName);
+    }
+    Ok(())
+}
+
 /// `base`, or the first of "base 2", "base 3", … whose key is not in `taken` (label keys).
 // SPEC: §1.16 appends " 2", " 3", … but does not say what happens when that pushes a label past
 // ZONE_LABEL_MAX; the stem is shortened so the result always passes `Profile::validate`.
@@ -397,6 +415,10 @@ pub enum ProfileError {
         zone: ZoneId,
         other: ZoneId,
     },
+    /// The profile name equals another profile's after trimming and lowercasing, the
+    /// `DuplicateZoneLabel` rule (amendment AB-9). Checked on create, rename, duplicate and
+    /// import by `check_name_unique`.
+    DuplicateName,
     /// Non-finite, or not inside [0, 1]² with width, height > 0 (PARITY-19, as v1).
     InvalidLayout {
         zone: ZoneId,
@@ -1555,6 +1577,52 @@ pub(crate) mod tests {
         assert_eq!(
             serde_json::to_string(&NoticeId::UnattendedActions).expect("serializes"),
             r#"{"type":"UnattendedActions"}"#
+        );
+    }
+
+    #[test]
+    fn dn1_profile_names_are_unique_after_trim_and_lowercase() {
+        let now = ts("2026-11-27T09:00:00Z");
+        let desk = Profile::new("Home desk".into(), count(2), now).expect("valid");
+        let work = Profile::new("Work".into(), count(4), now).expect("valid");
+        let stored = [desk.clone(), work.clone()];
+        let clash = Err(ProfileError::DuplicateName);
+
+        // Create: a new profile (new id) named like a stored one, in another case and padded.
+        let created = Profile::new("  home DESK ".into(), count(2), now).expect("valid");
+        assert_eq!(check_name_unique(&created, &stored), clash);
+        let created = Profile::new("Home desk 2".into(), count(2), now).expect("valid");
+        assert_eq!(check_name_unique(&created, &stored), Ok(()));
+
+        // Rename: to another profile's name fails; the same name in another case on the
+        // profile itself succeeds.
+        let mut renamed = work.clone();
+        renamed.name = "HOME desk".into();
+        assert_eq!(check_name_unique(&renamed, &stored), clash);
+        renamed.name = " wORK".into();
+        assert_eq!(check_name_unique(&renamed, &stored), Ok(()));
+
+        // Duplicate: a copy gets a new id, so keeping the source's name (in any case) fails.
+        let mut copy = desk.clone();
+        copy.id = ProfileId::new();
+        copy.name = "home desk".into();
+        assert_eq!(check_name_unique(&copy, &stored), clash);
+        copy.name = "Home desk (copy)".into();
+        assert_eq!(check_name_unique(&copy, &stored), Ok(()));
+
+        // Import: the file's profile is written under a new id.
+        let mut imported = calibrated_profile();
+        imported.id = ProfileId::new();
+        imported.name = "work".into();
+        assert_eq!(check_name_unique(&imported, &stored), clash);
+        imported.name = "Studio".into();
+        assert_eq!(check_name_unique(&imported, &stored), Ok(()));
+
+        // With nothing stored there is nothing to collide with.
+        assert_eq!(check_name_unique(&desk, &[]), Ok(()));
+        assert_eq!(
+            serde_json::to_string(&ProfileError::DuplicateName).expect("serializes"),
+            r#"{"type":"DuplicateName"}"#
         );
     }
 }

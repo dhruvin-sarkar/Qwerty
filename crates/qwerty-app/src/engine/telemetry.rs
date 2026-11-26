@@ -6,7 +6,7 @@
 
 use qwerty_core::audio::{AudioBlock, AudioFormat};
 use qwerty_core::detector::{Detector, DetectorParams, GateReport, RejectedCandidate};
-use qwerty_core::dsp::{Biquad, BAND_COUNT};
+use qwerty_core::dsp::{Biquad, FrameGeometry, BAND_COUNT};
 use qwerty_core::model::{ModelError, ModelScratch, TrainedModel};
 use qwerty_core::pipeline::TapDecision;
 use qwerty_core::units::{Decibels, HostDuration, HostTime, Milliseconds, SampleIndex};
@@ -60,6 +60,11 @@ pub struct TelemetryBuilder {
     wave: Vec<f32>,
     wave_next: usize,
     wave_len: usize,
+    /// The capture index of the newest sample in the waveform ring (None while it is empty).
+    wave_end: Option<SampleIndex>,
+    /// Half the detector's frame length at the capture rate: a detector frame centred on `at`
+    /// ends at `at + hop - 1` (`FrameGeometry`: len = 2·hop, centre = start + hop).
+    detector_hop: u64,
     next_meter: Option<HostTime>,
     next_diagnostics: Option<HostTime>,
 }
@@ -83,6 +88,8 @@ impl TelemetryBuilder {
             wave: Vec::new(),
             wave_next: 0,
             wave_len: 0,
+            wave_end: None,
+            detector_hop: 0,
             next_meter: None,
             next_diagnostics: None,
         }
@@ -104,6 +111,7 @@ impl TelemetryBuilder {
             .expect("the detector's 100 Hz high-pass is valid at every sample rate");
         self.hpf = vec![hpf; usize::from(format.channels.get())];
         self.wave = vec![0.0; format.rate.samples_in(WAVEFORM_SPAN).max(1)];
+        self.detector_hop = FrameGeometry::for_rate(format.rate).hop as u64;
         self.format = Some(format);
         self.reset_windows();
     }
@@ -123,6 +131,7 @@ impl TelemetryBuilder {
         self.meter_count = 0;
         self.wave_next = 0;
         self.wave_len = 0;
+        self.wave_end = None;
         self.next_meter = None;
         self.next_diagnostics = None;
     }
@@ -153,6 +162,10 @@ impl TelemetryBuilder {
                 self.wave_next = (self.wave_next + 1) % cap;
                 self.wave_len = (self.wave_len + 1).min(cap);
             }
+        }
+        let frames = (block.samples.len() / channels) as u64;
+        if self.level == TelemetryLevel::Diagnostics && frames > 0 {
+            self.wave_end = Some(SampleIndex(block.start.0 + frames - 1));
         }
     }
 
@@ -217,19 +230,21 @@ impl TelemetryBuilder {
                 noise[b] = level_db(frame.noise_db[b]);
             }
             out.push(TelemetryFrame::Spectrum {
+                end: SampleIndex(frame.at.0 + self.detector_hop - 1),
                 bands,
                 noise,
                 flux: finite_f32(frame.flux),
                 threshold: finite_f32(frame.threshold),
             });
         }
-        if self.wave_len > 0 {
-            out.push(self.waveform());
+        if let Some(end) = self.wave_end {
+            out.push(self.waveform(end));
         }
     }
 
-    /// Min/max of the waveform ring, oldest to newest, in `WAVEFORM_COLUMNS` columns.
-    fn waveform(&self) -> TelemetryFrame {
+    /// Min/max of the waveform ring, oldest to newest, in `WAVEFORM_COLUMNS` columns; `end` is
+    /// the capture index of the ring's newest sample.
+    fn waveform(&self, end: SampleIndex) -> TelemetryFrame {
         let cap = self.wave.len();
         let len = self.wave_len;
         let oldest = (self.wave_next + cap - len) % cap;
@@ -249,7 +264,7 @@ impl TelemetryBuilder {
             min.push(lo);
             max.push(hi);
         }
-        TelemetryFrame::Waveform { min, max }
+        TelemetryFrame::Waveform { end, min, max }
     }
 }
 
@@ -456,13 +471,92 @@ mod tests {
         t.on_block(&block);
         assert_eq!(t.meter_count, 9600);
         assert_eq!(t.wave_len, 4800);
-        match t.waveform() {
-            TelemetryFrame::Waveform { min, max } => {
+        assert_eq!(t.wave_end, Some(SampleIndex(4799)));
+        match t.waveform(SampleIndex(4799)) {
+            TelemetryFrame::Waveform { min, max, .. } => {
                 assert_eq!(min.len(), WAVEFORM_COLUMNS);
                 assert_eq!(max.len(), WAVEFORM_COLUMNS);
                 assert!(min.iter().zip(&max).all(|(lo, hi)| lo <= hi));
             }
             other => panic!("expected a waveform, got {other:?}"),
+        }
+    }
+
+    // SPEC: FE1 says Waveform `end`s are "100 ms of samples apart at the frame cadence"; the
+    // builder emits at ≤ 30 Hz, so the test drives it one 100 ms block per emitted frame, which
+    // makes consecutive `end`s exactly one Waveform span (4800 samples at 48 kHz) apart.
+    #[test]
+    fn fe1_waveform_and_spectrum_frames_carry_the_end_sample() {
+        use qwerty_core::audio::ChannelLayout;
+        use qwerty_core::detector::DetectorMode;
+
+        let format = format();
+        let channels = usize::from(format.channels.get());
+        let span = format.rate.samples_in(WAVEFORM_SPAN) as u64;
+        let hop = FrameGeometry::for_rate(format.rate).hop as u64;
+        let mut detector = Detector::new(
+            format,
+            &ChannelLayout::all_real(format.channels),
+            &DetectorParams::DEFAULT,
+            DetectorMode::Live,
+        )
+        .expect("a stereo 48 kHz detector");
+        let mut t = TelemetryBuilder::new();
+        t.set_format(format);
+        t.set_level(TelemetryLevel::Diagnostics);
+
+        let mut detected = Vec::new();
+        let mut frames = Vec::new();
+        let mut wave_ends = Vec::new();
+        let mut pushed = 0u64;
+        for k in 0..12u64 {
+            let samples: Vec<f32> = (0..span as usize * channels)
+                .map(|i| 0.01 * (((i as u64 + k * 7) % 31) as f32 / 31.0 - 0.5))
+                .collect();
+            let block = AudioBlock {
+                format,
+                start: SampleIndex(pushed),
+                samples: &samples,
+                time: BlockTime::Untimed,
+                discontinuity: false,
+            };
+            detector.push(&block, &mut detected).expect("push");
+            t.on_block(&block);
+            pushed += span;
+            let now = HostTime(0)
+                .checked_add(HostDuration::from_ms(Milliseconds::new(100.0 * k as f64)))
+                .expect("a small host time");
+            frames.clear();
+            t.due(now, Some(&detector), &mut frames);
+
+            let reported = detector.last_frame().expect("a detector frame per 100 ms");
+            let mut saw_spectrum = false;
+            for frame in &frames {
+                match frame {
+                    TelemetryFrame::Waveform { end, .. } => wave_ends.push(*end),
+                    TelemetryFrame::Spectrum { end, bands, .. } => {
+                        saw_spectrum = true;
+                        // The frame it reports: the same bands, centred on `at`.
+                        for (b, band) in bands.iter().enumerate() {
+                            assert_eq!(*band, level_db(reported.bands_db[b]));
+                        }
+                        // Its window [at − hop, at + hop) ends at `end`.
+                        assert_eq!(end.0, reported.at.0 + hop - 1);
+                        // The newest complete detector frame: inside the audio pushed so far,
+                        // and the next frame (one hop later) is not complete yet.
+                        assert!(end.0 < pushed, "{} ≥ {pushed}", end.0);
+                        assert!(end.0 + hop >= pushed, "{} + {hop} < {pushed}", end.0);
+                    }
+                    TelemetryFrame::Meter { .. } => {}
+                    TelemetryFrame::Trace { .. } => panic!("the builder never makes Trace"),
+                }
+            }
+            assert!(saw_spectrum, "a Spectrum frame at every 100 ms step");
+            assert_eq!(wave_ends.last(), Some(&SampleIndex(pushed - 1)));
+        }
+        assert_eq!(wave_ends.len(), 12);
+        for pair in wave_ends.windows(2) {
+            assert_eq!(pair[1].0 - pair[0].0, span, "ends {pair:?}");
         }
     }
 }

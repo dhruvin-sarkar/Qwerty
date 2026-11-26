@@ -1333,7 +1333,8 @@ pub struct LatencyBreakdown {
 /// Meter rate), all real channels, re full scale (a full-scale sine is −3 dB); `noise` =
 /// 10·log10(mean_b N_b / n_real), the same formula as the session's noise floor. Spectrum: the
 /// detector's band powers and noise estimate (§1.5.4 normalization), so bands and noise compare
-/// directly (PARITY-38).
+/// directly (PARITY-38). `end` on Spectrum and Waveform (amendment AB-10) is the last sample of
+/// the frame's window on the capture clock, the same clock as `TraceEntry.onset`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TelemetryFrame {
@@ -1343,6 +1344,8 @@ pub enum TelemetryFrame {
         noise: Decibels,
     },
     Spectrum {
+        /// The last sample of the detector frame these bands describe.
+        end: SampleIndex,
         // SPEC: §2.1.1's boxing rule (large_enum_variant) boxes the largest payload, `bands`; one
         // Box clears the lint, so a Spectrum frame makes one small allocation where §2.5 calls
         // Spectrum frames "fixed arrays". `noise` stays inline.
@@ -1351,8 +1354,12 @@ pub enum TelemetryFrame {
         flux: f32,
         threshold: f32,
     },
-    /// Diagnostics: 256 columns over the last 100 ms.
-    Waveform { min: Vec<f32>, max: Vec<f32> },
+    /// Diagnostics: 256 columns over the last 100 ms, whose last sample is `end`.
+    Waveform {
+        end: SampleIndex,
+        min: Vec<f32>,
+        max: Vec<f32>,
+    },
     /// Diagnostics: from the controller (§2.8); ≤ 10 Hz, ≤ 32 entries, older ones counted in
     /// telemetry_dropped.
     Trace { entries: Vec<TraceEntry> },
@@ -3061,12 +3068,14 @@ mod tests {
                     noise: Decibels::new(-90.0),
                 },
                 TelemetryFrame::Spectrum {
+                    end: SampleIndex(4_847),
                     bands: Box::new(floor),
                     noise: floor,
                     flux: 0.5,
                     threshold: 1.25,
                 },
                 TelemetryFrame::Waveform {
+                    end: SampleIndex(9_599),
                     min: vec![-0.5, -0.25],
                     max: vec![0.5, 0.25],
                 },
@@ -3075,6 +3084,15 @@ mod tests {
                 },
             ],
             4,
+        );
+        // AB-10: `end` is a plain sample index on the capture clock.
+        assert_eq!(
+            rt(&TelemetryFrame::Waveform {
+                end: SampleIndex(9_599),
+                min: vec![-0.5],
+                max: vec![0.5],
+            }),
+            serde_json::json!({"type": "Waveform", "end": 9599, "min": [-0.5], "max": [0.5]})
         );
         rt_variants(
             &[
@@ -3177,6 +3195,13 @@ mod tests {
             },
         ];
         rt_variants(&engine_errors, 33);
+        // AB-9: the duplicate-name error travels inside EngineError::Profile.
+        assert_eq!(
+            rt(&EngineError::Profile {
+                error: ProfileError::DuplicateName,
+            }),
+            serde_json::json!({"type": "Profile", "error": {"type": "DuplicateName"}})
+        );
         rt(&shutdown_report());
         rt_variants(&[AutostartPolicy::Reconcile, AutostartPolicy::Untouched], 2);
         rt_variants(
